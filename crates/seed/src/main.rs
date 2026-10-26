@@ -1,7 +1,4 @@
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
+use authz::{AuthorizationEngine, WorkspaceRole};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -13,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
-    let authz = authz::Authz::new(&database_url).await?;
+    let authz = authz_casbin::CasbinAuthz::new(&database_url).await?;
 
     let platform_admin =
         upsert_user(&pool, "platform-admin@example.test", "PlatformAdmin123!").await?;
@@ -81,10 +78,10 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     authz
-        .grant_workspace_role(editor, workspace_id, authz::WorkspaceRole::Editor)
+        .grant_workspace_role(editor, workspace_id, WorkspaceRole::Editor)
         .await?;
 
-    // viewer — нужен для проверки DoD «viewer может читать, но не создавать».
+    // viewer
     sqlx::query(
         r#"
         insert into workspace_members (workspace_id, user_id, role)
@@ -98,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     authz
-        .grant_workspace_role(viewer, workspace_id, authz::WorkspaceRole::Viewer)
+        .grant_workspace_role(viewer, workspace_id, WorkspaceRole::Viewer)
         .await?;
 
     // --- Document: insert only if not exists ---
@@ -129,24 +126,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn upsert_user(pool: &PgPool, email: &str, password: &str) -> anyhow::Result<Uuid> {
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)?
-        .to_string();
-
-    let id: Uuid = sqlx::query_scalar(
-        r#"
-        insert into users (email, password_hash)
-        values ($1, $2)
-        on conflict (email) do update
-        set password_hash = excluded.password_hash
-        returning id
-        "#,
-    )
-    .bind(email)
-    .bind(hash)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(id)
+    let hash = authn::hash_password(password)?;
+    let user = identity::upsert_user(pool, email, &hash).await?;
+    Ok(user.id)
 }

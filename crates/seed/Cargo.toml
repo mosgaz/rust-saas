@@ -11,11 +11,13 @@ path = "src/main.rs"
 [dependencies]
 domain = { path = "../domain" }
 authz = { path = "../authz" }
+authz-casbin = { path = "../authz-casbin" }
+authn = { path = "../authn" }
+identity = { path = "../identity" }
 db = { path = "../db" }
 
 sqlx.workspace = true
 tokio.workspace = true
-argon2.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
 

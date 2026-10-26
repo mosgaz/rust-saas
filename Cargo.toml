@@ -3,6 +3,10 @@ resolver = "3"
 members = [
     "crates/domain",
     "crates/authz",
+    "crates/authz-casbin",
+    "crates/identity",
+    "crates/authn",
+    "crates/saas",
     "crates/db",
     "crates/seed",
     "crates/app",

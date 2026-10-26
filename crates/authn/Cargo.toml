@@ -1,0 +1,18 @@
+[package]
+name = "authn"
+version = "0.1.0"
+edition = "2021"
+description = "Аутентификация: Argon2, JWT, register/login/verify_token"
+
+[dependencies]
+identity = { path = "../identity" }
+domain = { path = "../domain" }
+
+sqlx.workspace = true
+argon2.workspace = true
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json = "1"
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

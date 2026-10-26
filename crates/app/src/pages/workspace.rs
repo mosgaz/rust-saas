@@ -18,26 +18,9 @@ pub async fn create_document(workspace_id: Uuid, title: String) -> Result<Docume
         .await?
         .ok_or_else(|| ServerFnError::new("unauthorized"))?;
 
-    let domain_str = domain::workspace_domain(workspace_id);
-
-    state
-        .authz
-        .require(user.id, &domain_str, "documents", "write")
+    let document = saas::workspace::create_document(&state.saas, &user, workspace_id, title)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let document = sqlx::query_as::<_, Document>(
-        r#"
-        insert into documents (workspace_id, title)
-        values ($1, $2)
-        returning id, workspace_id, title, body, created_at
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(title)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     Ok(document)
 }
@@ -50,26 +33,9 @@ pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerF
         .await?
         .ok_or_else(|| ServerFnError::new("unauthorized"))?;
 
-    let domain_str = domain::workspace_domain(workspace_id);
-
-    state
-        .authz
-        .require(user.id, &domain_str, "documents", "read")
+    let documents = saas::workspace::list_documents(&state.saas, &user, workspace_id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let documents = sqlx::query_as::<_, Document>(
-        r#"
-        select id, workspace_id, title, body, created_at
-        from documents
-        where workspace_id = $1
-        order by created_at desc
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     Ok(documents)
 }
@@ -78,19 +44,13 @@ pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerF
 pub fn WorkspacePage() -> impl IntoView {
     let params = use_params::<WorkspaceParams>();
 
-    // Memo<Result<...>>::get() требует Clone, которого у ParamsError нет.
-    // with(...) даёт ссылку и не требует клонирования результата.
     let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
 
     let title = RwSignal::new(String::new());
     let documents = RwSignal::new(Vec::<Document>::new());
     let error = RwSignal::new(None::<String>);
-    // Тикер: инкрементим после успешного create, чтобы перезагрузить список.
     let refresh = RwSignal::new(0u32);
 
-    // Первичная загрузка + перезагрузка после создания документа.
-    // Effect срабатывает на клиенте (в гидрации), поэтому SSR отдаёт пустой
-    // список и грузит данные после hydration. Для MVP это приемлемо.
     Effect::new(move |_| {
         let _ = refresh.get();
         let id = workspace_id();
