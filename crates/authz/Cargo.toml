@@ -1,0 +1,15 @@
+[package]
+name = "authz"
+version = "0.1.0"
+edition = "2021"
+description = "Casbin, роли, политики, проверка доступа"
+
+[dependencies]
+domain = { path = "../domain" }
+
+casbin.workspace = true
+sqlx-adapter.workspace = true
+tokio.workspace = true
+
+uuid.workspace = true
+anyhow.workspace = true

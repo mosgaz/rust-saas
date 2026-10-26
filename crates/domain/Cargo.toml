@@ -1,0 +1,14 @@
+[package]
+name = "domain"
+version = "0.1.0"
+edition = "2021"
+description = "Общие бизнес-типы и правила именования доменов авторизации"
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sqlx = { workspace = true, optional = true }
+
+[features]
+ssr = ["dep:sqlx"]

@@ -1,0 +1,22 @@
+[package]
+name = "seed"
+version = "0.1.0"
+edition = "2021"
+description = "Bootstrap данных"
+
+[[bin]]
+name = "seed"
+path = "src/main.rs"
+
+[dependencies]
+domain = { path = "../domain" }
+authz = { path = "../authz" }
+db = { path = "../db" }
+
+sqlx.workspace = true
+tokio.workspace = true
+argon2.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+
+dotenvy = "0.15"

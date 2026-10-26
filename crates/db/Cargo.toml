@@ -1,0 +1,9 @@
+[package]
+name = "db"
+version = "0.1.0"
+edition = "2021"
+description = "PostgreSQL, migrations"
+
+[dependencies]
+sqlx.workspace = true
+anyhow.workspace = true

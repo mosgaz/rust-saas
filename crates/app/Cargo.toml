@@ -1,0 +1,75 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+description = "Leptos UI, Axum, server functions"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+domain = { path = "../domain", default-features = false }
+authz = { path = "../authz", optional = true }
+db = { path = "../db", optional = true }
+
+leptos = { version = "0.8" }
+leptos_meta = { version = "0.8" }
+leptos_router = { version = "0.8" }
+leptos_axum = { version = "0.8", optional = true }
+
+axum = { version = "0.8", optional = true }
+axum-extra = { version = "0.10", features = ["cookie"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"], optional = true }
+tower-http = { version = "0.6", features = ["fs", "trace"], optional = true }
+
+serde.workspace = true
+serde_json = { version = "1", optional = true }
+uuid.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+jsonwebtoken = { version = "9", optional = true }
+argon2 = { version = "0.5", optional = true }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+icons = { version = "0.19", features = ["leptos"] }
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom.workspace = true
+console_error_panic_hook = "0.1"
+
+[features]
+hydrate = [
+    "leptos/hydrate",
+]
+ssr = [
+    "dep:authz",
+    "dep:db",
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:tokio",
+    "dep:sqlx",
+    "dep:leptos_axum",
+    "dep:tower-http",
+    "dep:jsonwebtoken",
+    "dep:argon2",
+    "dep:tracing-subscriber",
+    "dep:dotenvy",
+    "dep:serde_json",
+    "domain/ssr",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+]
+
+[package.metadata.leptos]
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "style/main.css"
+assets-dir = "public"
+site-addr = "127.0.0.1:3395"
+reload-port = 3001
+bin-features = ["ssr"]
+lib-features = ["hydrate"]

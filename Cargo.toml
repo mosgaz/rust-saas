@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/domain",
+    "crates/authz",
+    "crates/db",
+    "crates/seed",
+    "crates/app",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde", "v4", "js"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate"] }
+casbin = { version = "2", default-features = false, features = ["runtime-tokio"] }
+sqlx-adapter = "1"
+argon2 = { version = "0.5", features = ["std"] }
+jsonwebtoken = "9"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Для wasm32-unknown-unknown: getrandom 0.2 требует фичу "js"
+getrandom = { version = "0.2", features = ["js"] }

@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+body {
+  @apply bg-neutral-950 text-neutral-100 antialiased;
+}
+
+.card {
+  @apply rounded-xl border border-neutral-800 bg-neutral-900 p-4;
+}
+
+.btn {
+  @apply rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium hover:bg-blue-500;
+}
+
+.input {
+  @apply w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2;
+}
