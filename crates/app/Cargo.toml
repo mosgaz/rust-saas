@@ -10,6 +10,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 domain = { path = "../domain", default-features = false }
 authz = { path = "../authz", optional = true }
+authz-casbin = { path = "../authz-casbin", optional = true }
+identity = { path = "../identity", optional = true }
+authn = { path = "../authn", optional = true }
+saas = { path = "../saas", optional = true }
 db = { path = "../db", optional = true }
 
 leptos = { version = "0.8" }
@@ -46,6 +50,10 @@ hydrate = [
 ]
 ssr = [
     "dep:authz",
+    "dep:authz-casbin",
+    "dep:identity",
+    "dep:authn",
+    "dep:saas",
     "dep:db",
     "dep:axum",
     "dep:axum-extra",

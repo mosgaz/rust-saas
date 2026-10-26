@@ -1,0 +1,17 @@
+[package]
+name = "authz-casbin"
+version = "0.1.0"
+edition = "2021"
+description = "Реализация AuthorizationEngine на Casbin"
+
+[dependencies]
+authz = { path = "../authz" }
+domain = { path = "../domain" }
+
+casbin.workspace = true
+sqlx-adapter.workspace = true
+tokio.workspace = true
+
+uuid.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"

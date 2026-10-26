@@ -18,28 +18,9 @@ pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace
         .await?
         .ok_or_else(|| ServerFnError::new("unauthorized"))?;
 
-    // Не доверяем tenant_id из параметра как источнику авторизации (§14.1):
-    // передаём его в Casbin, который разрешит только tenant_owner'у этого tenant.
-    let domain_str = domain::tenant_domain(tenant_id);
-
-    state
-        .authz
-        .require(user.id, &domain_str, "workspaces", "create")
+    let workspace = saas::tenant::create_workspace(&state.saas, &user, tenant_id, name)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let workspace = sqlx::query_as::<_, Workspace>(
-        r#"
-        insert into workspaces (tenant_id, name)
-        values ($1, $2)
-        returning id, tenant_id, name, created_at
-        "#,
-    )
-    .bind(tenant_id)
-    .bind(name)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     Ok(workspace)
 }

@@ -1,0 +1,13 @@
+[package]
+name = "identity"
+version = "0.1.0"
+edition = "2021"
+description = "Сущность пользователя: AuthUser, UserRecord, валидация email/password, CRUD users"
+
+[dependencies]
+domain = { path = "../domain", features = ["ssr"] }
+
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

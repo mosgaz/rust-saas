@@ -10,19 +10,9 @@ pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
         .await?
         .ok_or_else(|| ServerFnError::new("unauthorized"))?;
 
-    state
-        .authz
-        .require(user.id, domain::PLATFORM_DOMAIN, "tenants", "create")
+    let tenant = saas::platform::create_tenant(&state.saas, &user, name)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let tenant = sqlx::query_as::<_, Tenant>(
-        "insert into tenants (name) values ($1) returning id, name, status, created_at",
-    )
-    .bind(name)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     Ok(tenant)
 }

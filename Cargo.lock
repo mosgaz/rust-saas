@@ -64,7 +64,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "authn",
  "authz",
+ "authz-casbin",
  "axum",
  "axum-extra",
  "chrono",
@@ -74,11 +76,13 @@ dependencies = [
  "dotenvy",
  "getrandom 0.2.17",
  "icons",
+ "identity",
  "jsonwebtoken",
  "leptos",
  "leptos_axum",
  "leptos_meta",
  "leptos_router",
+ "saas",
  "serde",
  "serde_json",
  "sqlx",
@@ -175,13 +179,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "authn"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chrono",
+ "domain",
+ "identity",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "authz"
 version = "0.1.0"
 dependencies = [
- "anyhow",
+ "async-trait",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "authz-casbin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "authz",
  "casbin",
  "domain",
  "sqlx-adapter",
+ "thiserror 2.0.21",
  "tokio",
  "uuid",
 ]
@@ -1361,6 +1392,17 @@ dependencies = [
  "zerofrom",
  "zerotrie",
  "zerovec",
+]
+
+[[package]]
+name = "identity"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "domain",
+ "sqlx",
+ "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]
@@ -2635,6 +2677,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "saas"
+version = "0.1.0"
+dependencies = [
+ "authz",
+ "domain",
+ "identity",
+ "sqlx",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2686,11 +2740,13 @@ name = "seed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
+ "authn",
  "authz",
+ "authz-casbin",
  "db",
  "domain",
  "dotenvy",
+ "identity",
  "sqlx",
  "tokio",
  "uuid",

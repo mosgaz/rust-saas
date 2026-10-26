@@ -1,4 +1,9 @@
 #[cfg(feature = "ssr")]
+use std::sync::Arc;
+
+#[cfg(feature = "ssr")]
+use authz::AuthorizationEngine;
+#[cfg(feature = "ssr")]
 use axum::Router;
 #[cfg(feature = "ssr")]
 use leptos::config::get_configuration;
@@ -19,8 +24,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // cargo-leptos может передать пустые LEPTOS_* переменные — leptos_config
-    // падает на .parse::<u32>() с "invalid port value".
     for key in ["LEPTOS_SITE_ADDR", "LEPTOS_RELOAD_PORT"] {
         if std::env::var(key)
             .map(|v| v.trim().is_empty())
@@ -33,10 +36,6 @@ async fn main() -> anyhow::Result<()> {
     let conf = get_configuration(None)?;
     let leptos_options = conf.leptos_options;
 
-    // BIND_ADDR — только override. Если в нём есть мусор (например, '\r' из
-    // прошлого export CRLF-.env), он не должен ронять приложение. Пробуем
-    // распарсить как SocketAddr; на неудаче откатываемся на leptos_options.site_addr,
-    // который гарантированно валиден (get_configuration уже отработал).
     let bind_addr: std::net::SocketAddr = match std::env::var("BIND_ADDR") {
         Ok(raw) => match raw.trim().parse::<std::net::SocketAddr>() {
             Ok(addr) => addr,
@@ -56,12 +55,22 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
-    let authz = std::sync::Arc::new(authz::Authz::new(&database_url).await?);
+    let authz: Arc<dyn AuthorizationEngine> =
+        Arc::new(authz_casbin::CasbinAuthz::new(&database_url).await?);
+
+    let authn = Arc::new(authn::Authn::new(pool.clone(), jwt_secret));
+
+    let saas = Arc::new(
+        saas::SaasBuilder::new(pool.clone())
+            .with_authz(Arc::clone(&authz))
+            .build()?,
+    );
 
     let app_state = app::state::AppState {
         pool,
         authz,
-        jwt_secret,
+        authn,
+        saas,
         leptos_options: leptos_options.clone(),
     };
 
