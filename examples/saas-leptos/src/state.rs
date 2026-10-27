@@ -4,19 +4,13 @@ use std::sync::Arc;
 #[cfg(feature = "ssr")]
 use authn::Authn;
 #[cfg(feature = "ssr")]
-use authz::AuthorizationEngine;
-#[cfg(feature = "ssr")]
 use leptos::prelude::LeptosOptions;
 #[cfg(feature = "ssr")]
 use saas::SaasState;
-#[cfg(feature = "ssr")]
-use sqlx::PgPool;
 
 #[cfg(feature = "ssr")]
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: PgPool,
-    pub authz: Arc<dyn AuthorizationEngine>,
     pub authn: Arc<Authn>,
     pub saas: Arc<SaasState>,
     pub leptos_options: LeptosOptions,

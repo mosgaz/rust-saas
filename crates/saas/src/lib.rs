@@ -43,10 +43,6 @@ pub struct SaasState {
 }
 
 impl SaasState {
-    pub fn new(pool: PgPool, authz: Arc<dyn AuthorizationEngine>) -> Self {
-        Self { pool, authz }
-    }
-
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }

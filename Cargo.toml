@@ -9,8 +9,8 @@ members = [
     "crates/saas",
     "crates/db",
     "crates/seed",
-    "crates/app",
 ]
+exclude = ["examples/*"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
