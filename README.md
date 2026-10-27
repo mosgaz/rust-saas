@@ -61,7 +61,7 @@ seed         -> authz, authn, identity, authz-casbin, db, domain
 saas         -> authz (trait), identity, domain, sqlx
 authn        -> identity, domain, sqlx, argon2, jsonwebtoken
 identity     -> domain, sqlx
-authz-casbin -> authz (trait), domain, casbin, sqlx-adapter
+authz-casbin -> authz (trait), domain, casbin, sqlx, sqlx-adapter
 authz        -> (trait only)
 db           -> sqlx
 domain       -> serde, uuid, chrono; sqlx (optional, ssr only)
@@ -122,6 +122,8 @@ Example roles:
 | Authentication | Argon2, JSON Web Tokens |
 | Styling | Tailwind CSS v4 |
 | Local infrastructure | Docker Compose (v1) |
+| Logging | `tracing` + `tracing-subscriber` (`RUST_LOG` env-filter) |
+| Testing | `cargo test`; `#[sqlx::test]` for per-test isolated databases |
 
 ## Getting started
 
@@ -181,16 +183,26 @@ Keep `.env.example` on the placeholder (`replace-with-a-long-random-secret`); do
 Then adjust the values if needed:
 
 ```env
+# Read by the application, the seed binary, and `cargo test` (`#[sqlx::test]`)
 DATABASE_URL=postgres://postgres:postgres@localhost:5430/rust_saas
 JWT_SECRET=replace-with-a-long-random-secret
 BIND_ADDR=127.0.0.1:3395
+
+# Read by docker-compose.yml (defaults are used if unset)
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_DB=rust_saas
+
+# tracing-subscriber env-filter (e.g. info, debug)
+RUST_LOG=info
 ```
 
 Notes:
 
-- `.env` lives in the **repository root** and is discovered by the seed binary and the example through `dotenvy` (which searches upward from the current directory). Run the commands below from their documented locations.
+- `.env` lives in the **repository root** and is discovered by the seed binary, the example, and `#[sqlx::test]` (which reads it via sqlx's built-in `dotenvy` support), so run the commands below from their documented locations.
 - `.env` must be LF, not CRLF. If you ever ran `export $(grep -v '^#' .env | xargs)`, `unset BIND_ADDR JWT_SECRET DATABASE_URL` and reopen the shell.
 - Do not put `LEPTOS_*` variables into `.env` — empty values break `get_configuration(None)`.
+- `DATABASE_URL` is used in three places: by the running application, by `seed`, and by `cargo test`. The user in `DATABASE_URL` must have the `CREATE DATABASE` privilege for `#[sqlx::test]`; the default `postgres` superuser from `docker-compose.yml` already does.
 
 ### Apply migrations and seed data
 
@@ -240,14 +252,23 @@ Then in the browser:
 From the repository root:
 
 ```bash
-# library + seed
-cargo check
-cargo check -p seed
-
-# reference example (outside the workspace)
-cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr
-cargo check --manifest-path examples/saas-leptos/Cargo.toml
+clear && cargo check && cargo check -p seed && cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr && cargo check --manifest-path examples/saas-leptos/Cargo.toml
 ```
+
+### Running tests
+
+From the repository root:
+
+```bash
+cargo test
+```
+
+Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn` and `crates/saas`. Integration tests live in `crates/authn/tests/` and `crates/saas/tests/` and use `#[sqlx::test]`:
+
+- Each test gets its own isolated database on the server pointed to by `DATABASE_URL`; `crates/db/migrations` are applied automatically; the database is dropped when the test finishes.
+- No manual `createdb` is required.
+- The user in `DATABASE_URL` must have the `CREATE DATABASE` privilege (the default `postgres` superuser satisfies this).
+- Tests can run in parallel; isolation is per-database.
 
 ## Project layout
 
@@ -283,7 +304,7 @@ The `AuthorizationEngine` trait, `AuthzError`, and `WorkspaceRole`. No Casbin, n
 
 ### authz-casbin
 
-`CasbinAuthz` — the canonical implementation of `AuthorizationEngine` on top of Casbin and `sqlx-adapter`. The `g`/`p` matcher and `grant_*` methods live here, driven by `WorkspaceRole::permissions()`. Business code never talks to Casbin directly.
+`CasbinAuthz` — the canonical implementation of `AuthorizationEngine` on top of Casbin and `sqlx-adapter`. The `g`/`p` matcher and `grant_*` methods live here, driven by `WorkspaceRole::permissions()`. Business code never talks to Casbin directly. Two constructors: `CasbinAuthz::new(&database_url)` (production, own pool) and `CasbinAuthz::from_pool(PgPool)` (consumers and tests that already have a pool, e.g. `#[sqlx::test]`).
 
 ### identity
 
@@ -291,11 +312,11 @@ The sole owner of the `users` table. Provides `AuthUser`, `UserRecord` (includin
 
 ### authn
 
-The authentication mechanism on top of `identity`. Provides `Authn::register`, `Authn::login`, `Authn::issue_token`, `Authn::verify_token`, and `hash_password`. Uses Argon2 and `jsonwebtoken`, and talks to `users` through `identity` (via `sqlx`, not through `db`). Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`. `verify_token` returns `Ok(None)` for deleted users and invalid `sub`, `Err` for invalid signature or expiry.
+The authentication mechanism on top of `identity`. Provides `Authn::register`, `Authn::login`, `Authn::issue_token`, `Authn::verify_token`, and `hash_password`. Uses Argon2 and `jsonwebtoken`, and talks to `users` through `identity` (via `sqlx`, not through `db`). Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`. `verify_token` returns `Ok(None)` for deleted users and invalid `sub`, `Err` for invalid signature or expiry. Covered by 10 unit tests and 6 `#[sqlx::test]` integration tests.
 
 ### saas
 
-Business logic, independent of UI framework. `SaasState`, `SaasBuilder`, `CoreError`, and services: `platform::create_tenant`, `tenant::create_workspace`, `workspace::create_document`, `workspace::list_documents`. Every service checks authorization via `state.authz.require(...)` before touching the database. Depends on `authz` (trait), `identity` (`AuthUser`), `domain`, and `sqlx`. Construction goes through `SaasBuilder` only; `SaasState::new` is intentionally not exposed, so `authz` is always present.
+Business logic, independent of UI framework. `SaasState`, `SaasBuilder`, `CoreError`, and services: `platform::create_tenant`, `tenant::create_workspace`, `workspace::create_document`, `workspace::list_documents`. Every service checks authorization via `state.authz.require(...)` before touching the database. `create_tenant` and `create_workspace` grant the creator `tenant_owner` / `workspace_admin` respectively, inside the same transaction, then commit. Depends on `authz` (trait), `identity` (`AuthUser`), `domain`, and `sqlx`. Construction goes through `SaasBuilder` only; `SaasState::new` is intentionally not exposed, so `authz` is always present. Covered by 6 unit tests (mock `AuthorizationEngine`) and 4 `#[sqlx::test]` integration tests.
 
 ### db
 
@@ -307,7 +328,7 @@ Standalone binary for creating initial platform, tenant, workspace, user, and po
 
 ### examples/saas-leptos
 
-The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: they resolve `current_user` through `authn`, then delegate to `saas::*`. `AppState` holds `authn`, `saas`, and `leptos_options`, and implements `FromRef<AppState> for LeptosOptions`. This crate is **not** part of the library workspace; it is checked separately with `--manifest-path examples/saas-leptos/Cargo.toml`.
+The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*` or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn`, which map to HTTP 400/401/403/404/409/500. `AppState` holds `authn`, `saas`, and `leptos_options`, and implements `FromRef<AppState> for LeptosOptions`. `src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping. This crate is **not** part of the library workspace; it is checked separately with `--manifest-path examples/saas-leptos/Cargo.toml`.
 
 ## Authorization model
 
@@ -358,10 +379,12 @@ Authorization is always checked on the server before business logic executes.
 - Prefer explicit roles and permissions over unrestricted superuser access.
 - `saas` and `authn` do not know about Leptos, Axum, or Casbin.
 - Library crates do not depend on `examples/*`; each example has its own `Cargo.toml` and `Cargo.lock`.
+- Server functions resolve the actor through `extract::CurrentUser`; a missing actor is HTTP 401, not a generic `ServerFnError`.
+- Library errors (`CoreError`, `AuthnError`, `IdentityError`) are mapped to HTTP status codes in the example (`src/error.rs`); keep new variants covered by that mapping.
 
 ## Roadmap
 
-- Stage 1: typed errors, `CurrentUser` extractor, integration tests for `authn` and cross-tenant access, mock `AuthorizationEngine` in `saas` tests
+- Stage 1 (done): typed error mapping to HTTP codes, `CurrentUser` extractor, mock `AuthorizationEngine` and `#[sqlx::test]` integration tests for `authn`, `saas`, and cross-tenant / cross-workspace access; `create_tenant` / `create_workspace` grant the creator a role
 - Stage 2: invitation-based workspace membership, refresh tokens with rotation, logout with session invalidation, role management UI, Casbin policy cleanup on delete
 - Stage 3: platform admin UI, tenant suspension, email verification, audit log
 - Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, optional RLS

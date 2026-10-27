@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
+use sqlx::PgPool;
 use sqlx_adapter::SqlxAdapter;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -34,11 +35,28 @@ pub struct CasbinAuthz {
 }
 
 impl CasbinAuthz {
+    /// Конструктор для production: собственный пул к `database_url` (pool_size = 8).
+    /// Используется в `examples/saas-leptos/src/main.rs`.
     pub async fn new(database_url: &str) -> Result<Self, AuthzError> {
-        let model = DefaultModel::from_str(MODEL)
+        let adapter = SqlxAdapter::new(database_url, 8)
             .await
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
-        let adapter = SqlxAdapter::new(database_url, 8)
+        Self::from_adapter(adapter).await
+    }
+
+    /// Конструктор поверх готового пула. Нужен потребителям, у которых уже есть
+    /// `PgPool` (например, `#[sqlx::test]` в integration-тестах `saas`).
+    /// `casbin_rule` должна существовать в БД, к которой подключён `pool`
+    /// (у нас — через `crates/db/migrations`).
+    pub async fn from_pool(pool: PgPool) -> Result<Self, AuthzError> {
+        let adapter = SqlxAdapter::new_with_pool(pool)
+            .await
+            .map_err(|e| AuthzError::Internal(e.to_string()))?;
+        Self::from_adapter(adapter).await
+    }
+
+    async fn from_adapter(adapter: SqlxAdapter) -> Result<Self, AuthzError> {
+        let model = DefaultModel::from_str(MODEL)
             .await
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
 

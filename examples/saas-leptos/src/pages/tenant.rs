@@ -14,13 +14,11 @@ struct TenantParams {
 pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
 
-    let user = crate::auth::current_user()
-        .await?
-        .ok_or_else(|| ServerFnError::new("unauthorized"))?;
+    let user = crate::extract::CurrentUser::from_request().await?.require()?;
 
     let workspace = saas::tenant::create_workspace(&state.saas, &user, tenant_id, name)
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(crate::error::core_error_to_server_fn)?;
 
     Ok(workspace)
 }

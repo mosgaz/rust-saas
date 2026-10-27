@@ -6,13 +6,11 @@ use leptos::task::spawn_local;
 pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
 
-    let user = crate::auth::current_user()
-        .await?
-        .ok_or_else(|| ServerFnError::new("unauthorized"))?;
+    let user = crate::extract::CurrentUser::from_request().await?.require()?;
 
     let tenant = saas::platform::create_tenant(&state.saas, &user, name)
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(crate::error::core_error_to_server_fn)?;
 
     Ok(tenant)
 }

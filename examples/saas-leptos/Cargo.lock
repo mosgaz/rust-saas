@@ -175,6 +175,7 @@ dependencies = [
  "authz",
  "casbin",
  "domain",
+ "sqlx",
  "sqlx-adapter",
  "thiserror 2.0.21",
  "tokio",

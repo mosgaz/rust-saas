@@ -9,6 +9,7 @@ authz = { path = "../authz" }
 domain = { path = "../domain" }
 
 casbin.workspace = true
+sqlx.workspace = true
 sqlx-adapter.workspace = true
 tokio.workspace = true
 
