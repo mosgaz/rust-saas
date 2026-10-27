@@ -16,3 +16,9 @@ serde_json = "1"
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+# `macros` нужен для `#[sqlx::test]`; `.env` макрос читает сам через внутренний `dotenvy`,
+# отдельной feature для этого нет.
+sqlx = { workspace = true, features = ["macros"] }

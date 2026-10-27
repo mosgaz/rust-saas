@@ -2,6 +2,10 @@ pub mod auth;
 pub mod pages;
 
 #[cfg(feature = "ssr")]
+pub mod error;
+#[cfg(feature = "ssr")]
+pub mod extract;
+#[cfg(feature = "ssr")]
 pub mod state;
 
 use leptos::prelude::*;

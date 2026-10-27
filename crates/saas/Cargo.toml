@@ -12,3 +12,12 @@ identity = { path = "../identity" }
 sqlx.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio.workspace = true
+chrono.workspace = true
+authz-casbin = { path = "../authz-casbin" }
+authn = { path = "../authn" }
+# `macros` нужен для `#[sqlx::test]`; `.env` макрос читает сам через внутренний `dotenvy`.
+sqlx = { workspace = true, features = ["macros"] }
