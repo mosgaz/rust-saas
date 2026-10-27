@@ -4,14 +4,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
-pub struct User {
-    pub id: Uuid,
-    pub email: String,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
 pub struct Tenant {
     pub id: Uuid,
     pub name: String,

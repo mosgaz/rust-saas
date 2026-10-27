@@ -61,20 +61,18 @@ async fn main() -> anyhow::Result<()> {
     let authn = Arc::new(authn::Authn::new(pool.clone(), jwt_secret));
 
     let saas = Arc::new(
-        saas::SaasBuilder::new(pool.clone())
-            .with_authz(Arc::clone(&authz))
+        saas::SaasBuilder::new(pool)
+            .with_authz(authz)
             .build()?,
     );
 
-    let app_state = app::state::AppState {
-        pool,
-        authz,
+    let app_state = saas_leptos::state::AppState {
         authn,
         saas,
         leptos_options: leptos_options.clone(),
     };
 
-    let routes = generate_route_list(app::App);
+    let routes = generate_route_list(saas_leptos::App);
 
     let router = Router::new()
         .leptos_routes_with_context(
@@ -86,10 +84,10 @@ async fn main() -> anyhow::Result<()> {
             },
             {
                 let opts = leptos_options.clone();
-                move || app::shell(opts.clone())
+                move || saas_leptos::shell(opts.clone())
             },
         )
-        .fallback(leptos_axum::file_and_error_handler::<app::state::AppState, _>(app::shell))
+        .fallback(leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell))
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 

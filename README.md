@@ -1,8 +1,8 @@
-# rust-saas
+# Rust SAAS
 
-**rust-saas** is a full-stack Rust platform for building multi-tenant SaaS applications.
+**rust-saas** is a Rust library and reference application for building multi-tenant SaaS.
 
-It combines an isomorphic Leptos frontend, an Axum-based backend, PostgreSQL persistence, and Casbin-powered authorization. The project is organized as a Cargo workspace with focused crates that separate business logic, identity, authentication, authorization, and transport from each other, so the core crates can be reused in other applications through git dependencies.
+The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, authorization, and persistence from each other, so they can be reused in other applications through git dependencies. The `examples/saas-leptos` directory contains a reference consumer that combines them with an isomorphic Leptos frontend and an Axum-based backend.
 
 ## Features
 
@@ -22,20 +22,24 @@ It combines an isomorphic Leptos frontend, an Axum-based backend, PostgreSQL per
 
 ## Architecture
 
-The repository uses a Cargo workspace:
+The repository is split into two layers:
 
 ```text
-crates/
-├── domain/         Shared DTOs, domain helpers, PLATFORM_DOMAIN
-├── authz/          AuthorizationEngine trait + AuthzError (no Casbin)
-├── authz-casbin/   CasbinAuthz: canonical trait implementation
-├── identity/       Sole owner of `users`: AuthUser, UserRecord, validation, CRUD
-├── authn/          Argon2, JWT, register/login/verify_token/issue_token
-├── saas/           Business logic: platform, tenant, workspace, documents
-├── db/             PostgreSQL connection and migrations
-├── seed/           Bootstrap data and demo accounts
-└── app/            Leptos UI, Axum server, server functions
+crates/                  (library — the Cargo workspace)
+├── domain/             Shared DTOs, domain helpers, PLATFORM_DOMAIN
+├── authz/              AuthorizationEngine trait + AuthzError (no Casbin)
+├── authz-casbin/       CasbinAuthz: canonical trait implementation
+├── identity/           Sole owner of `users`: AuthUser, UserRecord, validation, CRUD
+├── authn/              Argon2, JWT, register/login/verify_token/issue_token
+├── saas/               Business logic: platform, tenant, workspace, documents
+├── db/                 PostgreSQL connection and migrations
+└── seed/               Bootstrap data and demo accounts
+
+examples/                (reference consumers — outside the workspace)
+└── saas-leptos/        Leptos SSR + Axum + #[server] + cookie
 ```
+
+`examples/*` is listed in `workspace.exclude`; each example has its own `Cargo.toml` and `Cargo.lock`, and depends on the library crates via path dependencies pointing at `../../crates/*`.
 
 The application separates four concerns:
 
@@ -52,12 +56,12 @@ UI does not replace backend authorization.`
 ### Crate dependency graph
 
 ```text
-app          -> saas, authn, identity, authz-casbin, db, domain
-seed         -> authn, identity, authz-casbin, db, domain
-saas         -> authz (trait), identity, db, domain
-authn        -> identity, db, domain
+saas-leptos  -> domain, authz, authz-casbin, identity, authn, saas, db   (example)
+seed         -> authz, authn, identity, authz-casbin, db, domain
+saas         -> authz (trait), identity, domain, sqlx
+authn        -> identity, domain, sqlx, argon2, jsonwebtoken
 identity     -> domain, sqlx
-authz-casbin -> authz (trait), casbin, sqlx-adapter
+authz-casbin -> authz (trait), domain, casbin, sqlx-adapter
 authz        -> (trait only)
 db           -> sqlx
 domain       -> serde, uuid, chrono; sqlx (optional, ssr only)
@@ -70,7 +74,8 @@ Forbidden edges:
 - `identity` does not depend on `authn` or `authz`.
 - `authz` does not depend on Casbin, SQL, HTTP, Leptos, or JWT.
 - `authz-casbin` does not depend on business tables (`users`, `tenants`).
-- `app` does not call `casbin_rule` directly and does not call `authz.require` — only `saas::*` and `authn::*`.
+- The example (`examples/saas-leptos`) does not call `casbin_rule` directly and does not call `authz.require` — only `saas::*` and `authn::*`.
+- Library crates do not depend on `examples/*`.
 
 ### Multi-tenancy model
 
@@ -109,8 +114,8 @@ Example roles:
 | Layer | Technology |
 |---|---|
 | Language | Rust |
-| UI | Leptos |
-| Backend | Axum |
+| UI | Leptos (in the reference example) |
+| Backend | Axum (in the reference example) |
 | Database | PostgreSQL 16 |
 | Database access | SQLx |
 | Authorization | Casbin (via `authz-casbin`) |
@@ -136,6 +141,8 @@ cargo install --locked cargo-leptos
 
 ### Start PostgreSQL
 
+Run from the repository root:
+
 ```bash
 docker-compose up -d
 docker-compose ps   # STATUS = Up (healthy)
@@ -143,7 +150,7 @@ docker-compose ps   # STATUS = Up (healthy)
 
 ### Configure environment
 
-Copy the example environment file:
+Copy the example environment file at the repository root:
 
 ```bash
 cp .env.example .env
@@ -181,10 +188,13 @@ BIND_ADDR=127.0.0.1:3395
 
 Notes:
 
+- `.env` lives in the **repository root** and is discovered by the seed binary and the example through `dotenvy` (which searches upward from the current directory). Run the commands below from their documented locations.
 - `.env` must be LF, not CRLF. If you ever ran `export $(grep -v '^#' .env | xargs)`, `unset BIND_ADDR JWT_SECRET DATABASE_URL` and reopen the shell.
 - Do not put `LEPTOS_*` variables into `.env` — empty values break `get_configuration(None)`.
 
 ### Apply migrations and seed data
+
+Run from the repository root:
 
 ```bash
 cargo run -p seed
@@ -203,9 +213,12 @@ The command applies database migrations and creates initial platform, tenant, wo
 
 Seed prints `tenant id:` and `workspace id:`; use them in the UI as shown below.
 
-### Run the application
+### Run the reference application
+
+The example is outside the workspace and has its own manifest, so it is run from its directory:
 
 ```bash
+cd examples/saas-leptos
 cargo leptos watch
 ```
 
@@ -222,6 +235,20 @@ Then in the browser:
 3. `/tenant/<tenant_id>` — as tenant owner, create a workspace.
 4. `/workspace/<workspace_id>` — as editor, create documents; as viewer, list only.
 
+### Checking the build
+
+From the repository root:
+
+```bash
+# library + seed
+cargo check
+cargo check -p seed
+
+# reference example (outside the workspace)
+cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr
+cargo check --manifest-path examples/saas-leptos/Cargo.toml
+```
+
 ## Project layout
 
 ```text
@@ -229,29 +256,34 @@ Then in the browser:
 ├── Cargo.toml
 ├── docker-compose.yml
 ├── .env.example
-└── crates/
-    ├── domain/
-    ├── authz/
-    ├── authz-casbin/
-    ├── identity/
-    ├── authn/
-    ├── saas/
-    ├── db/
-    ├── seed/
-    └── app/
+├── crates/
+│   ├── domain/
+│   ├── authz/
+│   ├── authz-casbin/
+│   ├── identity/
+│   ├── authn/
+│   ├── saas/
+│   ├── db/
+│   └── seed/
+└── examples/
+    └── saas-leptos/
+        ├── Cargo.toml
+        ├── src/
+        ├── style/
+        └── public/
 ```
 
 ### domain
 
-Shared DTOs (`User`, `Tenant`, `Workspace`, `Document`, `AuthUser`), authorization domain helpers (`PLATFORM_DOMAIN`, `tenant_domain`, `workspace_domain`). No SQL queries, no logic — just types. `sqlx::FromRow` derives are gated behind the `ssr` feature.
+Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`), authorization domain helpers (`PLATFORM_DOMAIN`, `tenant_domain`, `workspace_domain`). No SQL queries, no logic — just types. `sqlx::FromRow` derives are gated behind the `ssr` feature.
 
 ### authz
 
-The `AuthorizationEngine` trait and `AuthzError`. No Casbin, no SQL, no HTTP. Consumers depend on this crate only; the trait is dyn-safe (`async-trait`), so business code works with `Arc<dyn AuthorizationEngine>`.
+The `AuthorizationEngine` trait, `AuthzError`, and `WorkspaceRole`. No Casbin, no SQL, no HTTP. Consumers depend on this crate only; the trait is dyn-safe (`async-trait`), so business code works with `Arc<dyn AuthorizationEngine>`.
 
 ### authz-casbin
 
-`CasbinAuthz` — the canonical implementation of `AuthorizationEngine` on top of Casbin and `sqlx-adapter`. The `g`/`p` matcher, `grant_*` methods, and `WorkspaceRole` permissions live here. Business code never talks to Casbin directly.
+`CasbinAuthz` — the canonical implementation of `AuthorizationEngine` on top of Casbin and `sqlx-adapter`. The `g`/`p` matcher and `grant_*` methods live here, driven by `WorkspaceRole::permissions()`. Business code never talks to Casbin directly.
 
 ### identity
 
@@ -259,11 +291,11 @@ The sole owner of the `users` table. Provides `AuthUser`, `UserRecord` (includin
 
 ### authn
 
-The authentication mechanism on top of `identity`. Provides `Authn::register`, `Authn::login`, `Authn::issue_token`, `Authn::verify_token`, and `hash_password`. Uses Argon2 and `jsonwebtoken`. Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`. `verify_token` returns `Ok(None)` for deleted users and invalid `sub`, `Err` for invalid signature or expiry.
+The authentication mechanism on top of `identity`. Provides `Authn::register`, `Authn::login`, `Authn::issue_token`, `Authn::verify_token`, and `hash_password`. Uses Argon2 and `jsonwebtoken`, and talks to `users` through `identity` (via `sqlx`, not through `db`). Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`. `verify_token` returns `Ok(None)` for deleted users and invalid `sub`, `Err` for invalid signature or expiry.
 
 ### saas
 
-Business logic, independent of UI framework. `SaasState`, `SaasBuilder`, `CoreError`, and services: `platform::create_tenant`, `tenant::create_workspace`, `workspace::create_document`, `workspace::list_documents`. Every service checks authorization via `state.authz.require(...)` before touching the database. Depends only on `authz` (trait), `identity` (`AuthUser`), `db`, and `domain`.
+Business logic, independent of UI framework. `SaasState`, `SaasBuilder`, `CoreError`, and services: `platform::create_tenant`, `tenant::create_workspace`, `workspace::create_document`, `workspace::list_documents`. Every service checks authorization via `state.authz.require(...)` before touching the database. Depends on `authz` (trait), `identity` (`AuthUser`), `domain`, and `sqlx`. Construction goes through `SaasBuilder` only; `SaasState::new` is intentionally not exposed, so `authz` is always present.
 
 ### db
 
@@ -271,11 +303,11 @@ PostgreSQL connection helper and migration runner. Migrations live in `crates/db
 
 ### seed
 
-Standalone binary for creating initial platform, tenant, workspace, user, and policy data. Uses `identity::upsert_user`, `authn::hash_password`, and `authz-casbin` grants; other bootstrap rows are written with inline SQL by design (§10 of the handoff).
+Standalone binary for creating initial platform, tenant, workspace, user, and policy data. Uses `identity::upsert_user`, `authn::hash_password`, `authz::WorkspaceRole`, and `authz-casbin` grants; other bootstrap rows are written with inline SQL by design (§10 of the handoff).
 
-### app
+### examples/saas-leptos
 
-The application crate: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: they resolve `current_user` through `authn`, then delegate to `saas::*`. `AppState` holds `pool`, `authz`, `authn`, `saas`, and `leptos_options`, and implements `FromRef<AppState> for LeptosOptions`.
+The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: they resolve `current_user` through `authn`, then delegate to `saas::*`. `AppState` holds `authn`, `saas`, and `leptos_options`, and implements `FromRef<AppState> for LeptosOptions`. This crate is **not** part of the library workspace; it is checked separately with `--manifest-path examples/saas-leptos/Cargo.toml`.
 
 ## Authorization model
 
@@ -325,13 +357,14 @@ Authorization is always checked on the server before business logic executes.
 - Treat UI visibility as convenience, not as a security boundary.
 - Prefer explicit roles and permissions over unrestricted superuser access.
 - `saas` and `authn` do not know about Leptos, Axum, or Casbin.
+- Library crates do not depend on `examples/*`; each example has its own `Cargo.toml` and `Cargo.lock`.
 
 ## Roadmap
 
 - Stage 1: typed errors, `CurrentUser` extractor, integration tests for `authn` and cross-tenant access, mock `AuthorizationEngine` in `saas` tests
-- Stage 2: invitation-based workspace membership, role management UI, Casbin policy cleanup on delete
-- Stage 3: platform admin UI, tenant suspension, audit log
-- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups
+- Stage 2: invitation-based workspace membership, refresh tokens with rotation, logout with session invalidation, role management UI, Casbin policy cleanup on delete
+- Stage 3: platform admin UI, tenant suspension, email verification, audit log
+- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, optional RLS
 
 ## License
 

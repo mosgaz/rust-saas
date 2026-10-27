@@ -99,3 +99,6 @@ docker-data/
 # ─────────────────────────────────────────────────────────────────────────────
 node_modules/
 dist/
+# Examples are excluded from workspace; each keeps its own target/ and lockfile
+examples/*/target/
+examples/*/dist/
