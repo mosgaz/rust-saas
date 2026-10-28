@@ -88,6 +88,42 @@ pub async fn list_permissions(state: &SaasState) -> Result<Vec<Permission>, Core
         .map_err(Into::into)
 }
 
+/// Returns the `(resource, action)` pairs that `actor` is effectively
+/// allowed to perform in `domain`.
+///
+/// Iterates the reference table (`access::list_permissions`) and calls
+/// `authz.can(actor.id, domain, resource, action)` for each pair. This is a
+/// **read-only UX helper** for gating buttons and links; it does **not**
+/// replace `authz.require` in `saas::*` services, which every action still
+/// calls server-side.
+///
+/// No `require` call: any authenticated actor may discover their own
+/// effective permissions in a domain. A non-member gets an empty vector.
+pub async fn my_permissions(
+    state: &SaasState,
+    actor: &AuthUser,
+    domain: &str,
+) -> Result<Vec<(String, String)>, CoreError> {
+    let reference = ::access::list_permissions(state.access())
+        .await
+        .map_err(CoreError::from)?;
+
+    let mut out = Vec::with_capacity(reference.len());
+    for Permission {
+        resource, action, ..
+    } in reference
+    {
+        if state
+            .authz()
+            .can(actor.id, domain, &resource, &action)
+            .await?
+        {
+            out.push((resource, action));
+        }
+    }
+    Ok(out)
+}
+
 /// Assigns `role_key` to `user_id` in `domain`.
 ///
 /// Order:

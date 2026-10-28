@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use access::{AccessError, AccessState, RoleKey};
-use authz::{AuthzError, AuthorizationEngine};
+use authz::{AuthorizationEngine, AuthzError};
 use chrono::Utc;
 use domain::AuthUser;
 use sqlx::PgPool;
@@ -102,7 +102,10 @@ async fn create_owner_role_grants_all_permissions_and_is_idempotent(pool: PgPool
     let role2 = access::create_owner_role(&state, domain)
         .await
         .expect("idempotent create_owner_role must succeed");
-    assert_eq!(role1.id, role2.id, "idempotent call must return the same row");
+    assert_eq!(
+        role1.id, role2.id,
+        "idempotent call must return the same row"
+    );
 
     let count: i64 = sqlx::query_scalar("select count(*) from roles where domain = $1")
         .bind(domain)

@@ -8,13 +8,14 @@
 use std::sync::Arc;
 
 use ::access::{AccessError, AccessState, RoleKey};
-use authz::{AuthzError, AuthorizationEngine};
+use authz::{AuthorizationEngine, AuthzError};
 use domain::{AuthUser, Document, Tenant, Workspace, PLATFORM_DOMAIN};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 pub mod access;
 pub mod invitation;
+pub mod member;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -104,9 +105,9 @@ impl SaasBuilder {
     }
 
     pub fn build(self) -> Result<SaasState, CoreError> {
-        let authz = self
-            .authz
-            .ok_or_else(|| CoreError::Internal("SaasBuilder: authorization engine is required".into()))?;
+        let authz = self.authz.ok_or_else(|| {
+            CoreError::Internal("SaasBuilder: authorization engine is required".into())
+        })?;
         let access = self
             .access
             .ok_or_else(|| CoreError::Internal("SaasBuilder: access state is required".into()))?;
@@ -170,9 +171,10 @@ pub mod platform {
             .await
             .map_err(CoreError::from)?;
 
-        let permissions = ::access::get_permissions_for_role(state.access(), &domain_str, owner_role_key)
-            .await
-            .map_err(CoreError::from)?;
+        let permissions =
+            ::access::get_permissions_for_role(state.access(), &domain_str, owner_role_key)
+                .await
+                .map_err(CoreError::from)?;
 
         state
             .authz
@@ -237,9 +239,10 @@ pub mod tenant {
             .await
             .map_err(CoreError::from)?;
 
-        let permissions = ::access::get_permissions_for_role(state.access(), &ws_domain, owner_role_key)
-            .await
-            .map_err(CoreError::from)?;
+        let permissions =
+            ::access::get_permissions_for_role(state.access(), &ws_domain, owner_role_key)
+                .await
+                .map_err(CoreError::from)?;
 
         state
             .authz
@@ -514,7 +517,10 @@ mod tests {
     fn lazy_state(mock: Arc<MockAuthz>) -> SaasState {
         let pool = PgPool::connect_lazy("postgres://saas-test-host/saas_test")
             .expect("lazy pool must be constructible");
-        let access = Arc::new(AccessState::new(pool.clone(), mock.clone() as Arc<dyn AuthorizationEngine>));
+        let access = Arc::new(AccessState::new(
+            pool.clone(),
+            mock.clone() as Arc<dyn AuthorizationEngine>,
+        ));
         SaasBuilder::new(pool)
             .with_authz(mock as Arc<dyn AuthorizationEngine>)
             .with_access(access)
@@ -584,9 +590,16 @@ mod tests {
         let tenant_id = Uuid::new_v4();
         let role_key = RoleKey::parse("owner").unwrap();
 
-        let err = tenant::create_workspace(&state, &actor, tenant_id, "Marketing".into(), &actor, &role_key)
-            .await
-            .expect_err("require must deny");
+        let err = tenant::create_workspace(
+            &state,
+            &actor,
+            tenant_id,
+            "Marketing".into(),
+            &actor,
+            &role_key,
+        )
+        .await
+        .expect_err("require must deny");
         assert!(matches!(err, CoreError::Forbidden));
 
         let calls = mock.require_calls();
@@ -734,13 +747,10 @@ mod tests {
         let actor = actor();
         let workspace_id = Uuid::new_v4();
 
-        let err = invitation::list_invitations(
-            &state,
-            &actor,
-            InvitationTarget::Workspace(workspace_id),
-        )
-        .await
-        .expect_err("require must deny");
+        let err =
+            invitation::list_invitations(&state, &actor, InvitationTarget::Workspace(workspace_id))
+                .await
+                .expect_err("require must deny");
         assert!(matches!(err, CoreError::Forbidden));
 
         let calls = mock.require_calls();

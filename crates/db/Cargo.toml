@@ -2,7 +2,7 @@
 name = "db"
 version = "0.1.0"
 edition = "2021"
-description = "PostgreSQL, migrations"
+description = "PostgreSQL connection helper and migrations runner"
 
 [dependencies]
 sqlx.workspace = true

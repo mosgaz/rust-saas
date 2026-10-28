@@ -138,9 +138,10 @@ pub async fn accept_invitation(
 
     if let Some(tenant_id) = invitation.tenant_id {
         let domain_str = domain::tenant_domain(tenant_id);
-        let permissions = ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
-            .await
-            .map_err(CoreError::from)?;
+        let permissions =
+            ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
+                .await
+                .map_err(CoreError::from)?;
 
         sqlx::query(
             r#"
@@ -159,12 +160,12 @@ pub async fn accept_invitation(
             .authz
             .grant_role(user.id, &domain_str, role_key.as_str(), &permissions)
             .await?;
-
     } else if let Some(workspace_id) = invitation.workspace_id {
         let domain_str = domain::workspace_domain(workspace_id);
-        let permissions = ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
-            .await
-            .map_err(CoreError::from)?;
+        let permissions =
+            ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
+                .await
+                .map_err(CoreError::from)?;
 
         sqlx::query(
             r#"
@@ -183,7 +184,6 @@ pub async fn accept_invitation(
             .authz
             .grant_role(user.id, &domain_str, role_key.as_str(), &permissions)
             .await?;
-
     } else {
         return Err(CoreError::Internal(
             "invitation has neither tenant_id nor workspace_id".into(),
@@ -296,8 +296,8 @@ async fn validate_role(
     role: &str,
 ) -> Result<(), CoreError> {
     let domain_str = target_domain(target);
-    let role_key = ::access::RoleKey::parse(role)
-        .map_err(|e| CoreError::Validation(e.to_string()))?;
+    let role_key =
+        ::access::RoleKey::parse(role).map_err(|e| CoreError::Validation(e.to_string()))?;
 
     let exists = ::access::get_role(state.access(), &domain_str, &role_key)
         .await

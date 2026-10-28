@@ -9,7 +9,11 @@ use std::sync::Arc;
 use access::{AccessState, RoleKey};
 use authz_casbin::CasbinAuthz;
 use domain::{AuthUser, InvitationTarget};
-use saas::{access as saas_access, invitation, platform, tenant, workspace, CoreError, SaasBuilder, SaasState};
+use saas::member::MemberScope;
+use saas::{
+    access as saas_access, invitation, member, platform, tenant, workspace, CoreError, SaasBuilder,
+    SaasState,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -68,14 +72,13 @@ async fn create_tenant_creates_row_without_membership(pool: PgPool) {
         .await
         .expect("create_tenant must succeed");
 
-    let member: Option<String> = sqlx::query_scalar(
-        "select role from tenant_members where tenant_id = $1 and user_id = $2",
-    )
-    .bind(tenant.id)
-    .bind(admin.id)
-    .fetch_optional(&pool)
-    .await
-    .expect("query tenant_members");
+    let member: Option<String> =
+        sqlx::query_scalar("select role from tenant_members where tenant_id = $1 and user_id = $2")
+            .bind(tenant.id)
+            .bind(admin.id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query tenant_members");
     assert!(
         member.is_none(),
         "create_tenant must not write tenant_members"
@@ -109,24 +112,22 @@ async fn provision_tenant_grants_owner_and_membership(pool: PgPool) {
         .await
         .expect("provision_tenant must succeed");
 
-    let owner_role: Option<String> = sqlx::query_scalar(
-        "select role from tenant_members where tenant_id = $1 and user_id = $2",
-    )
-    .bind(tenant.id)
-    .bind(owner.id)
-    .fetch_optional(&pool)
-    .await
-    .expect("query tenant_members for owner");
+    let owner_role: Option<String> =
+        sqlx::query_scalar("select role from tenant_members where tenant_id = $1 and user_id = $2")
+            .bind(tenant.id)
+            .bind(owner.id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query tenant_members for owner");
     assert_eq!(owner_role.as_deref(), Some("owner"));
 
-    let actor_role: Option<String> = sqlx::query_scalar(
-        "select role from tenant_members where tenant_id = $1 and user_id = $2",
-    )
-    .bind(tenant.id)
-    .bind(admin.id)
-    .fetch_optional(&pool)
-    .await
-    .expect("query tenant_members for actor");
+    let actor_role: Option<String> =
+        sqlx::query_scalar("select role from tenant_members where tenant_id = $1 and user_id = $2")
+            .bind(tenant.id)
+            .bind(admin.id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query tenant_members for actor");
     assert!(
         actor_role.is_none(),
         "platform admin must not become a tenant member by provisioning"
@@ -165,15 +166,22 @@ async fn create_workspace_grants_owner_and_membership(pool: PgPool) {
     let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
     grant_platform_admin(&saas, &admin).await;
-    
+
     let owner_key = RoleKey::parse("owner").unwrap();
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"), &admin, &owner_key)
-        .await
-        .expect("create_workspace must succeed");
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .expect("create_workspace must succeed");
 
     let role: Option<String> = sqlx::query_scalar(
         "select role from workspace_members where workspace_id = $1 and user_id = $2",
@@ -210,9 +218,16 @@ async fn platform_admin_cannot_create_document_without_workspace_role(pool: PgPo
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(&saas, &owner, tenant.id, unique_name("Eng"), &owner, &owner_key)
-        .await
-        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &owner,
+        tenant.id,
+        unique_name("Eng"),
+        &owner,
+        &owner_key,
+    )
+    .await
+    .unwrap();
 
     let err = workspace::create_document(&saas, &admin, ws.id, "doc".into())
         .await
@@ -225,18 +240,32 @@ async fn cross_workspace_isolation(pool: PgPool) {
     let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
     grant_platform_admin(&saas, &admin).await;
-    
+
     let owner_key = RoleKey::parse("owner").unwrap();
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws1"), &admin, &owner_key)
-        .await
-        .unwrap();
-    let ws2 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws2"), &admin, &owner_key)
-        .await
-        .unwrap();
+    let ws1 = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("ws1"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+    let ws2 = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("ws2"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
 
     workspace::create_document(&saas, &admin, ws1.id, "private".into())
         .await
@@ -252,7 +281,10 @@ async fn cross_workspace_isolation(pool: PgPool) {
     let write_err = workspace::create_document(&saas, &outsider, ws2.id, "x".into())
         .await
         .expect_err("outsider must be forbidden");
-    assert!(matches!(write_err, CoreError::Forbidden), "got {write_err:?}");
+    assert!(
+        matches!(write_err, CoreError::Forbidden),
+        "got {write_err:?}"
+    );
 
     let docs = workspace::list_documents(&saas, &admin, ws1.id)
         .await
@@ -303,18 +335,32 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
     let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
     grant_platform_admin(&saas, &admin).await;
-    
+
     let owner_key = RoleKey::parse("owner").unwrap();
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws1"), &admin, &owner_key)
-        .await
-        .unwrap();
-    let ws2 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws2"), &admin, &owner_key)
-        .await
-        .unwrap();
+    let ws1 = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("ws1"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+    let ws2 = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("ws2"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
 
     let editor = make_user(&pool, "editor").await;
     let editor_key = RoleKey::parse("editor").unwrap();
@@ -345,14 +391,15 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
     assert!(admin_ids.contains(&ws2.id));
 
     let editor_list = workspace::list_memberships(&saas, &editor).await.unwrap();
-    assert_eq!(editor_list.len(), 1, "editor must see exactly one workspace");
+    assert_eq!(
+        editor_list.len(),
+        1,
+        "editor must see exactly one workspace"
+    );
     assert_eq!(editor_list[0].id, ws1.id);
 
     let outsider_list = workspace::list_memberships(&saas, &outsider).await.unwrap();
-    assert!(
-        outsider_list.is_empty(),
-        "outsider must see no workspaces"
-    );
+    assert!(outsider_list.is_empty(), "outsider must see no workspaces");
 }
 
 // ─── Invitations ────────────────────────────────────────────────────────────
@@ -364,7 +411,7 @@ async fn create_tenant_invitation_persists_row_and_returns_token(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
-    
+
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
@@ -394,12 +441,11 @@ async fn create_tenant_invitation_persists_row_and_returns_token(pool: PgPool) {
     assert_eq!(inv.token_hash.len(), 64, "sha-256 hex");
     assert_ne!(inv.token_hash, token);
 
-    let count: i64 =
-        sqlx::query_scalar("select count(*) from invitations where token_hash = $1")
-            .bind(&inv.token_hash)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let count: i64 = sqlx::query_scalar("select count(*) from invitations where token_hash = $1")
+        .bind(&inv.token_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(count, 1);
 
     let alive: bool =
@@ -416,14 +462,21 @@ async fn create_workspace_invitation_persists_row_and_returns_token(pool: PgPool
     let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
     grant_platform_admin(&saas, &admin).await;
-    
+
     let owner_key = RoleKey::parse("owner").unwrap();
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"), &admin, &owner_key)
-        .await
-        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
 
     let editor_key = RoleKey::parse("editor").unwrap();
     let ws_domain = domain::workspace_domain(ws.id);
@@ -466,7 +519,7 @@ async fn accept_tenant_invitation_grants_owner_and_membership(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
-    
+
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
@@ -490,14 +543,13 @@ async fn accept_tenant_invitation_grants_owner_and_membership(pool: PgPool) {
         .expect("accept must succeed");
     assert_eq!(accepted.id, inv.id);
 
-    let role: Option<String> = sqlx::query_scalar(
-        "select role from tenant_members where tenant_id = $1 and user_id = $2",
-    )
-    .bind(tenant.id)
-    .bind(invitee.id)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    let role: Option<String> =
+        sqlx::query_scalar("select role from tenant_members where tenant_id = $1 and user_id = $2")
+            .bind(tenant.id)
+            .bind(invitee.id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
     assert_eq!(role.as_deref(), Some("owner"));
 
     let can = saas
@@ -525,14 +577,21 @@ async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
     let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
     grant_platform_admin(&saas, &admin).await;
-    
+
     let owner_key = RoleKey::parse("owner").unwrap();
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"), &admin, &owner_key)
-        .await
-        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
 
     let editor_key = RoleKey::parse("editor").unwrap();
     let ws_domain = domain::workspace_domain(ws.id);
@@ -595,7 +654,7 @@ async fn accept_invitation_after_exhaustion_returns_not_found(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
-    
+
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
@@ -631,7 +690,7 @@ async fn accept_invitation_after_revoke_returns_not_found(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
-    
+
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
@@ -666,7 +725,7 @@ async fn accept_invitation_after_expiry_returns_not_found(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
-    
+
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
@@ -694,4 +753,389 @@ async fn accept_invitation_after_expiry_returns_not_found(pool: PgPool) {
         .await
         .expect_err("expired invitation must be rejected");
     assert!(matches!(err, CoreError::NotFound), "got {err:?}");
+}
+
+// ─── Members (Stage 2c) ─────────────────────────────────────────────────────
+
+/// Tenant member listing groups multiple roles per user and requires
+/// `(members, list)`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn member_list_tenant_groups_roles_and_requires_list(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let owner = make_user(&pool, "owner").await;
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
+        .await
+        .unwrap();
+
+    let tenant_domain = domain::tenant_domain(tenant.id);
+
+    // Custom role `auditor` in the tenant domain.
+    let auditor_key = RoleKey::parse("auditor").unwrap();
+    saas_access::create_role(
+        &saas,
+        &owner,
+        &tenant_domain,
+        &auditor_key,
+        "Auditor".to_string(),
+        "".to_string(),
+        &[("members".to_string(), "list".to_string())],
+    )
+    .await
+    .unwrap();
+
+    // `auditor` is also added to the owner so that `owner` holds two roles.
+    saas_access::assign_role(&saas, &owner, owner.id, &tenant_domain, &auditor_key)
+        .await
+        .unwrap();
+
+    let members = member::list(&saas, &owner, MemberScope::Tenant(tenant.id))
+        .await
+        .expect("list must succeed");
+    assert_eq!(members.len(), 1, "only the owner is a member");
+    let entry = &members[0];
+    assert_eq!(entry.user_id, owner.id);
+    assert_eq!(entry.email, owner.email);
+    assert_eq!(entry.roles.len(), 2);
+    assert!(entry.roles.iter().any(|r| r == "owner"));
+    assert!(entry.roles.iter().any(|r| r == "auditor"));
+
+    // Non-member is forbidden.
+    let outsider = make_user(&pool, "outsider").await;
+    let err = member::list(&saas, &outsider, MemberScope::Tenant(tenant.id))
+        .await
+        .expect_err("outsider must be forbidden");
+    assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
+}
+
+/// Workspace member listing includes users holding a workspace role and
+/// rejects `(members, list)` when the actor has no roles in the workspace.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn member_list_workspace_requires_list_permission(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let editor = make_user(&pool, "editor").await;
+    let ws_domain = domain::workspace_domain(ws.id);
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+    saas_access::assign_role(&saas, &admin, editor.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
+
+    let members = member::list(&saas, &admin, MemberScope::Workspace(ws.id))
+        .await
+        .expect("list must succeed");
+    assert_eq!(members.len(), 2, "owner and editor");
+    let emails: Vec<&str> = members.iter().map(|m| m.email.as_str()).collect();
+    assert!(emails.contains(&admin.email.as_str()));
+    assert!(emails.contains(&editor.email.as_str()));
+
+    // Actor with no workspace role — forbidden.
+    let outsider = make_user(&pool, "outsider").await;
+    let err = member::list(&saas, &outsider, MemberScope::Workspace(ws.id))
+        .await
+        .expect_err("outsider must be forbidden");
+    assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
+}
+
+/// `change_role` replaces the old role with the new one in both
+/// `*_members` and `casbin_rule`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn member_change_role_replaces_role(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let viewer_key = RoleKey::parse("viewer").unwrap();
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "write".to_string())],
+    )
+    .await
+    .unwrap();
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &viewer_key,
+        "Viewer".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let user = make_user(&pool, "user").await;
+    saas_access::assign_role(&saas, &admin, user.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
+
+    member::change_role(
+        &saas,
+        &admin,
+        MemberScope::Workspace(ws.id),
+        user.id,
+        &editor_key,
+        &viewer_key,
+    )
+    .await
+    .expect("change_role must succeed");
+
+    let can_write = saas
+        .authz()
+        .can(user.id, &ws_domain, "documents", "write")
+        .await
+        .unwrap();
+    let can_read = saas
+        .authz()
+        .can(user.id, &ws_domain, "documents", "read")
+        .await
+        .unwrap();
+    assert!(!can_write, "editor rights must be gone");
+    assert!(can_read, "viewer rights must be present");
+
+    let members = member::list(&saas, &admin, MemberScope::Workspace(ws.id))
+        .await
+        .unwrap();
+    let entry = members
+        .iter()
+        .find(|m| m.user_id == user.id)
+        .expect("user must be listed");
+    assert_eq!(entry.roles, vec!["viewer".to_string()]);
+}
+
+/// `change_role` with identical keys is a no-op (no `require`, no SQL).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn member_change_role_same_key_is_noop(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    // Actor is an outsider; if `require` were called, it would fail. The
+    // no-op path returns before `require`.
+    let outsider = make_user(&pool, "outsider").await;
+    member::change_role(
+        &saas,
+        &outsider,
+        MemberScope::Workspace(ws.id),
+        admin.id,
+        &owner_key,
+        &owner_key,
+    )
+    .await
+    .expect("no-op must not call require");
+}
+
+/// `remove_role` deletes the role from `*_members` and `casbin_rule`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn member_remove_role_removes_from_members_and_casbin(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let editor_key = RoleKey::parse("editor").unwrap();
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "write".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let user = make_user(&pool, "user").await;
+    saas_access::assign_role(&saas, &admin, user.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
+
+    member::remove_role(
+        &saas,
+        &admin,
+        MemberScope::Workspace(ws.id),
+        user.id,
+        &editor_key,
+    )
+    .await
+    .expect("remove_role must succeed");
+
+    let can_write = saas
+        .authz()
+        .can(user.id, &ws_domain, "documents", "write")
+        .await
+        .unwrap();
+    assert!(!can_write, "removed role must not grant documents:write");
+
+    let members = member::list(&saas, &admin, MemberScope::Workspace(ws.id))
+        .await
+        .unwrap();
+    assert!(
+        members.iter().all(|m| m.user_id != user.id),
+        "user must no longer appear in member list"
+    );
+}
+
+// ─── my_permissions (Stage 2c) ──────────────────────────────────────────────
+
+/// Owner sees the full reference table; a non-member sees an empty list;
+/// an editor sees exactly the two `documents:*` pairs.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+
+    // Owner — all permissions from the reference table.
+    let owner_perms = saas_access::my_permissions(&saas, &admin, &ws_domain)
+        .await
+        .unwrap();
+    let reference = ::access::list_permissions(saas.access()).await.unwrap();
+    assert_eq!(owner_perms.len(), reference.len());
+    assert!(owner_perms
+        .iter()
+        .any(|(r, a)| r == "members" && a == "list"));
+
+    // Editor — exactly `documents:read` + `documents:write`.
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let editor = make_user(&pool, "editor").await;
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[
+            ("documents".to_string(), "read".to_string()),
+            ("documents".to_string(), "write".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    saas_access::assign_role(&saas, &admin, editor.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
+
+    let editor_perms = saas_access::my_permissions(&saas, &editor, &ws_domain)
+        .await
+        .unwrap();
+    assert_eq!(editor_perms.len(), 2);
+    assert!(editor_perms
+        .iter()
+        .any(|(r, a)| r == "documents" && a == "read"));
+    assert!(editor_perms
+        .iter()
+        .any(|(r, a)| r == "documents" && a == "write"));
+
+    // Non-member — empty.
+    let outsider = make_user(&pool, "outsider").await;
+    let outsider_perms = saas_access::my_permissions(&saas, &outsider, &ws_domain)
+        .await
+        .unwrap();
+    assert!(
+        outsider_perms.is_empty(),
+        "non-member must see no permissions"
+    );
 }

@@ -1,9 +1,8 @@
-//! Global layout: header with navigation and auth controls (Logout, Renew).
+//! Global layout: header with navigation and auth controls (Logout).
 //!
 //! Wraps every page rendered inside `<Router>`. Auth controls are shown only
-//! when the user is logged in (`who_am_i` on mount, refreshed by `Renew`).
+//! when the user is logged in (`who_am_i` on mount).
 //!
-//! The `Renew` button is a **demo** for the auto-refresh middleware.
 //! The navigation uses `<A>` from `leptos_router` for active highlighting
 //! and client-side navigation (no full page reload).
 
@@ -13,7 +12,7 @@ use leptos::task::spawn_local;
 use leptos_router::components::A;
 use leptos_router::hooks::{use_location, use_navigate};
 
-use crate::auth::{logout, refresh};
+use crate::auth::logout;
 use crate::pages::invitation::who_am_i;
 
 /// Wraps every page: renders the header and puts `children` inside `<main>`.
@@ -26,7 +25,7 @@ pub fn Layout(children: Children) -> impl IntoView {
 
     Effect::new(move |_| {
         let _ = location.pathname.get();
-        
+
         spawn_local(async move {
             match who_am_i().await {
                 Ok(email) => logged_in.set(Some(email.is_some())),
@@ -48,23 +47,10 @@ pub fn Layout(children: Children) -> impl IntoView {
         }
     });
 
-    let on_renew = Callback::new(move |_: ()| {
-        spawn_local(async move {
-            match refresh().await {
-                Ok(u) => {
-                    logged_in.set(Some(true));
-                    status.set(Some(format!("Renewed as {}", u.email)));
-                }
-                Err(e) => status.set(Some(e.to_string())),
-            }
-        });
-    });
-
     view! {
         <header class="border-b border-neutral-800 px-6 py-3 flex flex-wrap items-center gap-4">
             <A href="/" attr:class="font-semibold">"Rust SAAS"</A>
             <nav class="flex gap-3 text-sm text-neutral-400">
-                // <A> automatically adds an `aria-current="page"` and active state
                 <A href="/tenants" attr:class="hover:text-white">"Tenants"</A>
                 <A href="/workspaces" attr:class="hover:text-white">"Workspaces"</A>
                 <A href="/platform" attr:class="hover:text-white">"Platform"</A>
@@ -77,12 +63,6 @@ pub fn Layout(children: Children) -> impl IntoView {
                         <a class="btn text-sm" href="/register">"Register"</a>
                     }.into_any(),
                     Some(true) => view! {
-                        <button
-                            class="btn text-sm"
-                            on:click=move |_| on_renew.run(())
-                        >
-                            "Renew (demo)"
-                        </button>
                         <button
                             class="btn text-sm"
                             on:click=move |_| on_logout.run(())

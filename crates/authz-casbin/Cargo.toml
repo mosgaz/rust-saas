@@ -2,7 +2,7 @@
 name = "authz-casbin"
 version = "0.1.0"
 edition = "2021"
-description = "Реализация AuthorizationEngine на Casbin"
+description = "Casbin implementation of the AuthorizationEngine trait"
 
 [dependencies]
 authz = { path = "../authz" }

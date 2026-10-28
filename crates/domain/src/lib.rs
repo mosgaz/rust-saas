@@ -95,6 +95,25 @@ pub enum InvitationTarget {
     Workspace(Uuid),
 }
 
+/// A membership entry: a user together with all `role_key`s they hold in a
+/// scope (tenant or workspace).
+///
+/// `roles` holds raw `role_key` strings rather than `access::RoleKey` so
+/// that `domain` does not depend on `access` (see the forbidden edges in
+/// handoff §4). The `access::*` layer validates keys at write time; the
+/// bookkeeping rows copied here are already validated.
+///
+/// No `sqlx::FromRow` derive: `roles` is an aggregate over `*_members` rows
+/// and is assembled in `saas::member::list` from flat `(user_id, email,
+/// role, created_at)` tuples grouped by `user_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Member {
+    pub user_id: Uuid,
+    pub email: String,
+    pub roles: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 pub const PLATFORM_DOMAIN: &str = "platform";
 
 /// Casbin domain for a tenant.

@@ -2,7 +2,7 @@
 name = "authn"
 version = "0.1.0"
 edition = "2021"
-description = "Authentication: Argon2, JWT, register/login/verify_token"
+description = "Authentication: Argon2, JWT access tokens, opaque refresh tokens with rotation and family revocation"
 
 [dependencies]
 identity = { path = "../identity" }

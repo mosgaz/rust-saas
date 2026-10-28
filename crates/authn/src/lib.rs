@@ -164,10 +164,7 @@ impl Authn {
     }
 
     /// Rotates a refresh token; reuse detection revokes the whole family.
-    pub async fn rotate_refresh_token(
-        &self,
-        raw: &str,
-    ) -> Result<(String, AuthUser), AuthnError> {
+    pub async fn rotate_refresh_token(&self, raw: &str) -> Result<(String, AuthUser), AuthnError> {
         let token_hash = hash_token(raw);
         let mut tx = self.pool.begin().await?;
 
@@ -242,12 +239,11 @@ impl Authn {
     pub async fn revoke_refresh_token(&self, raw: &str) -> Result<(), AuthnError> {
         let token_hash = hash_token(raw);
 
-        let family_id: Option<Uuid> = sqlx::query_scalar(
-            "select family_id from refresh_tokens where token_hash = $1",
-        )
-        .bind(&token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
+        let family_id: Option<Uuid> =
+            sqlx::query_scalar("select family_id from refresh_tokens where token_hash = $1")
+                .bind(&token_hash)
+                .fetch_optional(&self.pool)
+                .await?;
 
         if let Some(family_id) = family_id {
             self.revoke_family(family_id).await?;
@@ -348,7 +344,10 @@ mod tests {
     fn hash_password_produces_valid_argon2_hash() {
         let password = "correct horse battery staple";
         let hash = hash_password(password).expect("hashing must succeed");
-        assert!(hash.starts_with("$argon2"), "must be Argon2 PHC string: {hash}");
+        assert!(
+            hash.starts_with("$argon2"),
+            "must be Argon2 PHC string: {hash}"
+        );
 
         let parsed = PasswordHash::new(&hash).expect("hash must be parseable");
         Argon2::default()
@@ -367,7 +366,9 @@ mod tests {
     fn hash_password_rejects_wrong_password() {
         let hash = hash_password("real").expect("hashing must succeed");
         let parsed = PasswordHash::new(&hash).expect("hash must be parseable");
-        assert!(Argon2::default().verify_password(b"wrong", &parsed).is_err());
+        assert!(Argon2::default()
+            .verify_password(b"wrong", &parsed)
+            .is_err());
     }
 
     #[test]
@@ -427,7 +428,9 @@ mod tests {
     #[tokio::test]
     async fn verify_token_rejects_wrong_signature() {
         let user = sample_user();
-        let token = authn("issuer-secret").issue_access_token(&user).expect("issue");
+        let token = authn("issuer-secret")
+            .issue_access_token(&user)
+            .expect("issue");
         let err = authn("different-secret")
             .verify_token(&token)
             .await

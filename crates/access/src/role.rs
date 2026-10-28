@@ -278,10 +278,7 @@ pub async fn get_role(
 /// Idempotent: concurrent callers on the same `domain` are serialized by
 /// `INSERT ... ON CONFLICT (domain, key) DO NOTHING RETURNING id`; only the
 /// winning insert copies permissions. The loser re-selects the existing row.
-pub async fn create_owner_role(
-    state: &AccessState,
-    domain: &str,
-) -> Result<Role, AccessError> {
+pub async fn create_owner_role(state: &AccessState, domain: &str) -> Result<Role, AccessError> {
     let key = RoleKey::parse("owner")?;
 
     let mut tx = state.pool().begin().await?;
@@ -312,10 +309,12 @@ pub async fn create_owner_role(
             .await?;
             id
         }
-        None => sqlx::query_scalar("select id from roles where domain = $1 and key = 'owner'")
-            .bind(domain)
-            .fetch_one(&mut *tx)
-            .await?,
+        None => {
+            sqlx::query_scalar("select id from roles where domain = $1 and key = 'owner'")
+                .bind(domain)
+                .fetch_one(&mut *tx)
+                .await?
+        }
     };
 
     tx.commit().await?;

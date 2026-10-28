@@ -14,10 +14,12 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **Auto-refresh middleware (transparent token rotation)**
 - **Server-side logout (revokes refresh token family)**
 - **Domain-ownership RBAC (ADR-0001): roles are data, owner of a domain has all permissions**
+- **Tenant and workspace member management (list, assign/remove role, permission-gated UI)**
+- **UI gating by effective permissions (`my_permissions`, batched per domain)**
 - Platform, tenant, and workspace authorization domains
 - Invitations (reusable links and addressed) with `token_hash` (SHA-256), `expires_at`, `max_uses`, `revoked_at`
 - Document pages (view and create inside workspaces)
-- Tenant, workspace, and document navigation (`/tenants`, `/workspaces`, `/documents`)
+- Tenant, workspace, and document navigation (`/tenants`, `/workspaces`, `/workspaces/:id/documents/:id`)
 - Leptos server-side rendering and client hydration
 - Server functions for frontend-to-backend communication
 - PostgreSQL migrations with SQLx
@@ -31,15 +33,17 @@ The repository is split into two layers:
 
 ```text
 crates/                  (library — the Cargo workspace)
-├── domain/             Shared DTOs (Tenant, Workspace, Document, AuthUser, Invitation),
+├── domain/             Shared DTOs (Tenant, Workspace, Document, AuthUser, Invitation, Member),
 │                       InvitationTarget, domain helpers, PLATFORM_DOMAIN
 ├── authz/              AuthorizationEngine trait (can/require/grant_role/revoke_role) + AuthzError
 ├── authz-casbin/       CasbinAuthz: canonical trait implementation
 ├── access/             Sole owner of `permissions`, `roles`, `role_permissions`:
-│                       Role, Permission, RoleKey, AccessState, AccessError, role CRUD
+│                       Role, Permission, RoleKey, AccessState, AccessError, role CRUD,
+│                       create_owner_role, list_permissions, get_permissions_for_role
 ├── identity/           Sole owner of `users`: AuthUser, UserRecord, validation, CRUD
 ├── authn/              Argon2, JWT access tokens, opaque refresh tokens, rotation
-├── saas/               Business logic: platform, tenant, workspace, invitation, access (wrappers)
+├── saas/               Business logic: platform, tenant, workspace, invitation, member,
+│                       access (wrappers, incl. my_permissions)
 ├── db/                 PostgreSQL connection and migrations
 └── seed/               Bootstrap data and demo accounts
 
@@ -84,7 +88,7 @@ Forbidden edges:
 - `identity` does not depend on `authn` or `authz`.
 - `authz` does not depend on Casbin, SQL, HTTP, Leptos, or JWT. It does not know about specific roles.
 - `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`, `refresh_tokens`, `roles`, `permissions`).
-- The example (`examples/saas-leptos`) does not call `casbin_rule` directly and does not call `authz.require` — only `saas::*`, `saas::access::*`, and `authn::*`.
+- The example (`examples/saas-leptos`) does not call `casbin_rule` directly and does not call `authz.require` — only `saas::*`, `saas::access::*`, `saas::member::*`, and `authn::*`.
 - Library crates do not depend on `examples/*`.
 
 ### Multi-tenancy model
@@ -246,7 +250,7 @@ Demo users created by seed:
 | Workspace editor (role `editor`) | `editor@acme.test` | `Editor123!` |
 | Workspace viewer (role `viewer`) | `viewer@acme.test` | `Viewer123!` |
 
-The command applies database migrations (including `20261103000001_access_rbac_init.sql` and `20261103000002_saas_members_multi_role.sql`) and creates initial platform, tenant, workspace, user, role, and authorization data. It is idempotent: re-running it re-hashes passwords and re-applies roles/policies without creating duplicate rows.
+The command applies database migrations (including `20261103000001_access_rbac_init.sql`, `20261103000002_saas_members_multi_role.sql`, and `20261104000001_access_members_list_permission.sql`) and creates initial platform, tenant, workspace, user, role, and authorization data. It is idempotent: re-running it re-hashes passwords and re-applies roles/policies without creating duplicate rows.
 
 Seed flow (ADR-0001):
 
@@ -282,11 +286,15 @@ Then in the browser:
 2. `/platform` — as platform owner, create a tenant (the creator becomes its `owner` via `provision_tenant`).
 3. `/tenants` — list of tenants you're a member of; click **Open**.
 4. `/tenants/<tenant_id>` — as tenant owner, create a workspace; the creator becomes its `owner`.
-5. `/workspaces` — list of workspaces you're a member of.
-6. `/workspaces/<workspace_id>` — as editor, create documents; click a document title to view it on its dedicated page.
-7. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace owner, create a workspace invitation.
-8. Paste `/invitations/<64 hex>` into another browser/session (after logging in as someone else) — accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`.
-9. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work.
+5. `/tenants/<tenant_id>/members` — as tenant owner, see members and assign or remove roles.
+6. `/tenants/<tenant_id>/roles` — as tenant owner, list and create custom roles.
+7. `/workspaces` — list of workspaces you're a member of.
+8. `/workspaces/<workspace_id>` — as editor, create documents; click a document title to view it on its dedicated page.
+9. `/workspaces/<workspace_id>/members` — as workspace owner, see members and assign or remove roles.
+10. `/workspaces/<workspace_id>/roles` — as workspace owner, list and create custom roles.
+11. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace owner, create a workspace invitation.
+12. Paste `/invitations/<64 hex>` into another browser/session (after logging in as someone else) — accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`.
+13. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work.
 
 ### Checking the build
 
@@ -304,7 +312,7 @@ From the repository root:
 cargo test
 ```
 
-77 tests, all green (23 unit + 27 `authn`/`saas` integration + 6 `access` integration + 6 `authz-casbin` integration + 15 `saas` integration).
+67 tests, all green (23 unit + 13 `authn` integration + 20 `saas` integration + 6 `access` integration + 5 `authz-casbin` integration).
 
 Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/access`, and `crates/saas`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
@@ -336,7 +344,8 @@ Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/acc
 │   │       ├── 20261101000001_saas_invitations.sql
 │   │       ├── 20261102000001_authn_refresh_tokens.sql
 │   │       ├── 20261103000001_access_rbac_init.sql
-│   │       └── 20261103000002_saas_members_multi_role.sql
+│   │       ├── 20261103000002_saas_members_multi_role.sql
+│   │       └── 20261104000001_access_members_list_permission.sql
 │   └── seed/
 └── examples/
     └── saas-leptos/
@@ -344,7 +353,7 @@ Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/acc
 
 ### domain
 
-Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`, `Invitation`), the `InvitationTarget` enum (`Tenant(Uuid) | Workspace(Uuid)`), and authorization domain helpers (`PLATFORM_DOMAIN`, `tenant_domain`, `workspace_domain`). No SQL queries, no logic — just types. `sqlx::FromRow` / `sqlx::Type` derives are gated behind the `ssr` feature.
+Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`, `Invitation`, `Member`), the `InvitationTarget` enum (`Tenant(Uuid) | Workspace(Uuid)`), and authorization domain helpers (`PLATFORM_DOMAIN`, `tenant_domain`, `workspace_domain`). No SQL queries, no logic — just types. `sqlx::FromRow` / `sqlx::Type` derives are gated behind the `ssr` feature.
 
 ### authz
 
@@ -389,16 +398,18 @@ Business logic, independent of UI framework. `SaasState { pool, authz, access }`
 - `tenant::create_workspace(actor, tenant_id, name, owner, &owner_role_key)` — side effect preserved: the creator receives `owner_role_key` (usually `"owner"`).
 - `tenant::list_memberships` / `workspace::list_memberships` — membership queries via `EXISTS` (multi-role).
 - `workspace::create_document` / `list_documents` / `get_document`.
+- `member::list(actor, MemberScope)`, `member::change_role`, `member::remove_role` — tenant/workspace member management (Stage 2c).
 - `invitation::create_invitation` — validates `role` against `access::get_role(domain, &RoleKey)`.
 - `invitation::accept_invitation` — by raw token; writes `*_members` (multi-role PK) and grants the role via `authz.grant_role`.
 - `invitation::revoke_invitation` / `list_invitations`.
-- `saas::access::{create_role, update_role, delete_role, list_roles, list_permissions, assign_role, revoke_role}` — wrappers over `access` + `authz` + `*_members`.
+- `saas::access::{create_role, update_role, delete_role, list_roles, list_permissions, assign_role, revoke_role, my_permissions}` — wrappers over `access` + `authz` + `*_members`. `my_permissions` returns the actor's effective `(resource, action)` pairs in a domain (batched UX helper for the client; does not replace `authz.require`).
 
 Every service calls `state.authz.require(...)` before touching the database, **except** the explicit exceptions in handoff §5 p.5:
 
 - `invitation::accept_invitation` and `invitation::check_invitation` — authorized by the invitation token.
 - `tenant::list_memberships` / `workspace::list_memberships` — membership queries.
 - `access::get_permissions_for_role`, `access::create_owner_role`, `access::list_permissions`, `access::get_role` — helpers, called after `require` in a caller.
+- `access::my_permissions` — read-only UX helper; any authenticated actor may discover their own effective permissions in a domain.
 
 Does not know about Leptos, Axum, HTTP handlers, `casbin::Enforcer`, JWT, Argon2, or the `permissions`/`roles`/`role_permissions` tables (owned by `access`).
 
@@ -411,6 +422,7 @@ PostgreSQL connection helper and migration runner. Migrations live in `crates/db
 - `20261102000001_authn_refresh_tokens.sql` — `refresh_tokens` (owner: `authn`).
 - `20261103000001_access_rbac_init.sql` — `permissions`, `roles`, `role_permissions`; platform `owner` role with all permissions (owner: `access`).
 - `20261103000002_saas_members_multi_role.sql` — `*_members` PK → `(scope_id, user_id, role)`.
+- `20261104000001_access_members_list_permission.sql` — `(members, list)` reference row; top-up `roles.key='owner'` across all domains (owner: `access`).
 
 Includes a `build.rs` with `cargo:rerun-if-changed=migrations` (and a `cargo:warning=` listing the migration set each time the build script runs).
 
@@ -426,7 +438,7 @@ Idempotent: re-runs re-hash passwords, skip existing tenant/workspace, and re-ap
 
 ### examples/saas-leptos
 
-The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*`, `saas::access::*`, or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn` / `error::access_error_to_server_fn`, which map to HTTP 400/401/403/404/409/500. `AppState` holds `authn`, `saas` (which contains `access`), and `leptos_options`. `src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout. This crate is **not** part of the library workspace.
+The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*`, `saas::access::*`, `saas::member::*`, or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn` / `error::access_error_to_server_fn`, which map to HTTP 400/401/403/409/500. `AppState` holds `authn`, `saas` (which contains `access`), and `leptos_options`. `src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout. `src/pages/{member,role}.rs` hold tenant/workspace member and role management. This crate is **not** part of the library workspace.
 
 Routes:
 
@@ -436,14 +448,18 @@ Routes:
 | `/login` | `pages::auth::LoginPage` | sign in |
 | `/register` | `pages::auth::RegisterPage` | sign up |
 | `/platform` | `pages::platform::PlatformPage` | create a tenant (as platform owner) |
-| `/tenants` | `pages::tenant::TenantsListPage` | list of my tenants |
+| `/tenants` | `pages::tenant::TenantListPage` | list of my tenants |
 | `/tenants/:tenant_id` | `pages::tenant::TenantPage` | single tenant (create workspace) |
-| `/tenants/:tenant_id/invitations` | `pages::invitation::TenantInvitationsPage` | tenant invitations |
-| `/workspaces` | `pages::workspace::WorkspacesListPage` | list of my workspaces |
+| `/tenants/:tenant_id/invitations` | `pages::invitation::TenantInvitationListPage` | tenant invitations |
+| `/tenants/:tenant_id/members` | `pages::member::TenantMemberListPage` | tenant members and role changes |
+| `/tenants/:tenant_id/roles` | `pages::role::TenantRoleListPage` | tenant roles (list/create/delete) |
+| `/workspaces` | `pages::workspace::WorkspaceListPage` | list of my workspaces |
 | `/workspaces/:workspace_id` | `pages::workspace::WorkspacePage` | single workspace (documents) |
 | `/workspaces/:workspace_id/documents/:document_id` | `pages::workspace::DocumentPage` | single document view |
-| `/workspaces/:workspace_id/invitations` | `pages::invitation::WorkspaceInvitationsPage` | workspace invitations |
-| `/invitations/:token` | `pages::invitation::AcceptInvitationPage` | accept-flow |
+| `/workspaces/:workspace_id/invitations` | `pages::invitation::WorkspaceInvitationListPage` | workspace invitations |
+| `/workspaces/:workspace_id/members` | `pages::member::WorkspaceMemberListPage` | workspace members and role changes |
+| `/workspaces/:workspace_id/roles` | `pages::role::WorkspaceRoleListPage` | workspace roles (list/create/delete) |
+| `/invitations/:token` | `pages::invitation::InvitationAcceptPage` | accept-flow |
 
 ## Authorization model
 
@@ -459,6 +475,8 @@ Examples:
 user_id, platform, tenants, create
 user_id, tenant:uuid, workspaces, create
 user_id, tenant:uuid, invitations, create
+user_id, tenant:uuid, members, list
+user_id, tenant:uuid, members, manage
 user_id, workspace:uuid, documents, write
 user_id, workspace:uuid, roles, grant
 ```
@@ -484,7 +502,9 @@ m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act
 
 Both `g` (user → role in domain) and `p` (role → resource, action in domain) are required; `grant_role` adds both.
 
-Authorization is always checked on the server before business logic executes. Exceptions: `accept_invitation`/`check_invitation` (by token), `*::list_memberships` (membership queries), and `access` helpers (`get_role`, `get_permissions_for_role`, `list_permissions`, `create_owner_role`) — see handoff §5 p.5.
+Authorization is always checked on the server before business logic executes. Exceptions: `accept_invitation`/`check_invitation` (by token), `*::list_memberships` (membership queries), and `access` helpers (`get_role`, `get_permissions_for_role`, `list_permissions`, `create_owner_role`, `my_permissions`) — see handoff §5 p.5.
+
+UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and links; this is a UX convenience, not a security boundary — `authz.require` in `saas::*` remains authoritative.
 
 ## Development principles
 
@@ -501,7 +521,8 @@ Authorization is always checked on the server before business logic executes. Ex
 - Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored.
 - Refresh raw tokens are returned once from `authn::issue_refresh_token` and are never persisted; only `refresh_tokens.token_hash` (SHA-256) is stored.
 - `accept_invitation` does not compare `actor.email` to `invitation.email` until email verification (Stage 3).
-- Auto-refresh middleware serializes refresh within a single HTTP request; parallel HTTP requests with the same refresh token are a known limitation (Stage 2c/2d will add single-flight).
+- Auto-refresh middleware serializes refresh within a single HTTP request; parallel HTTP requests with the same refresh token are a known limitation (Stage 2d will add single-flight).
+- `saas::member::change_role` is not atomic: it is `revoke_role` followed by `assign_role`. If `assign_role` fails after `revoke_role` commits, the user loses the old role. Stage 2d will unify the SQL connection (see handoff §16).
 
 ## Roadmap
 
@@ -510,9 +531,10 @@ Authorization is always checked on the server before business logic executes. Ex
 - Stage 1.1 (done): `create_tenant` container only; `provision_tenant(actor, name, owner)` for explicit owner assignment; `create_workspace` side effect preserved.
 - Stage 2a (done): invitations core.
 - Stage 2b (done): refresh tokens with rotation + family revocation, auto-refresh middleware, logout with server-side invalidation, shorter access TTL, `access_token` + `refresh_token` cookies, global layout, document pages.
-- **Stage 2e (done): domain-ownership RBAC (ADR-0001), `access` crate, `grant_role`/`revoke_role`, `*_members` multi-role PK, `seed` bootstrap via `saas::*`.**
-- Stage 2c: workspace member management (list/change_role/remove), UI hides/disables buttons based on `authz.can`, client-side auto-retry.
-- Stage 2d: Casbin policy cleanup on delete + single Casbin/`saas` connection + single-flight refresh.
+- Stage 2e (done): domain-ownership RBAC (ADR-0001), `access` crate, `grant_role`/`revoke_role`, `*_members` multi-role PK, `seed` bootstrap via `saas::*`.
+- **Stage 2e.1 (done): cleanup — page naming convention (`EntityOperationPage`), EN comments, migration set sync, docs counters.**
+- **Stage 2c (done): tenant and workspace member management, roles UI, UI gating via `saas::access::my_permissions`, Renew-demo removed.**
+- Stage 2d (next): Casbin policy cleanup on delete, single Casbin/`saas` connection, single-flight refresh, atomic `change_role`.
 - Stage 3: platform admin UI, tenant suspension, email verification, audit log, return-URL preservation for `/invitations/:token`.
 - Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (incl. `/refresh`), optional RLS, E2E HTTP tests.
 

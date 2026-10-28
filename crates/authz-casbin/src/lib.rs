@@ -14,7 +14,7 @@ use sqlx_adapter::SqlxAdapter;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use authz::{AuthzError, AuthorizationEngine};
+use authz::{AuthorizationEngine, AuthzError};
 
 /// Casbin model: request `(sub, dom, obj, act)`; policy `(sub, dom, obj, act)`;
 /// role `g(_, _, _)`; matcher requires both `g` and `p`.

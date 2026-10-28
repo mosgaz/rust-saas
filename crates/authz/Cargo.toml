@@ -2,7 +2,7 @@
 name = "authz"
 version = "0.1.0"
 edition = "2021"
-description = "Абстракция авторизации: трейт AuthorizationEngine и типы ошибок"
+description = "Authorization abstraction: the AuthorizationEngine trait and error types"
 
 [dependencies]
 uuid.workspace = true
