@@ -85,6 +85,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <AutoReload options=options.clone() />
                 <HydrationScripts options />
                 <MetaTags />
+				<Stylesheet id="leptos" href="/pkg/rust-saas-leptos.css"/>
             </head>
             <body>
                 <App />

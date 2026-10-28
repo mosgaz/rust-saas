@@ -67,9 +67,12 @@ ssr = [
 ]
 
 [package.metadata.leptos]
+output-name = "rust-saas-leptos"
 site-root = "target/site"
 site-pkg-dir = "pkg"
-style-file = "style/main.css"
+# style-file = "style/main.css"
+tailwind-input-file = "assets/styles/tailwind.css"
+# tailwind-input-file = "styles/tailwind.css"
 assets-dir = "public"
 site-addr = "127.0.0.1:3395"
 reload-port = 3396
@@ -78,3 +81,17 @@ lib-features = ["hydrate"]
 
 # Independent workspace: consumer example, not part of the library.
 [workspace]
+
+# [package.metadata.leptos]
+# output-name = "rust-lms-client"
+# # site-name = "rust-lms"
+# site-root = "target/site"
+# site-pkg-dir = "pkg"
+# bin-target = "rust-lms-client"
+# # lib-target = "rust-lms-client"
+# lib-features = ["hydrate"]
+# bin-features = ["ssr"]
+# tailwind-input-file = "assets/styles/tailwind.css"
+# assets-dir = "public"
+# site-addr = "127.0.0.1:3726"
+# reload-port = 3727
