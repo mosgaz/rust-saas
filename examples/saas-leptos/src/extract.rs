@@ -1,11 +1,13 @@
-//! `CurrentUser` — текущий пользователь из cookie `session`.
+//! `CurrentUser` — the authenticated user for the current request.
 //!
-//! Поверх `authn::verify_token` (контракт: `Ok(None)` для удалённого
-//! пользователя и невалидного `sub`; `Err` для невалидной подписи/exp).
-//! Заменяет ручной `current_user().await?.ok_or_else(...)` в `#[server]`-функциях.
+//! Reads `Extension<Option<AuthUser>>` populated by
+//! [`crate::middleware::auto_refresh`], which is responsible for verifying
+//! the `access_token` cookie and, on expiry, rotating the `refresh_token`.
+//! By the time a `#[server]` function runs, the middleware has already done
+//! the work — `CurrentUser` only pulls the resolved value.
 //!
-//! Не реализован как `axum::FromRequestParts`, чтобы не тянуть `async-trait`
-//! в зависимости примера; вызывается в начале каждого `#[server]`-fn:
+//! Not an `axum::FromRequestParts` on purpose: keeping it a plain helper
+//! avoids pulling `async-trait` into the example's dependencies. Usage:
 //!
 //! ```ignore
 //! let user = crate::extract::CurrentUser::from_request().await?.require()?;
@@ -17,30 +19,18 @@ use leptos::prelude::*;
 pub struct CurrentUser(pub Option<AuthUser>);
 
 impl CurrentUser {
-    /// Загружает текущего пользователя из cookie `session` в текущем запросе.
-    /// `Ok(Self(None))` — нет cookie либо токен невалиден/просрочен/удалён.
+    /// Returns the current authenticated user, or `Ok(Self(None))` when the
+    /// request has no valid session.
     pub async fn from_request() -> Result<Self, ServerFnError> {
-        use axum_extra::extract::cookie::CookieJar;
-        use leptos_axum::extract;
-
-        let state = expect_context::<crate::state::AppState>();
-        let jar = extract::<CookieJar>().await?;
-
-        let Some(token) = jar.get("session").map(|c| c.value().to_string()) else {
-            return Ok(Self(None));
-        };
-
-        let user = state
-            .authn
-            .verify_token(&token)
+        let user = leptos_axum::extract::<Option<axum::extract::Extension<Option<AuthUser>>>>()
             .await
-            .map_err(crate::error::authn_error_to_server_fn)?;
-
+            .ok()
+            .flatten()
+            .and_then(|ext| ext.0);
         Ok(Self(user))
     }
 
-    /// Требует аутентифицированного пользователя. Возвращает `ServerFnError`
-    /// с HTTP 401, если cookie нет или токен невалиден.
+    /// Requires an authenticated user; returns HTTP 401 otherwise.
     pub fn require(self) -> Result<AuthUser, ServerFnError> {
         self.0.ok_or_else(crate::error::unauthorized_error)
     }

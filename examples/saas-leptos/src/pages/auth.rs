@@ -2,6 +2,7 @@ use crate::auth::{login, register};
 use domain::AuthUser;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use leptos_router::hooks::use_navigate;
 
 #[component]
 pub fn LoginPage() -> impl IntoView {
@@ -9,14 +10,22 @@ pub fn LoginPage() -> impl IntoView {
     let password = RwSignal::new(String::new());
     let user = RwSignal::new(None::<AuthUser>);
     let error = RwSignal::new(None::<String>);
+    let navigate = use_navigate();
 
-    let submit = move |_| {
-        spawn_local(async move {
-            match login(email.get(), password.get()).await {
-                Ok(u) => user.set(Some(u)),
-                Err(e) => error.set(Some(e.to_string())),
-            }
-        });
+    let submit = {
+        let navigate = navigate.clone();
+        move |_| {
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                match login(email.get(), password.get()).await {
+                    Ok(u) => {
+                        user.set(Some(u));
+                        navigate("/", Default::default());
+                    }
+                    Err(e) => error.set(Some(e.to_string())),
+                }
+            });
+        }
     };
 
     view! {
@@ -41,14 +50,22 @@ pub fn RegisterPage() -> impl IntoView {
     let password = RwSignal::new(String::new());
     let user = RwSignal::new(None::<AuthUser>);
     let error = RwSignal::new(None::<String>);
+    let navigate = use_navigate();
 
-    let submit = move |_| {
-        spawn_local(async move {
-            match register(email.get(), password.get()).await {
-                Ok(u) => user.set(Some(u)),
-                Err(e) => error.set(Some(e.to_string())),
-            }
-        });
+    let submit = {
+        let navigate = navigate.clone();
+        move |_| {
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                match register(email.get(), password.get()).await {
+                    Ok(u) => {
+                        user.set(Some(u));
+                        navigate("/", Default::default());
+                    }
+                    Err(e) => error.set(Some(e.to_string())),
+                }
+            });
+        }
     };
 
     view! {

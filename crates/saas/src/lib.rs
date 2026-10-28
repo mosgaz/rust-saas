@@ -352,6 +352,39 @@ pub mod workspace {
         Ok(documents)
     }
 
+	    /// Gets a single document by ID.
+    ///
+    /// Authorization is checked first
+    /// (`workspace:{id}`, `documents`, `read`), then the row is selected.
+    pub async fn get_document(
+        state: &SaasState,
+        actor: &AuthUser,
+        workspace_id: Uuid,
+        document_id: Uuid,
+    ) -> Result<Document, CoreError> {
+        let domain_str = domain::workspace_domain(workspace_id);
+
+        state
+            .authz
+            .require(actor.id, &domain_str, "documents", "read")
+            .await?;
+
+        let document = sqlx::query_as::<_, Document>(
+            r#"
+            select id, workspace_id, title, body, created_at
+            from documents
+            where id = $1 and workspace_id = $2
+            "#,
+        )
+        .bind(document_id)
+        .bind(workspace_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(CoreError::NotFound)?;
+
+        Ok(document)
+    }
+
     /// Lists workspaces the given user is a member of, newest first.
     ///
     /// **Exception to §5 p.5** (`authz.require` first): see

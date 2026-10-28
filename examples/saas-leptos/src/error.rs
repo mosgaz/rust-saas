@@ -2,29 +2,19 @@
 //! status codes.
 //!
 //! Mapping:
-//! - `Validation` (Core / Identity)                         -> 400
-//! - `Unauthorized`, `InvalidCredentials`, `TokenInvalid`, `TokenExpired` -> 401
-//! - `Forbidden`                                            -> 403
-//! - `NotFound` (Core / Identity)                           -> 404
-//! - `DuplicateEmail` (Identity)                            -> 409
-//! - `Internal`, `Db`                                       -> 500
+//! - `Validation` (Core / Identity)                              -> 400
+//! - `Unauthorized`, `InvalidCredentials`, `TokenInvalid`,
+//!   `TokenExpired`, `RefreshInvalid`, `RefreshReused`           -> 401
+//! - `Forbidden`                                                 -> 403
+//! - `NotFound` (Core / Identity)                                -> 404
+//! - `DuplicateEmail` (Identity)                                 -> 409
+//! - `Internal`, `Db`                                            -> 500
 //!
 //! The body of `ServerFnError` is the error's `Display` string. The HTTP
 //! status is set via `leptos_axum::ResponseOptions` before the `#[server]`
 //! function returns. If the `ResponseOptions` context is unavailable (unit
 //! test, not a `#[server]` call), the status is not set and the same
 //! `ServerFnError` is returned.
-//!
-//! Stage 2a (`saas::invitation::*`) reuses the existing variants:
-//! - `accept_invitation` returns `CoreError::NotFound` for a token that does
-//!   not match any active invitation (does not exist, revoked, expired, or
-//!   exhausted) — mapped to HTTP 404. The specific reason is intentionally
-//!   not distinguished, to avoid leaking invitation state.
-//! - `create_invitation` returns `CoreError::Validation` for an invalid
-//!   `role`/`ttl_hours`/`max_uses` — HTTP 400.
-//! - `create/revoke/list_invitations` return `CoreError::Forbidden` when
-//!   `authz.require` denies — HTTP 403.
-//! No new `CoreError` variant was introduced in Stage 2a.
 
 use leptos::prelude::*;
 
@@ -55,6 +45,7 @@ fn status_for_authn(e: &AuthnError) -> u16 {
     match e {
         AuthnError::InvalidCredentials => 401,
         AuthnError::TokenInvalid | AuthnError::TokenExpired => 401,
+        AuthnError::RefreshInvalid | AuthnError::RefreshReused => 401,
         AuthnError::Internal(_) => 500,
         AuthnError::Identity(inner) => status_for_identity(inner),
         AuthnError::Db(_) => 500,

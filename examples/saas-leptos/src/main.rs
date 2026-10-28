@@ -52,13 +52,27 @@ async fn main() -> anyhow::Result<()> {
     let database_url = std::env::var("DATABASE_URL")?;
     let jwt_secret = std::env::var("JWT_SECRET")?;
 
+    let access_ttl_minutes = std::env::var("ACCESS_TOKEN_TTL_MINUTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(authn::DEFAULT_ACCESS_TTL_MINUTES);
+    let refresh_ttl_days = std::env::var("REFRESH_TOKEN_TTL_DAYS")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(authn::DEFAULT_REFRESH_TTL_DAYS);
+
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(authz_casbin::CasbinAuthz::new(&database_url).await?);
 
-    let authn = Arc::new(authn::Authn::new(pool.clone(), jwt_secret));
+    let authn = Arc::new(authn::Authn::with_ttl(
+        pool.clone(),
+        jwt_secret,
+        chrono::Duration::minutes(access_ttl_minutes),
+        chrono::Duration::days(refresh_ttl_days),
+    ));
 
     let saas = Arc::new(
         saas::SaasBuilder::new(pool)
@@ -67,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let app_state = saas_leptos::state::AppState {
-        authn,
+        authn: authn.clone(),
         saas,
         leptos_options: leptos_options.clone(),
     };
@@ -89,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .fallback(leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            authn,
+            saas_leptos::middleware::auto_refresh,
+        ))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)

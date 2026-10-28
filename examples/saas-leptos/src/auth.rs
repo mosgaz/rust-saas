@@ -1,9 +1,15 @@
-//! Server functions for user registration and login.
+//! Server functions for registration, login, refresh, and logout.
 //!
-//! Both functions delegate to `authn::*`, issue a session JWT, and set it
-//! as an `httpOnly` cookie named `session`. Cookie attributes are the
-//! consumer's responsibility: the current MVP sets `path = "/"` and
-//! `http_only = true`, but not `Secure` or `SameSite` (see handoff §16).
+//! All delegate to `authn::*`. Cookies are managed by the example, not by
+//! `authn`:
+//!
+//! - `access_token` — short-lived JWT (default TTL 15 min).
+//! - `refresh_token` — opaque, rotation with family revocation (default TTL
+//!   30 days).
+//!
+//! Cookie attributes in the MVP: `path = "/"`, `http_only = true`.
+//! `Secure` / `SameSite` are Stage 4. Session cookies (no `Max-Age`) — the
+//! browser keeps them until close; persistence is Stage 4.
 //!
 //! Errors are mapped to HTTP status codes by `crate::error`
 //! (`authn_error_to_server_fn`).
@@ -14,15 +20,17 @@ use leptos::prelude::*;
 #[cfg(feature = "ssr")]
 use axum::http::HeaderValue;
 
-/// Registers a new user, issues a session JWT, and sets the `session` cookie.
-///
-/// Delegates to `authn::Authn::register` and `authn::Authn::issue_token`.
-/// On success returns the created `AuthUser`; the caller's browser receives
-/// a `Set-Cookie` header via `leptos_axum::ResponseOptions`.
+#[cfg(feature = "ssr")]
+fn append_cookie(response: &leptos_axum::ResponseOptions, c: axum_extra::extract::cookie::Cookie<'static>) -> Result<(), ServerFnError> {
+    let header = HeaderValue::from_str(&c.to_string())
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    response.append_header(axum::http::header::SET_COOKIE, header);
+    Ok(())
+}
+
+/// Registers a new user, issues access + refresh tokens, and sets both cookies.
 #[server]
 pub async fn register(email: String, password: String) -> Result<AuthUser, ServerFnError> {
-    use axum_extra::extract::cookie::Cookie;
-
     let state = expect_context::<crate::state::AppState>();
 
     let user = state
@@ -31,30 +39,26 @@ pub async fn register(email: String, password: String) -> Result<AuthUser, Serve
         .await
         .map_err(crate::error::authn_error_to_server_fn)?;
 
-    let token = state
+    let access = state
         .authn
-        .issue_token(&user)
+        .issue_access_token(&user)
+        .map_err(crate::error::authn_error_to_server_fn)?;
+    let refresh = state
+        .authn
+        .issue_refresh_token(&user)
+        .await
         .map_err(crate::error::authn_error_to_server_fn)?;
 
-    let cookie = Cookie::build(("session", token)).path("/").http_only(true);
-
     let response = expect_context::<leptos_axum::ResponseOptions>();
-    let header = HeaderValue::from_str(&cookie.to_string())
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    response.append_header(axum::http::header::SET_COOKIE, header);
+    append_cookie(&response, crate::middleware::access_cookie(access))?;
+    append_cookie(&response, crate::middleware::refresh_cookie(refresh))?;
 
     Ok(user)
 }
 
-/// Logs in an existing user, issues a session JWT, and sets the `session` cookie.
-///
-/// Delegates to `authn::Authn::login` and `authn::Authn::issue_token`.
-/// On success returns the authenticated `AuthUser`; the caller's browser
-/// receives a `Set-Cookie` header via `leptos_axum::ResponseOptions`.
+/// Logs in an existing user, issues access + refresh tokens, sets both cookies.
 #[server]
 pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFnError> {
-    use axum_extra::extract::cookie::Cookie;
-
     let state = expect_context::<crate::state::AppState>();
 
     let user = state
@@ -63,17 +67,56 @@ pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFn
         .await
         .map_err(crate::error::authn_error_to_server_fn)?;
 
-    let token = state
+    let access = state
         .authn
-        .issue_token(&user)
+        .issue_access_token(&user)
+        .map_err(crate::error::authn_error_to_server_fn)?;
+    let refresh = state
+        .authn
+        .issue_refresh_token(&user)
+        .await
         .map_err(crate::error::authn_error_to_server_fn)?;
 
-    let cookie = Cookie::build(("session", token)).path("/").http_only(true);
-
     let response = expect_context::<leptos_axum::ResponseOptions>();
-    let header = HeaderValue::from_str(&cookie.to_string())
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    response.append_header(axum::http::header::SET_COOKIE, header);
+    append_cookie(&response, crate::middleware::access_cookie(access))?;
+    append_cookie(&response, crate::middleware::refresh_cookie(refresh))?;
 
     Ok(user)
+}
+
+/// Returns the current authenticated user, if any.
+///
+/// After auto-refresh middleware has run for this request, the user reflects
+/// the post-rotation state. On the client, callers usually follow this with a
+/// page reload so that new cookies take effect across subsequent requests.
+#[server]
+pub async fn refresh() -> Result<AuthUser, ServerFnError> {
+    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    Ok(user)
+}
+
+/// Clears both cookies and revokes the refresh-token family in the database.
+///
+/// Access token stays valid until its short `exp`; refresh-token family is
+/// revoked, so the session cannot be extended.
+#[server]
+pub async fn logout() -> Result<(), ServerFnError> {
+    use axum_extra::extract::cookie::CookieJar;
+
+    let state = expect_context::<crate::state::AppState>();
+    let jar = leptos_axum::extract::<CookieJar>().await?;
+
+    if let Some(raw) = jar.get(crate::middleware::REFRESH_COOKIE).map(|c| c.value().to_string()) {
+        state
+            .authn
+            .revoke_refresh_token(&raw)
+            .await
+            .map_err(crate::error::authn_error_to_server_fn)?;
+    }
+
+    let response = expect_context::<leptos_axum::ResponseOptions>();
+    append_cookie(&response, crate::middleware::removal_cookie(crate::middleware::ACCESS_COOKIE))?;
+    append_cookie(&response, crate::middleware::removal_cookie(crate::middleware::REFRESH_COOKIE))?;
+
+    Ok(())
 }
