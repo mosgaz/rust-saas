@@ -28,12 +28,9 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 tower-http = { version = "0.6", features = ["fs", "trace"], optional = true }
 
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", optional = true }
 uuid = { version = "1", features = ["serde", "v4", "js"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
-jsonwebtoken = { version = "9", optional = true }
-argon2 = { version = "0.5", features = ["std"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 dotenvy = { version = "0.15", optional = true }
@@ -61,11 +58,8 @@ ssr = [
     "dep:sqlx",
     "dep:leptos_axum",
     "dep:tower-http",
-    "dep:jsonwebtoken",
-    "dep:argon2",
     "dep:tracing-subscriber",
     "dep:dotenvy",
-    "dep:serde_json",
     "domain/ssr",
     "leptos/ssr",
     "leptos_meta/ssr",
@@ -78,7 +72,7 @@ site-pkg-dir = "pkg"
 style-file = "style/main.css"
 assets-dir = "public"
 site-addr = "127.0.0.1:3395"
-reload-port = 3001
+reload-port = 3396
 bin-features = ["ssr"]
 lib-features = ["hydrate"]
 

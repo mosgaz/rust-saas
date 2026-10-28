@@ -1,3 +1,10 @@
+//! Reference Leptos SSR consumer of the `rust-saas` library.
+//!
+//! `App` provides a meta context and mounts the `Router` with all routes.
+//! `shell` builds the `<html><head>…</head><body>…</body></html>` skeleton
+//! used by `leptos_routes_with_context` (the 4th argument, not `App`), as
+//! required by `leptos_meta`. `hydrate` is the WASM entry point.
+
 pub mod auth;
 pub mod pages;
 
@@ -12,12 +19,9 @@ use leptos::prelude::*;
 use leptos_meta::*;
 use leptos_router::{components::*, path};
 
+/// Root component: provides the meta context and mounts the router.
 #[component]
 pub fn App() -> impl IntoView {
-    // Мета-контекст создаётся в App, как в официальном шаблоне leptos-rs/start-axum 0.8.
-    // SSR рендерит shell → shell строит <head><MetaTags/></head><body><App/></body>;
-    // App выполняется во время построения дерева и регистрирует контекст,
-    // после чего MetaTags и Stylesheet могут инжектить теги на финальном этапе рендера.
     provide_meta_context();
 
     view! {
@@ -28,13 +32,34 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/login") view=pages::auth::LoginPage />
                 <Route path=path!("/register") view=pages::auth::RegisterPage />
                 <Route path=path!("/platform") view=pages::platform::PlatformPage />
-                <Route path=path!("/tenant/:tenant_id") view=pages::tenant::TenantPage />
-                <Route path=path!("/workspace/:workspace_id") view=pages::workspace::WorkspacePage />
+
+                <Route path=path!("/tenants") view=pages::tenant::TenantsListPage />
+                <Route path=path!("/tenants/:tenant_id") view=pages::tenant::TenantPage />
+                <Route
+                    path=path!("/tenants/:tenant_id/invitations")
+                    view=pages::invitation::TenantInvitationsPage
+                />
+
+                <Route path=path!("/workspaces") view=pages::workspace::WorkspacesListPage />
+                <Route
+                    path=path!("/workspaces/:workspace_id")
+                    view=pages::workspace::WorkspacePage
+                />
+                <Route
+                    path=path!("/workspaces/:workspace_id/invitations")
+                    view=pages::invitation::WorkspaceInvitationsPage
+                />
+
+                <Route
+                    path=path!("/invitations/:token")
+                    view=pages::invitation::AcceptInvitationPage
+                />
             </Routes>
         </Router>
     }
 }
 
+/// HTML shell used by `leptos_routes_with_context` (4th argument).
 #[cfg(feature = "ssr")]
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -54,6 +79,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
     }
 }
 
+/// WASM entry point: hydrates the SSR-rendered `App`.
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
