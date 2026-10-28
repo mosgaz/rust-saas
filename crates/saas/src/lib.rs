@@ -4,24 +4,16 @@
 //! `casbin::Enforcer`, JWT or Argon2. Authorization is delegated to an
 //! `authz::AuthorizationEngine`; the actor is `domain::AuthUser` (resolved
 //! by `authn` in the consumer).
-//!
-//! **Invariant (§5 p.5):** every service calls `authz.require` first, with
-//! two explicit exceptions:
-//! - `invitation::accept_invitation` authorizes by the invitation token.
-//! - `tenant::list_memberships` / `workspace::list_memberships` are
-//!   membership queries (not protected actions): there is no domain to
-//!   `require` before knowing the result. `*_members` is the authoritative
-//!   source for "which tenants/workspaces am I a member of"; `casbin_rule`
-//!   remains the source of truth for what can be done **inside** a tenant or
-//!   workspace (Appendix B §2.10).
 
 use std::sync::Arc;
 
-use authz::{AuthzError, AuthorizationEngine, WorkspaceRole};
+use ::access::{AccessError, AccessState, RoleKey};
+use authz::{AuthzError, AuthorizationEngine};
 use domain::{AuthUser, Document, Tenant, Workspace, PLATFORM_DOMAIN};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod access;
 pub mod invitation;
 
 #[derive(Debug, thiserror::Error)]
@@ -49,10 +41,27 @@ impl From<AuthzError> for CoreError {
     }
 }
 
+impl From<AccessError> for CoreError {
+    fn from(e: AccessError) -> Self {
+        match e {
+            AccessError::Forbidden => CoreError::Forbidden,
+            AccessError::InvalidRoleKey(s) => CoreError::Validation(s),
+            AccessError::RoleNotFound(_) => CoreError::NotFound,
+            AccessError::PermissionNotFound(_, _) => CoreError::NotFound,
+            AccessError::Protected => CoreError::Forbidden,
+            AccessError::Immutable => CoreError::Forbidden,
+            AccessError::Validation(s) => CoreError::Validation(s),
+            AccessError::Internal(s) => CoreError::Internal(s),
+            AccessError::Db(e) => CoreError::Db(e),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SaasState {
-    pool: PgPool,
-    authz: Arc<dyn AuthorizationEngine>,
+    pub(crate) pool: PgPool,
+    pub(crate) authz: Arc<dyn AuthorizationEngine>,
+    pub(crate) access: Arc<AccessState>,
 }
 
 impl SaasState {
@@ -63,16 +72,25 @@ impl SaasState {
     pub fn authz(&self) -> &Arc<dyn AuthorizationEngine> {
         &self.authz
     }
+
+    pub fn access(&self) -> &AccessState {
+        &self.access
+    }
 }
 
 pub struct SaasBuilder {
     pool: PgPool,
     authz: Option<Arc<dyn AuthorizationEngine>>,
+    access: Option<Arc<AccessState>>,
 }
 
 impl SaasBuilder {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, authz: None }
+        Self {
+            pool,
+            authz: None,
+            access: None,
+        }
     }
 
     pub fn with_authz(mut self, authz: Arc<dyn AuthorizationEngine>) -> Self {
@@ -80,13 +98,22 @@ impl SaasBuilder {
         self
     }
 
+    pub fn with_access(mut self, access: Arc<AccessState>) -> Self {
+        self.access = Some(access);
+        self
+    }
+
     pub fn build(self) -> Result<SaasState, CoreError> {
         let authz = self
             .authz
             .ok_or_else(|| CoreError::Internal("SaasBuilder: authorization engine is required".into()))?;
+        let access = self
+            .access
+            .ok_or_else(|| CoreError::Internal("SaasBuilder: access state is required".into()))?;
         Ok(SaasState {
             pool: self.pool,
             authz,
+            access,
         })
     }
 }
@@ -94,20 +121,7 @@ impl SaasBuilder {
 pub mod platform {
     use super::*;
 
-    /// Creates a tenant container.
-    ///
-    /// Order:
-    /// 1. `authz.require(actor.id, "platform", "tenants", "create")` — first.
-    /// 2. `INSERT tenants` — no transaction, no side effects.
-    ///
-    /// The creator does **not** become a member of the new tenant. Owner
-    /// assignment is a separate action: use [`provision_tenant`] when the
-    /// owner already exists, or an invitation flow (Stage 2) when not.
-    ///
-    /// A tenant created with `create_tenant` has no owner until
-    /// `provision_tenant` (or invitation-accept) is called; the resulting row
-    /// is a valid container but is not accessible for tenant-scoped operations
-    /// (no `tenant_owner` in `casbin_rule`). See handoff §16.
+    /// Creates a tenant container. No side effects.
     pub async fn create_tenant(
         state: &SaasState,
         actor: &AuthUser,
@@ -128,31 +142,13 @@ pub mod platform {
         Ok(tenant)
     }
 
-    /// Creates a tenant and explicitly assigns an owner.
-    ///
-    /// Order:
-    /// 1. `authz.require(actor.id, "platform", "tenants", "create")` — first.
-    /// 2. `tx.begin`.
-    /// 3. `INSERT tenants` + `INSERT tenant_members(owner.id, 'owner')`.
-    /// 4. `authz.grant_tenant_owner(owner.id, tenant.id)`.
-    /// 5. `tx.commit`.
-    ///
-    /// `actor` and `owner` are different roles: `actor` acts in the `platform`
-    /// domain (creates the container), `owner` receives `tenant_owner` in the
-    /// new tenant. When `actor == owner`, the UI scenario "created → became
-    /// owner" holds; when they differ, a platform admin provisions a tenant
-    /// for someone else without becoming a member.
-    ///
-    /// `owner` is `&AuthUser`, not `owner_email: &str`: `saas` does not look
-    /// up users by email (that is `identity` semantics).
-    ///
-    /// Residual limitation: `authz-casbin` writes to `casbin_rule` via its
-    /// own pool, outside the `state.pool` transaction. See handoff §16.
+    /// Creates a tenant and assigns an explicit owner with `owner_role_key`.
     pub async fn provision_tenant(
         state: &SaasState,
         actor: &AuthUser,
         name: String,
         owner: &AuthUser,
+        owner_role_key: &RoleKey,
     ) -> Result<Tenant, CoreError> {
         state
             .authz
@@ -168,22 +164,33 @@ pub mod platform {
         .fetch_one(&mut *tx)
         .await?;
 
+        let domain_str = domain::tenant_domain(tenant.id);
+
+        ::access::create_owner_role(state.access(), &domain_str)
+            .await
+            .map_err(CoreError::from)?;
+
+        let permissions = ::access::get_permissions_for_role(state.access(), &domain_str, owner_role_key)
+            .await
+            .map_err(CoreError::from)?;
+
+        state
+            .authz
+            .grant_role(owner.id, &domain_str, owner_role_key.as_str(), &permissions)
+            .await?;
+
         sqlx::query(
             r#"
             insert into tenant_members (tenant_id, user_id, role)
-            values ($1, $2, 'owner')
-            on conflict (tenant_id, user_id) do update set role = excluded.role
+            values ($1, $2, $3)
+            on conflict do nothing
             "#,
         )
         .bind(tenant.id)
         .bind(owner.id)
+        .bind(owner_role_key.as_str())
         .execute(&mut *tx)
         .await?;
-
-        state
-            .authz
-            .grant_tenant_owner(owner.id, tenant.id)
-            .await?;
 
         tx.commit().await?;
 
@@ -194,23 +201,14 @@ pub mod platform {
 pub mod tenant {
     use super::*;
 
-    /// Creates a workspace inside a tenant and assigns the creator as
-    /// `workspace_admin`.
-    ///
-    /// Order:
-    /// 1. `authz.require(actor.id, "tenant:{id}", "workspaces", "create")` — first.
-    /// 2. Transaction: `INSERT workspaces` + `INSERT workspace_members(role='admin')`.
-    /// 3. `authz.grant_workspace_role(actor.id, workspace.id, WorkspaceRole::Admin)`.
-    /// 4. `COMMIT`.
-    ///
-    /// The side-effect "creator becomes `workspace_admin`" is preserved
-    /// (unlike `platform::create_tenant`): a workspace is a working unit, and
-    /// its creator is by definition its admin.
+    /// Creates a workspace inside a tenant and assigns the owner as `owner_role_key`.
     pub async fn create_workspace(
         state: &SaasState,
         actor: &AuthUser,
         tenant_id: Uuid,
         name: String,
+        owner: &AuthUser,
+        owner_role_key: &RoleKey,
     ) -> Result<Workspace, CoreError> {
         let domain_str = domain::tenant_domain(tenant_id);
 
@@ -233,38 +231,40 @@ pub mod tenant {
         .fetch_one(&mut *tx)
         .await?;
 
-        sqlx::query(
-            r#"
-            insert into workspace_members (workspace_id, user_id, role)
-            values ($1, $2, 'admin')
-            on conflict (workspace_id, user_id) do update set role = excluded.role
-            "#,
-        )
-        .bind(workspace.id)
-        .bind(actor.id)
-        .execute(&mut *tx)
-        .await?;
+        let ws_domain = domain::workspace_domain(workspace.id);
+
+        ::access::create_owner_role(state.access(), &ws_domain)
+            .await
+            .map_err(CoreError::from)?;
+
+        let permissions = ::access::get_permissions_for_role(state.access(), &ws_domain, owner_role_key)
+            .await
+            .map_err(CoreError::from)?;
 
         state
             .authz
-            .grant_workspace_role(actor.id, workspace.id, WorkspaceRole::Admin)
+            .grant_role(owner.id, &ws_domain, owner_role_key.as_str(), &permissions)
             .await?;
+
+        sqlx::query(
+            r#"
+            insert into workspace_members (workspace_id, user_id, role)
+            values ($1, $2, $3)
+            on conflict do nothing
+            "#,
+        )
+        .bind(workspace.id)
+        .bind(owner.id)
+        .bind(owner_role_key.as_str())
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
 
         Ok(workspace)
     }
 
-    /// Lists tenants the given user is a member of, newest first.
-    ///
-    /// **Exception to §5 p.5** (`authz.require` first): this is a membership
-    /// query, not a protected action. There is no domain to `require` before
-    /// knowing the result. `tenant_members` is the authoritative source for
-    /// "which tenants is this user a member of" (Appendix B §2.10);
-    /// `casbin_rule` remains the authoritative source for what the user can
-    /// do **inside** each tenant. A platform admin who provisioned a tenant
-    /// for someone else (actor ≠ owner) is not a member and does not see it
-    /// here — consistent with §2.13 (platform admin is not a superuser).
+    /// Lists tenants where the user has at least one role.
     pub async fn list_memberships(
         state: &SaasState,
         user: &AuthUser,
@@ -273,8 +273,10 @@ pub mod tenant {
             r#"
             select t.id, t.name, t.status, t.created_at
             from tenants t
-            join tenant_members tm on tm.tenant_id = t.id
-            where tm.user_id = $1
+            where exists (
+                select 1 from tenant_members tm
+                where tm.tenant_id = t.id and tm.user_id = $1
+            )
             order by t.created_at desc
             "#,
         )
@@ -289,10 +291,6 @@ pub mod tenant {
 pub mod workspace {
     use super::*;
 
-    /// Creates a document inside a workspace.
-    ///
-    /// Authorization is checked first
-    /// (`workspace:{id}`, `documents`, `write`), then the row is inserted.
     pub async fn create_document(
         state: &SaasState,
         actor: &AuthUser,
@@ -321,10 +319,6 @@ pub mod workspace {
         Ok(document)
     }
 
-    /// Lists documents in a workspace.
-    ///
-    /// Authorization is checked first
-    /// (`workspace:{id}`, `documents`, `read`), then the rows are selected.
     pub async fn list_documents(
         state: &SaasState,
         actor: &AuthUser,
@@ -352,10 +346,6 @@ pub mod workspace {
         Ok(documents)
     }
 
-	    /// Gets a single document by ID.
-    ///
-    /// Authorization is checked first
-    /// (`workspace:{id}`, `documents`, `read`), then the row is selected.
     pub async fn get_document(
         state: &SaasState,
         actor: &AuthUser,
@@ -385,12 +375,7 @@ pub mod workspace {
         Ok(document)
     }
 
-    /// Lists workspaces the given user is a member of, newest first.
-    ///
-    /// **Exception to §5 p.5** (`authz.require` first): see
-    /// [`tenant::list_memberships`] for the rationale. `workspace_members` is
-    /// the membership source of truth; `casbin_rule` remains the source of
-    /// truth for actions **inside** the workspace.
+    /// Lists workspaces where the user has at least one role.
     pub async fn list_memberships(
         state: &SaasState,
         user: &AuthUser,
@@ -399,8 +384,10 @@ pub mod workspace {
             r#"
             select w.id, w.tenant_id, w.name, w.created_at
             from workspaces w
-            join workspace_members wm on wm.workspace_id = w.id
-            where wm.user_id = $1
+            where exists (
+                select 1 from workspace_members wm
+                where wm.workspace_id = w.id and wm.user_id = $1
+            )
             order by w.created_at desc
             "#,
         )
@@ -414,38 +401,34 @@ pub mod workspace {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `saas` without a real database.
-    //!
-    //! `PgPool::connect_lazy` creates a pool without opening a connection.
-    //! The mock `AuthorizationEngine` is set to `deny` mode, so `authz.require`
-    //! fails before `saas` touches the database.
-    //!
-    //! `accept_invitation` and `*::list_memberships` have no unit tests here:
-    //! they do not call `authz.require` and go straight to SQL, which a lazy
-    //! pool cannot serve. Covered by integration tests (`tests/integration.rs`).
-
     use super::*;
     use std::sync::Mutex;
 
-    use authz::{AuthzError, AuthorizationEngine, WorkspaceRole};
     use chrono::Utc;
-    use domain::{AuthUser, InvitationTarget};
+    use domain::InvitationTarget;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RequireCall {
         user_id: Uuid,
         domain: String,
-        object: String,
+        resource: String,
         action: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct GrantRoleCall {
+        user_id: Uuid,
+        domain: String,
+        role_key: String,
+        permissions: Vec<(String, String)>,
     }
 
     #[derive(Default)]
     struct MockAuthz {
         deny: bool,
         require_calls: Mutex<Vec<RequireCall>>,
-        grant_tenant_owner_calls: Mutex<Vec<(Uuid, Uuid)>>,
-        grant_workspace_role_calls: Mutex<Vec<(Uuid, Uuid, String)>>,
-        grant_platform_admin_calls: Mutex<Vec<Uuid>>,
+        grant_role_calls: Mutex<Vec<GrantRoleCall>>,
+        revoke_role_calls: Mutex<Vec<(Uuid, String, String)>>,
     }
 
     impl MockAuthz {
@@ -460,12 +443,8 @@ mod tests {
             self.require_calls.lock().unwrap().clone()
         }
 
-        fn grant_tenant_owner_calls(&self) -> Vec<(Uuid, Uuid)> {
-            self.grant_tenant_owner_calls.lock().unwrap().clone()
-        }
-
-        fn grant_workspace_role_calls(&self) -> Vec<(Uuid, Uuid, String)> {
-            self.grant_workspace_role_calls.lock().unwrap().clone()
+        fn grant_role_calls(&self) -> Vec<GrantRoleCall> {
+            self.grant_role_calls.lock().unwrap().clone()
         }
     }
 
@@ -475,7 +454,7 @@ mod tests {
             &self,
             _user_id: Uuid,
             _domain: &str,
-            _object: &str,
+            _resource: &str,
             _action: &str,
         ) -> Result<bool, AuthzError> {
             Ok(!self.deny)
@@ -485,13 +464,13 @@ mod tests {
             &self,
             user_id: Uuid,
             domain: &str,
-            object: &str,
+            resource: &str,
             action: &str,
         ) -> Result<(), AuthzError> {
             self.require_calls.lock().unwrap().push(RequireCall {
                 user_id,
                 domain: domain.to_string(),
-                object: object.to_string(),
+                resource: resource.to_string(),
                 action: action.to_string(),
             });
             if self.deny {
@@ -501,33 +480,32 @@ mod tests {
             }
         }
 
-        async fn grant_platform_admin(&self, user_id: Uuid) -> Result<(), AuthzError> {
-            self.grant_platform_admin_calls.lock().unwrap().push(user_id);
-            Ok(())
-        }
-
-        async fn grant_tenant_owner(
+        async fn grant_role(
             &self,
             user_id: Uuid,
-            tenant_id: Uuid,
+            domain: &str,
+            role_key: &str,
+            permissions: &[(String, String)],
         ) -> Result<(), AuthzError> {
-            self.grant_tenant_owner_calls
-                .lock()
-                .unwrap()
-                .push((user_id, tenant_id));
-            Ok(())
-        }
-
-        async fn grant_workspace_role(
-            &self,
-            user_id: Uuid,
-            workspace_id: Uuid,
-            role: WorkspaceRole,
-        ) -> Result<(), AuthzError> {
-            self.grant_workspace_role_calls.lock().unwrap().push((
+            self.grant_role_calls.lock().unwrap().push(GrantRoleCall {
                 user_id,
-                workspace_id,
-                role.as_str().to_string(),
+                domain: domain.to_string(),
+                role_key: role_key.to_string(),
+                permissions: permissions.to_vec(),
+            });
+            Ok(())
+        }
+
+        async fn revoke_role(
+            &self,
+            user_id: Uuid,
+            domain: &str,
+            role_key: &str,
+        ) -> Result<(), AuthzError> {
+            self.revoke_role_calls.lock().unwrap().push((
+                user_id,
+                domain.to_string(),
+                role_key.to_string(),
             ));
             Ok(())
         }
@@ -536,8 +514,10 @@ mod tests {
     fn lazy_state(mock: Arc<MockAuthz>) -> SaasState {
         let pool = PgPool::connect_lazy("postgres://saas-test-host/saas_test")
             .expect("lazy pool must be constructible");
+        let access = Arc::new(AccessState::new(pool.clone(), mock.clone() as Arc<dyn AuthorizationEngine>));
         SaasBuilder::new(pool)
             .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .with_access(access)
             .build()
             .expect("builder must succeed")
     }
@@ -566,13 +546,10 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, PLATFORM_DOMAIN);
-        assert_eq!(call.object, "tenants");
+        assert_eq!(call.resource, "tenants");
         assert_eq!(call.action, "create");
 
-        assert!(
-            mock.grant_tenant_owner_calls().is_empty(),
-            "create_tenant must not call grant_tenant_owner"
-        );
+        assert!(mock.grant_role_calls().is_empty());
     }
 
     #[tokio::test]
@@ -581,8 +558,9 @@ mod tests {
         let state = lazy_state(mock.clone());
         let actor = actor();
         let owner = self::actor();
+        let role_key = RoleKey::parse("owner").unwrap();
 
-        let err = platform::provision_tenant(&state, &actor, "Acme".into(), &owner)
+        let err = platform::provision_tenant(&state, &actor, "Acme".into(), &owner, &role_key)
             .await
             .expect_err("require must deny");
         assert!(matches!(err, CoreError::Forbidden));
@@ -592,10 +570,10 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, PLATFORM_DOMAIN);
-        assert_eq!(call.object, "tenants");
+        assert_eq!(call.resource, "tenants");
         assert_eq!(call.action, "create");
 
-        assert!(mock.grant_tenant_owner_calls().is_empty());
+        assert!(mock.grant_role_calls().is_empty());
     }
 
     #[tokio::test]
@@ -604,8 +582,9 @@ mod tests {
         let state = lazy_state(mock.clone());
         let actor = actor();
         let tenant_id = Uuid::new_v4();
+        let role_key = RoleKey::parse("owner").unwrap();
 
-        let err = tenant::create_workspace(&state, &actor, tenant_id, "Marketing".into())
+        let err = tenant::create_workspace(&state, &actor, tenant_id, "Marketing".into(), &actor, &role_key)
             .await
             .expect_err("require must deny");
         assert!(matches!(err, CoreError::Forbidden));
@@ -615,10 +594,10 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.object, "workspaces");
+        assert_eq!(call.resource, "workspaces");
         assert_eq!(call.action, "create");
 
-        assert!(mock.grant_workspace_role_calls().is_empty());
+        assert!(mock.grant_role_calls().is_empty());
     }
 
     #[tokio::test]
@@ -638,7 +617,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.object, "documents");
+        assert_eq!(call.resource, "documents");
         assert_eq!(call.action, "write");
     }
 
@@ -659,7 +638,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.object, "documents");
+        assert_eq!(call.resource, "documents");
         assert_eq!(call.action, "read");
     }
 
@@ -675,7 +654,7 @@ mod tests {
             &actor,
             InvitationTarget::Tenant(tenant_id),
             Some("invitee@example.test".into()),
-            "tenant_owner".into(),
+            "owner".into(),
             None,
             Some(1),
         )
@@ -688,7 +667,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.object, "invitations");
+        assert_eq!(call.resource, "invitations");
         assert_eq!(call.action, "create");
     }
 
@@ -717,7 +696,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.object, "invitations");
+        assert_eq!(call.resource, "invitations");
         assert_eq!(call.action, "create");
     }
 
@@ -744,7 +723,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.object, "invitations");
+        assert_eq!(call.resource, "invitations");
         assert_eq!(call.action, "revoke");
     }
 
@@ -769,7 +748,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.object, "invitations");
+        assert_eq!(call.resource, "invitations");
         assert_eq!(call.action, "list");
     }
 

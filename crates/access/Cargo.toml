@@ -1,0 +1,20 @@
+[package]
+name = "access"
+version = "0.1.0"
+edition = "2021"
+description = "Role and permission ownership: permissions, roles, role_permissions (ADR-0001)"
+
+[dependencies]
+domain = { path = "../domain", features = ["ssr"] }
+authz = { path = "../authz" }
+
+sqlx.workspace = true
+uuid.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+sqlx = { workspace = true, features = ["macros"] }

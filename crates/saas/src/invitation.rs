@@ -1,20 +1,13 @@
 //! Invitations: creation, acceptance, revocation, listing.
 //!
-//! An invitation targets exactly one scope: a tenant (`role = "tenant_owner"`)
-//! or a workspace (`role ∈ {"admin", "editor", "viewer"}`). `email IS NULL`
-//! means a reusable link; `email IS NOT NULL` means an addressed invitation
-//! (until email verification, Stage 3, addressed invitations are effectively
-//! links; see handoff §16).
-//!
-//! Raw tokens are returned once from [`create_invitation`] as a tuple
-//! `(invitation, raw_token)` and never persisted; `invitations.token_hash`
-//! stores SHA-256 of the raw token.
+//! An invitation targets exactly one scope: a tenant or a workspace.
+//! `email IS NULL` means a reusable link; `email IS NOT NULL` means an
+//! addressed invitation.
 //!
 //! **Invariant exception (§5 p.5):** [`accept_invitation`] does **not** call
 //! `authz.require` — it authorizes by the invitation token. All other
 //! services in this module check `authz.require(...)` first.
 
-use authz::WorkspaceRole;
 use domain::{AuthUser, Invitation, InvitationTarget};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -25,13 +18,6 @@ use crate::{CoreError, SaasState};
 const DEFAULT_TTL_HOURS: i32 = 168;
 
 /// Creates an invitation.
-///
-/// The raw token is returned to the caller once (as the second tuple element)
-/// and is not persisted; `invitations.token_hash` stores SHA-256 of it.
-///
-/// `ttl_hours` defaults to [`DEFAULT_TTL_HOURS`] when `None`.
-/// `max_uses` (if `Some`) must be `>= 1`; `None` means unlimited (typical for
-/// link invitations).
 pub async fn create_invitation(
     state: &SaasState,
     actor: &AuthUser,
@@ -48,7 +34,7 @@ pub async fn create_invitation(
         .require(actor.id, &domain_str, "invitations", "create")
         .await?;
 
-    validate_role(target, &role)?;
+    validate_role(state, target, &role).await?;
 
     if let Some(email) = email.as_deref() {
         identity::validate_email(email).map_err(|e| CoreError::Validation(e.to_string()))?;
@@ -95,14 +81,6 @@ pub async fn create_invitation(
 }
 
 /// Checks an invitation by raw token without accepting it.
-///
-/// Returns `Some(Invitation)` if the token is valid (not revoked, not expired,
-/// not exhausted), or `None` otherwise. Does not increment `used_count`, does
-/// not write memberships, and does not call `authz.require` (authorized by the
-/// token itself, same as [`accept_invitation`]).
-///
-/// Used by the UI to show "invalid / expired / revoked" before asking the
-/// user to log in.
 pub async fn check_invitation(
     state: &SaasState,
     raw_token: &str,
@@ -126,19 +104,6 @@ pub async fn check_invitation(
 }
 
 /// Accepts an invitation by raw token.
-///
-/// **Does not call `authz.require`** (§5 p.5 explicit exception): the caller
-/// is authorized by the possession of the raw token. Everything else — the
-/// `used_count` increment, the membership write, and the `grant_*` — happens
-/// in one transaction; `grant_*` runs before `tx.commit()`.
-///
-/// Returns `CoreError::NotFound` if the token does not match any active
-/// invitation (does not exist, revoked, expired, or exhausted). The reason is
-/// not distinguished to avoid leaking invitation state.
-///
-/// **Known limitation (handoff §16):** `actor.email` is not compared to
-/// `invitation.email` until email verification (Stage 3); addressed
-/// invitations are effectively links in Stage 2a.
 pub async fn accept_invitation(
     state: &SaasState,
     user: &AuthUser,
@@ -168,51 +133,58 @@ pub async fn accept_invitation(
         .execute(&mut *tx)
         .await?;
 
+    let role_key = ::access::RoleKey::parse(&invitation.role)
+        .map_err(|e| CoreError::Validation(e.to_string()))?;
+
     if let Some(tenant_id) = invitation.tenant_id {
+        let domain_str = domain::tenant_domain(tenant_id);
+        let permissions = ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
+            .await
+            .map_err(CoreError::from)?;
+
         sqlx::query(
             r#"
             insert into tenant_members (tenant_id, user_id, role)
-            values ($1, $2, 'owner')
-            on conflict (tenant_id, user_id) do update set role = excluded.role
+            values ($1, $2, $3)
+            on conflict do nothing
             "#,
         )
         .bind(tenant_id)
         .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
-
-        state.authz.grant_tenant_owner(user.id, tenant_id).await?;
-    } else if let Some(workspace_id) = invitation.workspace_id {
-        let role = match invitation.role.as_str() {
-            "admin" => WorkspaceRole::Admin,
-            "editor" => WorkspaceRole::Editor,
-            "viewer" => WorkspaceRole::Viewer,
-            other => {
-                return Err(CoreError::Internal(format!(
-                    "unexpected workspace role in invitation: {other}"
-                )))
-            }
-        };
-
-        sqlx::query(
-            r#"
-            insert into workspace_members (workspace_id, user_id, role)
-            values ($1, $2, $3)
-            on conflict (workspace_id, user_id) do update set role = excluded.role
-            "#,
-        )
-        .bind(workspace_id)
-        .bind(user.id)
-        .bind(invitation.role.as_str())
+        .bind(role_key.as_str())
         .execute(&mut *tx)
         .await?;
 
         state
             .authz
-            .grant_workspace_role(user.id, workspace_id, role)
+            .grant_role(user.id, &domain_str, role_key.as_str(), &permissions)
             .await?;
+
+    } else if let Some(workspace_id) = invitation.workspace_id {
+        let domain_str = domain::workspace_domain(workspace_id);
+        let permissions = ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
+            .await
+            .map_err(CoreError::from)?;
+
+        sqlx::query(
+            r#"
+            insert into workspace_members (workspace_id, user_id, role)
+            values ($1, $2, $3)
+            on conflict do nothing
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(user.id)
+        .bind(role_key.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        state
+            .authz
+            .grant_role(user.id, &domain_str, role_key.as_str(), &permissions)
+            .await?;
+
     } else {
-        // Unreachable: the CHECK constraint enforces exactly one scope.
         return Err(CoreError::Internal(
             "invitation has neither tenant_id nor workspace_id".into(),
         ));
@@ -223,11 +195,7 @@ pub async fn accept_invitation(
     Ok(invitation)
 }
 
-/// Revokes an invitation (sets `revoked_at = now()`).
-///
-/// `target` is required to resolve the Casbin domain before any SQL; the
-/// `WHERE` clause additionally checks that the invitation belongs to `target`,
-/// so a mismatched `(target, invitation_id)` pair yields `NotFound`.
+/// Revokes an invitation.
 pub async fn revoke_invitation(
     state: &SaasState,
     actor: &AuthUser,
@@ -269,7 +237,7 @@ pub async fn revoke_invitation(
     Ok(())
 }
 
-/// Lists invitations for a tenant or workspace, newest first.
+/// Lists invitations.
 pub async fn list_invitations(
     state: &SaasState,
     actor: &AuthUser,
@@ -304,7 +272,6 @@ pub async fn list_invitations(
     Ok(invitations)
 }
 
-/// Resolves the Casbin domain string for an invitation target.
 fn target_domain(target: InvitationTarget) -> String {
     match target {
         InvitationTarget::Tenant(id) => domain::tenant_domain(id),
@@ -312,36 +279,35 @@ fn target_domain(target: InvitationTarget) -> String {
     }
 }
 
-/// Generates a raw invitation token: 2 × UUID v4 (244 bits of entropy),
-/// hex-encoded into 64 characters.
 fn generate_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-/// SHA-256 of the raw token, hex-encoded. Stored in `invitations.token_hash`.
 fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-/// Validates that `role` is allowed for the given `target`.
-fn validate_role(target: InvitationTarget, role: &str) -> Result<(), CoreError> {
-    match target {
-        InvitationTarget::Tenant(_) => {
-            if role != "tenant_owner" {
-                return Err(CoreError::Validation(format!(
-                    "invalid tenant role: {role} (expected tenant_owner)"
-                )));
-            }
-        }
-        InvitationTarget::Workspace(_) => {
-            if !matches!(role, "admin" | "editor" | "viewer") {
-                return Err(CoreError::Validation(format!(
-                    "invalid workspace role: {role} (expected admin|editor|viewer)"
-                )));
-            }
-        }
+/// Validates that `role` exists in the target domain.
+async fn validate_role(
+    state: &SaasState,
+    target: InvitationTarget,
+    role: &str,
+) -> Result<(), CoreError> {
+    let domain_str = target_domain(target);
+    let role_key = ::access::RoleKey::parse(role)
+        .map_err(|e| CoreError::Validation(e.to_string()))?;
+
+    let exists = ::access::get_role(state.access(), &domain_str, &role_key)
+        .await
+        .map_err(CoreError::from)?
+        .is_some();
+
+    if !exists {
+        return Err(CoreError::Validation(format!(
+            "role '{role}' does not exist in domain '{domain_str}'"
+        )));
     }
     Ok(())
 }

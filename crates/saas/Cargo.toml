@@ -6,6 +6,7 @@ description = "SaaS business logic: platform, tenant, workspace, documents, invi
 
 [dependencies]
 authz = { path = "../authz" }
+access = { path = "../access" }
 domain = { path = "../domain", features = ["ssr"] }
 identity = { path = "../identity" }
 

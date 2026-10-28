@@ -4,7 +4,7 @@
 //! endpoint (URL/contract unchanged) but delegates to
 //! `saas::platform::provision_tenant` with `actor == owner`. The UI scenario
 //! "created → became owner" is preserved through an explicit call:
-//! `create_tenant` (container-only) no longer grants `tenant_owner`, so the
+//! `create_tenant` (container-only) no longer grants `owner`, so the
 //! server function passes the current user as the owner.
 
 use domain::Tenant;
@@ -13,15 +13,15 @@ use leptos::task::spawn_local;
 
 /// Creates a tenant and assigns the current user as its owner.
 ///
-/// Delegates to `saas::platform::provision_tenant(&state.saas, &user, name, &user)`.
-/// Errors are mapped to HTTP status codes by `crate::error::core_error_to_server_fn`.
+/// Delegates to `saas::platform::provision_tenant` with `RoleKey::parse("owner")`.
 #[server]
 pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
 
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let owner_key = access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let tenant = saas::platform::provision_tenant(&state.saas, &user, name, &user)
+    let tenant = saas::platform::provision_tenant(&state.saas, &user, name, &user, &owner_key)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
 
