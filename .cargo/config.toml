@@ -1,0 +1,3 @@
+[alias]
+# cargo client — leptos watch для examples/saas-leptos
+client = ["leptos", "--manifest-path", "examples/saas-leptos/Cargo.toml", "watch"]

@@ -2,7 +2,7 @@
 name = "seed"
 version = "0.1.0"
 edition = "2021"
-description = "Bootstrap данных"
+description = "Bootstrap binary: platform owner, demo tenant/workspace/users/roles"
 
 [[bin]]
 name = "seed"

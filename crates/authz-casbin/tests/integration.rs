@@ -6,7 +6,7 @@
 //! `CasbinAuthz::from_pool` shares the test pool, so policies live in that
 //! test database.
 
-use authz::{AuthzError, AuthorizationEngine};
+use authz::{AuthorizationEngine, AuthzError};
 use authz_casbin::CasbinAuthz;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -34,9 +34,18 @@ async fn grant_role_grants_permissions_and_can_checks_them(pool: PgPool) {
         .await
         .expect("grant_role must succeed");
 
-    let can_read = authz.can(user_id, domain, "documents", "read").await.unwrap();
-    let can_write = authz.can(user_id, domain, "documents", "write").await.unwrap();
-    let can_delete = authz.can(user_id, domain, "documents", "delete").await.unwrap();
+    let can_read = authz
+        .can(user_id, domain, "documents", "read")
+        .await
+        .unwrap();
+    let can_write = authz
+        .can(user_id, domain, "documents", "write")
+        .await
+        .unwrap();
+    let can_delete = authz
+        .can(user_id, domain, "documents", "delete")
+        .await
+        .unwrap();
 
     assert!(can_read, "must be able to read");
     assert!(can_write, "must be able to write");
@@ -67,7 +76,10 @@ async fn revoke_role_removes_permissions(pool: PgPool) {
         .await
         .unwrap();
 
-    let can_before = authz.can(user_id, domain, "documents", "read").await.unwrap();
+    let can_before = authz
+        .can(user_id, domain, "documents", "read")
+        .await
+        .unwrap();
     assert!(can_before, "must have permission before revoke");
 
     authz
@@ -75,7 +87,10 @@ async fn revoke_role_removes_permissions(pool: PgPool) {
         .await
         .expect("revoke_role must succeed");
 
-    let can_after = authz.can(user_id, domain, "documents", "read").await.unwrap();
+    let can_after = authz
+        .can(user_id, domain, "documents", "read")
+        .await
+        .unwrap();
     assert!(!can_after, "must not have permission after revoke");
 }
 
@@ -93,8 +108,14 @@ async fn domain_isolation(pool: PgPool) {
         .await
         .unwrap();
 
-    let can_a = authz.can(user_id, domain_a, "documents", "read").await.unwrap();
-    let can_b = authz.can(user_id, domain_b, "documents", "read").await.unwrap();
+    let can_a = authz
+        .can(user_id, domain_a, "documents", "read")
+        .await
+        .unwrap();
+    let can_b = authz
+        .can(user_id, domain_b, "documents", "read")
+        .await
+        .unwrap();
 
     assert!(can_a, "must have permission in domain_a");
     assert!(!can_b, "must not have permission in domain_b");
@@ -118,8 +139,14 @@ async fn multiple_roles_in_same_domain_are_additive(pool: PgPool) {
         .await
         .unwrap();
 
-    let can_read = authz.can(user_id, domain, "documents", "read").await.unwrap();
-    let can_write = authz.can(user_id, domain, "documents", "write").await.unwrap();
+    let can_read = authz
+        .can(user_id, domain, "documents", "read")
+        .await
+        .unwrap();
+    let can_write = authz
+        .can(user_id, domain, "documents", "write")
+        .await
+        .unwrap();
 
     assert!(can_read, "must have read from viewer role");
     assert!(can_write, "must have write from editor role");
@@ -141,6 +168,9 @@ async fn grant_role_is_idempotent(pool: PgPool) {
         .await
         .expect("second grant must not fail");
 
-    let can_read = authz.can(user_id, domain, "documents", "read").await.unwrap();
+    let can_read = authz
+        .can(user_id, domain, "documents", "read")
+        .await
+        .unwrap();
     assert!(can_read, "permission must persist after duplicate grant");
 }

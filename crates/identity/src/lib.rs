@@ -1,9 +1,9 @@
-//! Сущность пользователя платформы.
+//! Platform user entity.
 //!
-//! Крейт владеет таблицей `users` (единственный владелец по контракту).
-//! Хэширование паролей сюда не входит — `create_user`/`upsert_user` принимают
-//! готовый `password_hash`, который вычисляет `authn`. JWT, cookie, HTTP,
-//! Casbin здесь отсутствуют.
+//! This crate owns the `users` table (sole writer by contract).
+//! Password hashing is not performed here — `create_user`/`upsert_user`
+//! accept a precomputed `password_hash` produced by `authn`. JWT, cookie,
+//! HTTP, and Casbin are not part of this crate.
 
 use domain::AuthUser;
 use sqlx::PgPool;
@@ -21,7 +21,7 @@ pub enum IdentityError {
     Db(#[from] sqlx::Error),
 }
 
-/// Строка таблицы `users` целиком, включая `password_hash`.
+/// Full `users` row, including `password_hash`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserRecord {
     pub id: Uuid,
@@ -58,12 +58,11 @@ pub fn validate_password(password: &str) -> Result<(), IdentityError> {
 }
 
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<AuthUser>, IdentityError> {
-    let user = sqlx::query_as::<_, AuthUser>(
-        "select id, email, created_at from users where id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let user =
+        sqlx::query_as::<_, AuthUser>("select id, email, created_at from users where id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
     Ok(user)
 }
 
@@ -80,7 +79,8 @@ pub async fn find_by_email(
     Ok(user)
 }
 
-/// Создаёт пользователя. `password_hash` должен быть уже вычислен (Argon2 — в `authn`).
+/// Creates a user. `password_hash` must already be computed (Argon2 is in
+/// `authn`).
 pub async fn create_user(
     pool: &PgPool,
     email: &str,
@@ -104,8 +104,8 @@ pub async fn create_user(
     })
 }
 
-/// Идемпотентный upsert: если пользователь с таким email есть — обновляем
-/// `password_hash`, иначе создаём. Используется seed-ом.
+/// Idempotent upsert: if a user with this email exists, update
+/// `password_hash`; otherwise create. Used by `seed`.
 pub async fn upsert_user(
     pool: &PgPool,
     email: &str,

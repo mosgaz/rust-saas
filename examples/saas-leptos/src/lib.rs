@@ -30,7 +30,6 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
 
     view! {
-        <Stylesheet href="/pkg/site.css" />
         <Router>
             <layout::Layout>
                 <Routes fallback=|| "Not found">
@@ -39,33 +38,46 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/register") view=pages::auth::RegisterPage />
                     <Route path=path!("/platform") view=pages::platform::PlatformPage />
 
-                    <Route path=path!("/tenants") view=pages::tenant::TenantsListPage />
+                    <Route path=path!("/tenants") view=pages::tenant::TenantListPage />
                     <Route path=path!("/tenants/:tenant_id") view=pages::tenant::TenantPage />
                     <Route
                         path=path!("/tenants/:tenant_id/invitations")
-                        view=pages::invitation::TenantInvitationsPage
+                        view=pages::invitation::TenantInvitationListPage
+                    />
+                    <Route
+                        path=path!("/tenants/:tenant_id/members")
+                        view=pages::member::TenantMemberListPage
+                    />
+                    <Route
+                        path=path!("/tenants/:tenant_id/roles")
+                        view=pages::role::TenantRoleListPage
                     />
 
-                    <Route path=path!("/workspaces") view=pages::workspace::WorkspacesListPage />
+                    <Route path=path!("/workspaces") view=pages::workspace::WorkspaceListPage />
                     <Route
                         path=path!("/workspaces/:workspace_id")
                         view=pages::workspace::WorkspacePage
                     />
-                    
-                    // ДОБАВЛЕННЫЙ РОУТ ДЛЯ ДОКУМЕНТА:
                     <Route
                         path=path!("/workspaces/:workspace_id/documents/:document_id")
                         view=pages::workspace::DocumentPage
                     />
-
                     <Route
                         path=path!("/workspaces/:workspace_id/invitations")
-                        view=pages::invitation::WorkspaceInvitationsPage
+                        view=pages::invitation::WorkspaceInvitationListPage
+                    />
+                    <Route
+                        path=path!("/workspaces/:workspace_id/members")
+                        view=pages::member::WorkspaceMemberListPage
+                    />
+                    <Route
+                        path=path!("/workspaces/:workspace_id/roles")
+                        view=pages::role::WorkspaceRoleListPage
                     />
 
                     <Route
                         path=path!("/invitations/:token")
-                        view=pages::invitation::AcceptInvitationPage
+                        view=pages::invitation::InvitationAcceptPage
                     />
                 </Routes>
             </layout::Layout>
@@ -85,7 +97,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <AutoReload options=options.clone() />
                 <HydrationScripts options />
                 <MetaTags />
-				<Stylesheet id="leptos" href="/pkg/rust-saas-leptos.css"/>
+                <Stylesheet id="leptos" href="/pkg/rust-saas-leptos.css"/>
             </head>
             <body>
                 <App />

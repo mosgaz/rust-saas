@@ -138,10 +138,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Assign roles. `assign_role` is idempotent (ON CONFLICT DO NOTHING for
     // `*_members` and `add_policy` for `casbin_rule`).
-    saas_access::assign_role(&state, &tenant_owner, editor_user.id, &ws_domain, &editor_key)
-        .await?;
-    saas_access::assign_role(&state, &tenant_owner, viewer_user.id, &ws_domain, &viewer_key)
-        .await?;
+    saas_access::assign_role(
+        &state,
+        &tenant_owner,
+        editor_user.id,
+        &ws_domain,
+        &editor_key,
+    )
+    .await?;
+    saas_access::assign_role(
+        &state,
+        &tenant_owner,
+        viewer_user.id,
+        &ws_domain,
+        &viewer_key,
+    )
+    .await?;
 
     // Create the first document if it doesn't exist.
     let doc_exists: bool = sqlx::query_scalar(

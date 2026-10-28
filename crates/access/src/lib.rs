@@ -28,9 +28,7 @@ mod permission;
 mod role;
 
 pub use permission::{get_permissions_for_role, list_permissions};
-pub use role::{
-    create_owner_role, create_role, delete_role, get_role, list_roles, update_role,
-};
+pub use role::{create_owner_role, create_role, delete_role, get_role, list_roles, update_role};
 
 /// Errors produced by `access::*`.
 #[derive(Debug, thiserror::Error)]

@@ -235,7 +235,10 @@ async fn rotate_refresh_token_reuse_revokes_family(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(revoked, total, "reuse must revoke the whole family");
-    assert!(total >= 2, "family must have at least two rows after rotate");
+    assert!(
+        total >= 2,
+        "family must have at least two rows after rotate"
+    );
 }
 
 /// `revoke_refresh_token` (logout) sets `revoked_at`; a subsequent rotate

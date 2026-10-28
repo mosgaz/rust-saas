@@ -80,7 +80,7 @@ pub async fn accept_invitation(token: String) -> Result<Invitation, ServerFnErro
 // ─── Shared panel ───────────────────────────────────────────────────────────
 
 #[component]
-pub fn InvitationsPanel(target: InvitationTarget) -> impl IntoView {
+pub fn InvitationListPage(target: InvitationTarget) -> impl IntoView {
     let invitations = RwSignal::new(Vec::<Invitation>::new());
     let error = RwSignal::new(None::<String>);
     let refresh = RwSignal::new(0u32);
@@ -263,7 +263,7 @@ struct TenantIdParams {
 }
 
 #[component]
-pub fn TenantInvitationsPage() -> impl IntoView {
+pub fn TenantInvitationListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
     let tenant_id = move || params.with(|r| r.as_ref().ok().map(|p| p.tenant_id));
 
@@ -282,7 +282,7 @@ pub fn TenantInvitationsPage() -> impl IntoView {
                 <div class="mt-2">
                     <a class="btn text-sm" href=format!("/tenants/{id}")>"Open tenant"</a>
                 </div>
-                <InvitationsPanel target=InvitationTarget::Tenant(id) />
+                <InvitationListPage target=InvitationTarget::Tenant(id) />
             })}
         </main>
     }
@@ -294,7 +294,7 @@ struct WorkspaceIdParams {
 }
 
 #[component]
-pub fn WorkspaceInvitationsPage() -> impl IntoView {
+pub fn WorkspaceInvitationListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
     let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
 
@@ -313,7 +313,7 @@ pub fn WorkspaceInvitationsPage() -> impl IntoView {
                 <div class="mt-2">
                     <a class="btn text-sm" href=format!("/workspaces/{id}")>"Open workspace"</a>
                 </div>
-                <InvitationsPanel target=InvitationTarget::Workspace(id) />
+                <InvitationListPage target=InvitationTarget::Workspace(id) />
             })}
         </main>
     }
@@ -327,7 +327,7 @@ struct InviteTokenParams {
 }
 
 #[component]
-pub fn AcceptInvitationPage() -> impl IntoView {
+pub fn InvitationAcceptPage() -> impl IntoView {
     let params = use_params::<InviteTokenParams>();
     let token = move || params.with(|r| r.as_ref().ok().map(|p| p.token.clone()));
 
@@ -336,7 +336,6 @@ pub fn AcceptInvitationPage() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let navigate = use_navigate();
 
-    // Check the invitation token on mount.
     Effect::new(move |_| {
         let Some(tok) = token() else {
             error.set(Some("invalid invitation token".into()));
@@ -350,7 +349,6 @@ pub fn AcceptInvitationPage() -> impl IntoView {
         });
     });
 
-    // Check the current user on mount.
     Effect::new(move |_| {
         spawn_local(async move {
             match who_am_i().await {
