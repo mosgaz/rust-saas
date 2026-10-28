@@ -2,7 +2,7 @@
 
 **rust-saas** is a Rust library and reference application for building multi-tenant SaaS.
 
-The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, authorization, and persistence from each other, so they can be reused in other applications through git dependencies. The `examples/saas-leptos` directory contains a reference consumer that combines them with an isomorphic Leptos frontend and an Axum-based backend.
+The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, and authorization from each other, so they can be reused in other applications through git dependencies. The `examples/saas-leptos` directory contains a reference consumer that combines them with an isomorphic Leptos frontend and an Axum-based backend.
 
 ## Features
 
@@ -10,11 +10,14 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - Identity-first user model
 - Email and password authentication
 - Argon2 password hashing
-- JWT-based sessions stored in HTTP-only cookies
+- **JWT access tokens (short-lived) and opaque refresh tokens (rotation with family revocation)**
+- **Auto-refresh middleware (transparent token rotation)**
+- **Server-side logout (revokes refresh token family)**
 - Domain-scoped RBAC authorization with Casbin, behind an `AuthorizationEngine` trait
 - Platform, tenant, and workspace authorization domains
 - Invitations (reusable links and addressed) with `token_hash` (SHA-256), `expires_at`, `max_uses`, `revoked_at`
-- Tenant and workspace navigation (`/tenants`, `/workspaces`) for authenticated users
+- **Document pages (view and create inside workspaces)**
+- Tenant, workspace, and document navigation (`/tenants`, `/workspaces`, `/documents`)
 - Leptos server-side rendering and client hydration
 - Server functions for frontend-to-backend communication
 - PostgreSQL migrations with SQLx
@@ -33,13 +36,13 @@ crates/                  (library — the Cargo workspace)
 ├── authz/              AuthorizationEngine trait + AuthzError + WorkspaceRole
 ├── authz-casbin/       CasbinAuthz: canonical trait implementation
 ├── identity/           Sole owner of `users`: AuthUser, UserRecord, validation, CRUD
-├── authn/              Argon2, JWT, register/login/verify_token/issue_token
+├── authn/              Argon2, JWT access tokens, opaque refresh tokens, rotation
 ├── saas/               Business logic: platform, tenant, workspace, invitation
 ├── db/                 PostgreSQL connection and migrations
 └── seed/               Bootstrap data and demo accounts
 
 examples/                (reference consumers — outside the workspace)
-└── saas-leptos/        Leptos SSR + Axum + #[server] + cookie
+└── saas-leptos/        Leptos SSR + Axum + #[server] + middleware + cookies
 ```
 
 `examples/*` is listed in `workspace.exclude`; each example has its own `Cargo.toml` and `Cargo.lock`, and depends on the library crates via path dependencies pointing at `../../crates/*`.
@@ -49,12 +52,11 @@ The application separates four concerns:
 | Concern | Responsibility | Crate |
 |---|---|---|
 | Identity | Who you are as an entity (`users` table, `AuthUser`) | `identity` |
-| Authentication | How you proved you are who you are (Argon2, JWT) | `authn` |
+| Authentication | How you proved you are who you are (Argon2, JWT, refresh tokens) | `authn` |
 | Authorization | What you are allowed to do (`AuthorizationEngine`) | `authz` / `authz-casbin` |
 | Data isolation | Which rows you can see (SQL filters by tenant/workspace) | `saas` |
 
-`Casbin does not replace SQL isolation. JWT does not replace Casbin.
-UI does not replace backend authorization.`
+`Casbin does not replace SQL isolation. JWT does not replace Casbin. UI does not replace backend authorization.`
 
 ### Crate dependency graph
 
@@ -62,7 +64,7 @@ UI does not replace backend authorization.`
 saas-leptos  -> domain, authz, authz-casbin, identity, authn, saas, db   (example)
 seed         -> authz, authn, identity, authz-casbin, db, domain
 saas         -> authz (trait), identity, domain, sqlx, sha2
-authn        -> identity, domain, sqlx, argon2, jsonwebtoken
+authn        -> identity, domain, sqlx, argon2, jsonwebtoken, sha2
 identity     -> domain, sqlx
 authz-casbin -> authz (trait), domain, casbin, sqlx, sqlx-adapter
 authz        -> (trait only)
@@ -73,10 +75,10 @@ domain       -> serde, uuid, chrono; sqlx (optional, ssr only)
 Forbidden edges:
 
 - `saas` does not depend on Leptos, Axum, `casbin::Enforcer`, JWT, or Argon2. `sha2` is used only for `invitation::hash_token`, never for passwords (passwords are Argon2 in `authn`).
-- `authn` does not depend on `authz`.
+- `authn` does not depend on `authz`. `sha2` is used only for `refresh_tokens.token_hash`.
 - `identity` does not depend on `authn` or `authz`.
 - `authz` does not depend on Casbin, SQL, HTTP, Leptos, or JWT.
-- `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`).
+- `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`, `refresh_tokens`).
 - The example (`examples/saas-leptos`) does not call `casbin_rule` directly and does not call `authz.require` — only `saas::*` and `authn::*`.
 - Library crates do not depend on `examples/*`.
 
@@ -125,8 +127,9 @@ Example roles and permissions:
 | Database | PostgreSQL 16 |
 | Database access | SQLx |
 | Authorization | Casbin (via `authz-casbin`) |
-| Authentication | Argon2, JSON Web Tokens |
+| Authentication | Argon2, JSON Web Tokens (access), opaque tokens (refresh) |
 | Invitation tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
+| Refresh tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Styling | Tailwind CSS v4 |
 | Local infrastructure | Docker Compose (v1) |
 | Logging | `tracing` + `tracing-subscriber` (`RUST_LOG` env-filter) |
@@ -193,6 +196,8 @@ Then adjust the values if needed:
 # Read by the application, the seed binary, and `cargo test` (`#[sqlx::test]`)
 DATABASE_URL=postgres://postgres:postgres@localhost:5430/rust_saas
 JWT_SECRET=replace-with-a-long-random-secret
+ACCESS_TOKEN_TTL_MINUTES=15
+REFRESH_TOKEN_TTL_DAYS=30
 BIND_ADDR=127.0.0.1:3395
 
 # Read by docker-compose.yml (defaults are used if unset)
@@ -228,7 +233,7 @@ Demo users created by seed:
 | Workspace editor | `editor@acme.test` | `Editor123!` |
 | Workspace viewer | `viewer@acme.test` | `Viewer123!` |
 
-The command applies database migrations (including `20261101000001_saas_invitations.sql`) and creates initial platform, tenant, workspace, user, and authorization data. It is idempotent: re-running it re-hashes passwords and re-applies policies without creating duplicate rows.
+The command applies database migrations (including `20261102000001_authn_refresh_tokens.sql`) and creates initial platform, tenant, workspace, user, and authorization data. It is idempotent: re-running it re-hashes passwords and re-applies policies without creating duplicate rows.
 
 **Policy regrant.** `seed` calls `grant_platform_admin`, `grant_tenant_owner`, and `grant_workspace_role` on every invocation. Casbin's `add_policy` deduplicates existing `p`-rows and adds new ones; this is how existing tenant/workspace policies pick up permissions introduced by later library versions (for example, `invitations:create/revoke/list` added in Stage 2a).
 
@@ -258,9 +263,10 @@ Then in the browser:
 3. `/tenants` — list of tenants you're a member of; click **Open**.
 4. `/tenants/<tenant_id>` — as tenant owner, create a workspace.
 5. `/workspaces` — list of workspaces you're a member of.
-6. `/workspaces/<workspace_id>` — as editor, create documents; as viewer, list only.
-7. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace admin, create a workspace invitation.
+6. `/workspaces/<workspace_id>` — as editor, create documents; click a document title to view it on its dedicated page.
+7. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace owner, create a workspace invitation.
 8. Paste `/invitations/<64 hex>` into another browser/session (after logging in as someone else) — accept-flow writes `tenant_members` / `workspace_members` and grants the corresponding role.
+9. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work. The **Renew (demo)** button in the header shows the current user is valid.
 
 ### Checking the build
 
@@ -278,7 +284,7 @@ From the repository root:
 cargo test
 ```
 
-41 tests, all green (21 unit + 20 `#[sqlx::test]` integration).
+50 tests, all green (23 unit + 27 `#[sqlx::test]` integration).
 
 Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn` and `crates/saas`. Integration tests live in `crates/authn/tests/` and `crates/saas/tests/` and use `#[sqlx::test]`:
 
@@ -306,12 +312,15 @@ Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn` and `crates/
 │   ├── db/
 │   │   └── migrations/
 │   │       ├── 20261026000001_init.sql
-│   │       └── 20261101000001_saas_invitations.sql
+│   │       ├── 20261101000001_saas_invitations.sql
+│   │       └── 20261102000001_authn_refresh_tokens.sql
 │   └── seed/
 └── examples/
     └── saas-leptos/
         ├── Cargo.toml
         ├── src/
+        │   ├── layout.rs
+        │   ├── middleware.rs
         │   ├── pages/
         │   │   ├── auth.rs
         │   │   ├── home.rs
@@ -347,7 +356,7 @@ The sole owner of the `users` table. Provides `AuthUser`, `UserRecord` (includin
 
 ### authn
 
-The authentication mechanism on top of `identity`. Provides `Authn::register`, `Authn::login`, `Authn::issue_token`, `Authn::verify_token`, and `hash_password`. Uses Argon2 and `jsonwebtoken`, and talks to `users` through `identity` (via `sqlx`, not through `db`). Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`. `verify_token` returns `Ok(None)` for deleted users and invalid `sub`, `Err` for invalid signature or expiry. Covered by 10 unit tests and 6 `#[sqlx::test]` integration tests.
+The authentication mechanism on top of `identity`. Provides `Authn::with_ttl` (and `new`), `register`, `login`, `issue_access_token`, `issue_refresh_token`, `rotate_refresh_token`, `revoke_refresh_token`, `revoke_family`, `verify_token`, and `hash_password`. Uses Argon2 for passwords, `jsonwebtoken` for access tokens, and `sha2` for opaque refresh tokens (rotation with family revocation, stored in `refresh_tokens`). Talks to `users` through `identity`. Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`. `verify_token` returns `Ok(None)` for deleted users and invalid `sub`, `Err` for invalid signature or expiry. Covered by 13 unit tests and 13 `#[sqlx::test]` integration tests.
 
 ### saas
 
@@ -357,7 +366,7 @@ Business logic, independent of UI framework. `SaasState`, `SaasBuilder`, `CoreEr
 - `platform::provision_tenant(actor, name, owner)` — creates a tenant and explicitly assigns `owner` in one transaction (`INSERT tenants` + `INSERT tenant_members(owner, 'owner')` + `grant_tenant_owner(owner)`).
 - `tenant::create_workspace` — creates a workspace and assigns the creator `workspace_admin` (side effect preserved: a workspace is a working unit, and its creator is by definition its admin).
 - `tenant::list_memberships` / `workspace::list_memberships` — membership queries (see below).
-- `workspace::create_document` / `workspace::list_documents`.
+- `workspace::create_document` / `workspace::list_documents` / `workspace::get_document`.
 - `invitation::create_invitation` — returns `(Invitation, raw_token)`; raw token is shown once and is not persisted (`invitations.token_hash` stores SHA-256).
 - `invitation::accept_invitation` — by raw token; writes `*_members` and grants the role in one transaction.
 - `invitation::revoke_invitation` / `invitation::list_invitations`.
@@ -374,7 +383,8 @@ Depends on `authz` (trait), `identity` (`AuthUser`), `domain`, `sqlx`, and `sha2
 PostgreSQL connection helper and migration runner. Migrations live in `crates/db/migrations/`:
 
 - `20261026000001_init.sql` — `users`, `tenants`, `workspaces`, `tenant_members`, `workspace_members`, `documents`, `casbin_rule`.
-- `20261101000001_saas_invitations.sql` — `invitations` (owner: `saas`; `saas_*` prefix marks ownership without splitting the migration folder).
+- `20261101000001_saas_invitations.sql` — `invitations` (owner: `saas`).
+- `20261102000001_authn_refresh_tokens.sql` — `refresh_tokens` (owner: `authn`, Stage 2b).
 Includes a `build.rs` with `cargo:rerun-if-changed=migrations` so that Cargo
 recompiles `db` whenever a migration file changes (prevents stale
 `sqlx::migrate!` caches across workspace targets).
@@ -385,9 +395,9 @@ Standalone binary for creating initial platform, tenant, workspace, user, and po
 
 ### examples/saas-leptos
 
-The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*` or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn`, which map to HTTP 400/401/403/404/409/500. `AppState` holds `authn`, `saas`, and `leptos_options`, and implements `FromRef<AppState> for LeptosOptions`. `src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping. This crate is **not** part of the library workspace; it is checked separately with `--manifest-path examples/saas-leptos/Cargo.toml`.
+The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*` or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn`, which map to HTTP 400/401/403/404/409/500. `AppState` holds `authn`, `saas`, and `leptos_options`, and implements `FromRef<AppState> for LeptosOptions`. `src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout. This crate is **not** part of the library workspace; it is checked separately with `--manifest-path examples/saas-leptos/Cargo.toml`.
 
-Routes (Stage 2a):
+Routes (Stage 2b):
 
 | Route | Component | Purpose |
 |---|---|---|
@@ -400,10 +410,11 @@ Routes (Stage 2a):
 | `/tenants/:tenant_id/invitations` | `pages::invitation::TenantInvitationsPage` | tenant invitations |
 | `/workspaces` | `pages::workspace::WorkspacesListPage` | list of my workspaces |
 | `/workspaces/:workspace_id` | `pages::workspace::WorkspacePage` | single workspace (documents) |
+| `/workspaces/:workspace_id/documents/:document_id` | `pages::workspace::DocumentPage` | single document view |
 | `/workspaces/:workspace_id/invitations` | `pages::invitation::WorkspaceInvitationsPage` | workspace invitations |
 | `/invitations/:token` | `pages::invitation::AcceptInvitationPage` | accept-flow |
 
-Plural URLs (`/tenants`, `/workspaces`) are intentional: list pages are first-class. `/invitations/:token` lives under a shared `/invitations` prefix; future extensions (`/invitations/:token/decline`) will not require renaming.
+Plural URLs (`/tenants`, `/workspaces`) are intentional: list pages are first-class. `/invitations/:token` lives under a shared `/invitations` prefix.
 
 ## Authorization model
 
@@ -459,7 +470,9 @@ Authorization is always checked on the server before business logic executes. Ex
 - Server functions resolve the actor through `extract::CurrentUser`; a missing actor is HTTP 401, not a generic `ServerFnError`.
 - Library errors (`CoreError`, `AuthnError`, `IdentityError`) are mapped to HTTP status codes in the example (`src/error.rs`); keep new variants covered by that mapping.
 - Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored.
+- **Refresh raw tokens are returned once from `authn::issue_refresh_token` and are never persisted; only `refresh_tokens.token_hash` (SHA-256) is stored.**
 - `accept_invitation` does not compare `actor.email` to `invitation.email` until email verification (Stage 3); addressed invitations are effectively links today — documented limitation, not a bug.
+- **Auto-refresh middleware serializes refresh within a single HTTP request; parallel HTTP requests with the same refresh token are a known limitation (Stage 2c/2d will add single-flight).**
 
 ## Roadmap
 
@@ -467,11 +480,12 @@ Authorization is always checked on the server before business logic executes. Ex
 - Stage 1.5 (done): workspace `async-trait` dependency, removal of unused `tower-http` / `getrandom` / `serde_json` / `jsonwebtoken` / `argon2`, removal of dead `#[server] current_user`, `.env.example` (EN), README `cargo test`
 - Stage 1.1 (done): `create_tenant` container only; `provision_tenant(actor, name, owner)` for explicit owner assignment; `create_workspace` side effect preserved
 - Stage 2a (done): invitations core — `invitations` table, `saas::invitation::{create, accept, revoke, list}`, `invitations:*` permissions, `tenant::list_memberships` / `workspace::list_memberships`, plural URL scheme (`/tenants`, `/workspaces`, `/invitations/:token`)
-- Stage 2b: refresh tokens with rotation + family revocation, logout with server-side invalidation, shorter access TTL
-- Stage 2c: workspace member management (list/change_role/remove), UI hides/disables buttons based on `authz.can`
-- Stage 2d: Casbin policy cleanup on delete + single Casbin/`saas` connection
+- **Stage 2b (done): refresh tokens with rotation + family revocation, auto-refresh middleware, logout with server-side invalidation, shorter access TTL, `access_token` + `refresh_token` cookies, global layout, document pages**
+- Stage 2e: domain-ownership RBAC (ADR-0001), `access` crate, `grant_role`/`revoke_role`, `*_members` multi-role PK, `seed` bootstrap updates
+- Stage 2c: workspace member management (list/change_role/remove), UI hides/disables buttons based on `authz.can`, client-side auto-retry
+- Stage 2d: Casbin policy cleanup on delete + single Casbin/`saas` connection + single-flight refresh
 - Stage 3: platform admin UI, tenant suspension, email verification (makes addressed invitations effective), audit log, return-URL preservation for `/invitations/:token`
-- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting, optional RLS, E2E HTTP tests
+- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (incl. `/refresh`), optional RLS, E2E HTTP tests
 
 ## License
 
