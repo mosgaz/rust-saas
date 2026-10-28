@@ -1,3 +1,9 @@
+//! Canonical implementation of `authz::AuthorizationEngine` on top of Casbin.
+//!
+//! The Casbin model, the `g`/`p` matcher, and the `grant_*` methods live
+//! here. Business code never talks to Casbin directly. This crate does not
+//! know about business tables (`users`, `tenants`); only `casbin_rule`.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +16,8 @@ use uuid::Uuid;
 use authz::{AuthzError, AuthorizationEngine, WorkspaceRole};
 use domain::{tenant_domain, workspace_domain, PLATFORM_DOMAIN};
 
+/// Casbin model: request `(sub, dom, obj, act)`; policy `(sub, dom, obj, act)`;
+/// role `g(_, _, _)`; matcher requires both `g` and `p`.
 const MODEL: &str = r#"
 [request_definition]
 r = sub, dom, obj, act
@@ -35,8 +43,8 @@ pub struct CasbinAuthz {
 }
 
 impl CasbinAuthz {
-    /// Конструктор для production: собственный пул к `database_url` (pool_size = 8).
-    /// Используется в `examples/saas-leptos/src/main.rs`.
+    /// Production constructor: own pool to `database_url` (`pool_size = 8`).
+    /// Used in `examples/saas-leptos/src/main.rs`.
     pub async fn new(database_url: &str) -> Result<Self, AuthzError> {
         let adapter = SqlxAdapter::new(database_url, 8)
             .await
@@ -44,10 +52,10 @@ impl CasbinAuthz {
         Self::from_adapter(adapter).await
     }
 
-    /// Конструктор поверх готового пула. Нужен потребителям, у которых уже есть
-    /// `PgPool` (например, `#[sqlx::test]` в integration-тестах `saas`).
-    /// `casbin_rule` должна существовать в БД, к которой подключён `pool`
-    /// (у нас — через `crates/db/migrations`).
+    /// Constructor over an existing pool. Consumers and tests that already
+    /// have a `PgPool` (for example `#[sqlx::test]` in `saas` integration
+    /// tests) use this. `casbin_rule` must exist in the database the pool is
+    /// connected to (here, via `crates/db/migrations`).
     pub async fn from_pool(pool: PgPool) -> Result<Self, AuthzError> {
         let adapter = SqlxAdapter::new_with_pool(pool)
             .await
@@ -145,12 +153,25 @@ impl AuthorizationEngine for CasbinAuthz {
         enforcer
             .add_policy(vec![
                 "tenant_owner".to_string(),
-                domain,
+                domain.clone(),
                 "workspaces".to_string(),
                 "create".to_string(),
             ])
             .await
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
+
+        // Stage 2a: `tenant_owner` can manage tenant-scoped invitations.
+        for action in ["create", "revoke", "list"] {
+            enforcer
+                .add_policy(vec![
+                    "tenant_owner".to_string(),
+                    domain.clone(),
+                    "invitations".to_string(),
+                    action.to_string(),
+                ])
+                .await
+                .map_err(|e| AuthzError::Internal(e.to_string()))?;
+        }
 
         Ok(())
     }

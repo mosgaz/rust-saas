@@ -1,8 +1,8 @@
-//! Абстракция авторизации: трейт `AuthorizationEngine` и типы ошибок.
+//! Authorization abstraction: the `AuthorizationEngine` trait and error types.
 //!
-//! Крейт не знает о Casbin, SQL, HTTP, Leptos или JWT. Конкретная реализация
-//! (например, `authz-casbin`) подключается отдельно и передаётся бизнес-коду
-//! как `Arc<dyn AuthorizationEngine>`.
+//! This crate is trait-only: no Casbin, no SQL, no HTTP, no Leptos, no JWT.
+//! A concrete implementation (for example `authz-casbin`) is plugged in
+//! separately and passed to business code as `Arc<dyn AuthorizationEngine>`.
 
 use uuid::Uuid;
 
@@ -14,6 +14,11 @@ pub enum AuthzError {
     Internal(String),
 }
 
+/// A workspace-scoped role.
+///
+/// `permissions()` is the **source of truth for Casbin policies**:
+/// `authz-casbin::grant_workspace_role` iterates over it and writes one
+/// `p`-row per `(object, action)`. It is not a UI list.
 #[derive(Debug, Clone, Copy)]
 pub enum WorkspaceRole {
     Admin,
@@ -36,6 +41,9 @@ impl WorkspaceRole {
                 ("documents", "read"),
                 ("documents", "write"),
                 ("members", "manage"),
+                ("invitations", "create"),
+                ("invitations", "revoke"),
+                ("invitations", "list"),
             ],
             Self::Editor => vec![("documents", "read"), ("documents", "write")],
             Self::Viewer => vec![("documents", "read")],

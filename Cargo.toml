@@ -24,9 +24,7 @@ casbin = { version = "2", default-features = false, features = ["runtime-tokio"]
 sqlx-adapter = "1"
 argon2 = { version = "0.5", features = ["std"] }
 jsonwebtoken = "9"
-tower-http = { version = "0.6", features = ["fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Для wasm32-unknown-unknown: getrandom 0.2 требует фичу "js"
-getrandom = { version = "0.2", features = ["js"] }
+async-trait = "0.1"
+sha2 = "0.10"

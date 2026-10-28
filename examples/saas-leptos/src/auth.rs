@@ -1,9 +1,24 @@
+//! Server functions for user registration and login.
+//!
+//! Both functions delegate to `authn::*`, issue a session JWT, and set it
+//! as an `httpOnly` cookie named `session`. Cookie attributes are the
+//! consumer's responsibility: the current MVP sets `path = "/"` and
+//! `http_only = true`, but not `Secure` or `SameSite` (see handoff §16).
+//!
+//! Errors are mapped to HTTP status codes by `crate::error`
+//! (`authn_error_to_server_fn`).
+
 use domain::AuthUser;
 use leptos::prelude::*;
 
 #[cfg(feature = "ssr")]
 use axum::http::HeaderValue;
 
+/// Registers a new user, issues a session JWT, and sets the `session` cookie.
+///
+/// Delegates to `authn::Authn::register` and `authn::Authn::issue_token`.
+/// On success returns the created `AuthUser`; the caller's browser receives
+/// a `Set-Cookie` header via `leptos_axum::ResponseOptions`.
 #[server]
 pub async fn register(email: String, password: String) -> Result<AuthUser, ServerFnError> {
     use axum_extra::extract::cookie::Cookie;
@@ -31,6 +46,11 @@ pub async fn register(email: String, password: String) -> Result<AuthUser, Serve
     Ok(user)
 }
 
+/// Logs in an existing user, issues a session JWT, and sets the `session` cookie.
+///
+/// Delegates to `authn::Authn::login` and `authn::Authn::issue_token`.
+/// On success returns the authenticated `AuthUser`; the caller's browser
+/// receives a `Set-Cookie` header via `leptos_axum::ResponseOptions`.
 #[server]
 pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFnError> {
     use axum_extra::extract::cookie::Cookie;
@@ -56,15 +76,4 @@ pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFn
     response.append_header(axum::http::header::SET_COOKIE, header);
 
     Ok(user)
-}
-
-/// Текущий пользователь из cookie `session`.
-///
-/// Тонкая обёртка над `crate::extract::CurrentUser::from_request()`; сигнатура
-/// сохранена для обратной совместимости с `pages/*.rs`. Маппинг ошибок —
-/// типизированный (`AuthnError` → HTTP-код через `crate::error`).
-#[server]
-pub async fn current_user() -> Result<Option<AuthUser>, ServerFnError> {
-    let current = crate::extract::CurrentUser::from_request().await?;
-    Ok(current.0)
 }

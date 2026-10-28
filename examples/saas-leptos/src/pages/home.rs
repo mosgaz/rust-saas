@@ -1,7 +1,11 @@
+//! Landing page: links to log in / register / platform and the user's lists
+//! of tenants and workspaces. Also exposes a "jump to tenant" input.
+
+use icons::leptos::{Building2, LogIn, LayoutList, UserPlus};
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
-use icons::leptos::{Building2, LogIn, UserPlus};
 
+/// Landing page (`/`).
 #[component]
 pub fn HomePage() -> impl IntoView {
     let tenant_id = RwSignal::new(String::new());
@@ -13,7 +17,7 @@ pub fn HomePage() -> impl IntoView {
             let id = tenant_id.get();
             let id = id.trim();
             if !id.is_empty() {
-                navigate(&format!("/tenant/{id}"), Default::default());
+                navigate(&format!("/tenants/{id}"), Default::default());
             }
         }
     };
@@ -25,7 +29,7 @@ pub fn HomePage() -> impl IntoView {
                 "Platform, tenants, workspaces and authorization."
             </p>
 
-            <div class="mt-8 flex gap-4">
+            <div class="mt-8 flex flex-wrap gap-4">
                 <a class="btn inline-flex items-center gap-2" href="/login">
                     <LogIn class="w-4 h-4" />
                     "Login"
@@ -38,11 +42,19 @@ pub fn HomePage() -> impl IntoView {
                     <Building2 class="w-4 h-4" />
                     "Platform"
                 </a>
+                <a class="btn inline-flex items-center gap-2" href="/tenants">
+                    <LayoutList class="w-4 h-4" />
+                    "My tenants"
+                </a>
+                <a class="btn inline-flex items-center gap-2" href="/workspaces">
+                    <LayoutList class="w-4 h-4" />
+                    "My workspaces"
+                </a>
             </div>
 
             <div class="card mt-8">
                 <p class="text-sm text-neutral-400">
-                    "Open tenant (paste tenant id from seed output)"
+                    "Open tenant by id (paste a tenant id from the seed output)"
                 </p>
                 <input class="input mt-2" placeholder="tenant_id" bind:value=tenant_id />
                 <button class="btn mt-3" on:click=open_tenant>"Open tenant"</button>
