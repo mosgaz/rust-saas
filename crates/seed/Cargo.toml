@@ -9,12 +9,14 @@ name = "seed"
 path = "src/main.rs"
 
 [dependencies]
-domain = { path = "../domain" }
+access = { path = "../access" }
 authz = { path = "../authz" }
 authz-casbin = { path = "../authz-casbin" }
 authn = { path = "../authn" }
 identity = { path = "../identity" }
 db = { path = "../db" }
+domain = { path = "../domain" }
+saas = { path = "../saas" }
 
 sqlx.workspace = true
 tokio.workspace = true

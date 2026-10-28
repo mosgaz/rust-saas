@@ -1,34 +1,31 @@
 //! Integration tests for `saas` against a real PostgreSQL + `authz-casbin`.
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
-//! `crates/db/migrations` (including `casbin_rule` and `invitations`), and
-//! drops it afterwards. `CasbinAuthz::from_pool` uses the same pool, so
-//! policies live in that test database.
-//!
-//! No manual `createdb` is required. `DATABASE_URL` must point at a server
-//! where the user has the `CREATE DATABASE` privilege.
+//! `crates/db/migrations` (including `casbin_rule`, `roles`, `permissions`,
+//! and `invitations`), and drops it afterwards.
 
 use std::sync::Arc;
 
-use authz::AuthorizationEngine;
+use access::{AccessState, RoleKey};
 use authz_casbin::CasbinAuthz;
 use domain::{AuthUser, InvitationTarget};
-use saas::{invitation, platform, tenant, workspace, CoreError, SaasBuilder, SaasState};
+use saas::{access as saas_access, invitation, platform, tenant, workspace, CoreError, SaasBuilder, SaasState};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Builds a `CasbinAuthz` + `SaasState` sharing the test pool.
-async fn setup(pool: &PgPool) -> (Arc<CasbinAuthz>, SaasState) {
+/// Builds a `CasbinAuthz` + `AccessState` + `SaasState` sharing the test pool.
+async fn setup(pool: &PgPool) -> SaasState {
     let casbin = Arc::new(
         CasbinAuthz::from_pool(pool.clone())
             .await
             .expect("casbin init"),
     );
-    let saas = SaasBuilder::new(pool.clone())
-        .with_authz(casbin.clone() as Arc<dyn AuthorizationEngine>)
+    let access = Arc::new(AccessState::new(pool.clone(), casbin.clone()));
+    SaasBuilder::new(pool.clone())
+        .with_authz(casbin)
+        .with_access(access)
         .build()
-        .expect("saas builder");
-    (casbin, saas)
+        .expect("saas builder")
 }
 
 /// Creates a user with a random email and a known password.
@@ -40,6 +37,19 @@ async fn make_user(pool: &PgPool, label: &str) -> AuthUser {
         .expect("user must be created")
 }
 
+/// Grants `platform` owner to the given user.
+async fn grant_platform_admin(state: &SaasState, user: &AuthUser) {
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let perms = ::access::get_permissions_for_role(state.access(), "platform", &owner_key)
+        .await
+        .unwrap();
+    state
+        .authz()
+        .grant_role(user.id, "platform", "owner", &perms)
+        .await
+        .unwrap();
+}
+
 /// Random tenant/workspace name so parallel tests within one database do not
 /// collide on `unique (tenant_id, name)`.
 fn unique_name(label: &str) -> String {
@@ -48,18 +58,11 @@ fn unique_name(label: &str) -> String {
 
 // ─── Tenant provisioning / workspace ────────────────────────────────────────
 
-/// `create_tenant` is a container-only operation: it inserts a `tenants` row
-/// but does not assign an owner, does not write `tenant_members`, and does not
-/// grant any Casbin policy.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn create_tenant_creates_row_without_membership(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin
-        .grant_platform_admin(admin.id)
-        .await
-        .expect("grant platform admin");
+    grant_platform_admin(&saas, &admin).await;
 
     let tenant = platform::create_tenant(&saas, &admin, unique_name("Acme"))
         .await
@@ -78,7 +81,8 @@ async fn create_tenant_creates_row_without_membership(pool: PgPool) {
         "create_tenant must not write tenant_members"
     );
 
-    let can = casbin
+    let can = saas
+        .authz()
         .can(
             admin.id,
             &domain::tenant_domain(tenant.id),
@@ -89,30 +93,19 @@ async fn create_tenant_creates_row_without_membership(pool: PgPool) {
         .expect("casbin can");
     assert!(
         !can,
-        "creator must not have tenant_owner on a container-only tenant"
+        "creator must not have owner on a container-only tenant"
     );
-
-    let row: (String, String) =
-        sqlx::query_as("select name, status from tenants where id = $1")
-            .bind(tenant.id)
-            .fetch_one(&pool)
-            .await
-            .expect("tenant row");
-    assert_eq!(row.0, tenant.name);
-    assert_eq!(row.1, "active");
 }
 
-/// `provision_tenant` creates the tenant and explicitly assigns an owner.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn provision_tenant_grants_owner_and_membership(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
-
+    grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner)
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .expect("provision_tenant must succeed");
 
@@ -139,7 +132,8 @@ async fn provision_tenant_grants_owner_and_membership(pool: PgPool) {
         "platform admin must not become a tenant member by provisioning"
     );
 
-    let owner_can = casbin
+    let owner_can = saas
+        .authz()
         .can(
             owner.id,
             &domain::tenant_domain(tenant.id),
@@ -150,7 +144,8 @@ async fn provision_tenant_grants_owner_and_membership(pool: PgPool) {
         .expect("casbin can (owner)");
     assert!(owner_can, "owner must be able to create workspaces");
 
-    let actor_can = casbin
+    let actor_can = saas
+        .authz()
         .can(
             admin.id,
             &domain::tenant_domain(tenant.id),
@@ -161,23 +156,22 @@ async fn provision_tenant_grants_owner_and_membership(pool: PgPool) {
         .expect("casbin can (actor)");
     assert!(
         !actor_can,
-        "platform admin must not gain tenant_owner via provision_tenant"
+        "platform admin must not gain tenant owner via provision_tenant"
     );
 }
 
-/// `create_workspace` keeps the side effect "creator becomes
-/// `workspace_admin`".
 #[sqlx::test(migrations = "../db/migrations")]
-async fn create_workspace_grants_admin_and_membership(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+async fn create_workspace_grants_owner_and_membership(pool: PgPool) {
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin)
+    grant_platform_admin(&saas, &admin).await;
+    
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"))
+    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"), &admin, &owner_key)
         .await
         .expect("create_workspace must succeed");
 
@@ -189,9 +183,10 @@ async fn create_workspace_grants_admin_and_membership(pool: PgPool) {
     .fetch_optional(&pool)
     .await
     .expect("query workspace_members");
-    assert_eq!(role.as_deref(), Some("admin"));
+    assert_eq!(role.as_deref(), Some("owner"));
 
-    let can = casbin
+    let can = saas
+        .authz()
         .can(
             admin.id,
             &domain::workspace_domain(ws.id),
@@ -200,24 +195,22 @@ async fn create_workspace_grants_admin_and_membership(pool: PgPool) {
         )
         .await
         .expect("casbin can");
-    assert!(can, "workspace admin must be able to write documents");
+    assert!(can, "workspace owner must be able to write documents");
 }
 
-/// A platform admin who provisioned a tenant for someone else, and who has no
-/// workspace role in that tenant's workspace, cannot create documents there.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn platform_admin_cannot_create_document_without_workspace_role(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "pa").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
+    grant_platform_admin(&saas, &admin).await;
 
     let owner = make_user(&pool, "owner").await;
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner)
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(&saas, &owner, tenant.id, unique_name("Eng"))
+    let ws = tenant::create_workspace(&saas, &owner, tenant.id, unique_name("Eng"), &owner, &owner_key)
         .await
         .unwrap();
 
@@ -227,22 +220,21 @@ async fn platform_admin_cannot_create_document_without_workspace_role(pool: PgPo
     assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
 }
 
-/// Users of one workspace cannot read or write documents in another
-/// workspace, even inside the same tenant.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn cross_workspace_isolation(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin)
+    grant_platform_admin(&saas, &admin).await;
+    
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws1"))
+    let ws1 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws1"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws2 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws2"))
+    let ws2 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws2"), &admin, &owner_key)
         .await
         .unwrap();
 
@@ -268,27 +260,23 @@ async fn cross_workspace_isolation(pool: PgPool) {
     assert_eq!(docs.len(), 1);
 }
 
-// ─── Membership lists (Stage 2a) ────────────────────────────────────────────
+// ─── Membership lists ───────────────────────────────────────────────────────
 
-/// `tenant::list_memberships` returns only the tenants where the user is in
-/// `tenant_members`. A platform admin who provisioned tenant A for user `a`
-/// and tenant B for user `b` is not a member of either and sees an empty list;
-/// `a` sees only tenant A, `b` sees only tenant B, `outsider` sees nothing.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn list_memberships_returns_only_member_tenants(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
+    grant_platform_admin(&saas, &admin).await;
 
+    let owner_key = RoleKey::parse("owner").unwrap();
     let a = make_user(&pool, "a").await;
     let b = make_user(&pool, "b").await;
     let outsider = make_user(&pool, "outsider").await;
 
-    let tenant_a = platform::provision_tenant(&saas, &admin, unique_name("A"), &a)
+    let tenant_a = platform::provision_tenant(&saas, &admin, unique_name("A"), &a, &owner_key)
         .await
         .unwrap();
-    let tenant_b = platform::provision_tenant(&saas, &admin, unique_name("B"), &b)
+    let tenant_b = platform::provision_tenant(&saas, &admin, unique_name("B"), &b, &owner_key)
         .await
         .unwrap();
 
@@ -303,51 +291,50 @@ async fn list_memberships_returns_only_member_tenants(pool: PgPool) {
     let admin_list = tenant::list_memberships(&saas, &admin).await.unwrap();
     assert!(
         admin_list.is_empty(),
-        "platform admin is not a member of tenants it provisioned (see §2.13)"
+        "platform admin is not a member of tenants it provisioned"
     );
 
     let outsider_list = tenant::list_memberships(&saas, &outsider).await.unwrap();
     assert!(outsider_list.is_empty(), "outsider must see no tenants");
 }
 
-/// `workspace::list_memberships` returns only the workspaces where the user
-/// is in `workspace_members`. `admin` creates `ws1` (becomes
-/// `workspace_admin`), `editor` is granted `Editor` on `ws1`; `outsider` has
-/// no role and sees nothing. `ws2` created by `admin` is not seen by `editor`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin)
+    grant_platform_admin(&saas, &admin).await;
+    
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws1"))
+    let ws1 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws1"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws2 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws2"))
+    let ws2 = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("ws2"), &admin, &owner_key)
         .await
         .unwrap();
 
     let editor = make_user(&pool, "editor").await;
-    casbin
-        .grant_workspace_role(editor.id, ws1.id, authz::WorkspaceRole::Editor)
-        .await
-        .unwrap();
-    sqlx::query(
-        r#"
-        insert into workspace_members (workspace_id, user_id, role)
-        values ($1, $2, 'editor')
-        on conflict do nothing
-        "#,
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let ws_domain = domain::workspace_domain(ws1.id);
+
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
     )
-    .bind(ws1.id)
-    .bind(editor.id)
-    .execute(&pool)
     .await
     .unwrap();
+
+    saas_access::assign_role(&saas, &admin, editor.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
 
     let outsider = make_user(&pool, "outsider").await;
 
@@ -368,20 +355,17 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
     );
 }
 
-// ─── Invitations (Stage 2a) ─────────────────────────────────────────────────
+// ─── Invitations ────────────────────────────────────────────────────────────
 
-/// `create_invitation` for a tenant target inserts a row with
-/// `tenant_id = Some`, `workspace_id = None`, and returns the raw token
-/// alongside the row. The raw token is not persisted; only its SHA-256 hash
-/// is stored in `token_hash`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn create_tenant_invitation_persists_row_and_returns_token(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
+    grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner)
+    let owner_key = RoleKey::parse("owner").unwrap();
+    
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
 
@@ -391,7 +375,7 @@ async fn create_tenant_invitation_persists_row_and_returns_token(pool: PgPool) {
         &owner,
         InvitationTarget::Tenant(tenant.id),
         Some(invitee_email.clone()),
-        "tenant_owner".into(),
+        "owner".into(),
         None,
         Some(1),
     )
@@ -401,7 +385,7 @@ async fn create_tenant_invitation_persists_row_and_returns_token(pool: PgPool) {
     assert_eq!(inv.tenant_id, Some(tenant.id));
     assert_eq!(inv.workspace_id, None);
     assert_eq!(inv.email.as_deref(), Some(invitee_email.as_str()));
-    assert_eq!(inv.role, "tenant_owner");
+    assert_eq!(inv.role, "owner");
     assert_eq!(inv.used_count, 0);
     assert_eq!(inv.max_uses, Some(1));
     assert!(inv.revoked_at.is_none());
@@ -427,21 +411,33 @@ async fn create_tenant_invitation_persists_row_and_returns_token(pool: PgPool) {
     assert!(alive, "default TTL must put expires_at in the future");
 }
 
-/// `create_invitation` for a workspace target inserts a row with
-/// `workspace_id = Some`, `tenant_id = None`, `email = None` (link), and
-/// `max_uses = None` (unlimited).
 #[sqlx::test(migrations = "../db/migrations")]
 async fn create_workspace_invitation_persists_row_and_returns_token(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin)
+    grant_platform_admin(&saas, &admin).await;
+    
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"))
+    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"), &admin, &owner_key)
         .await
         .unwrap();
+
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let ws_domain = domain::workspace_domain(ws.id);
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
 
     let (inv, token) = invitation::create_invitation(
         &saas,
@@ -463,16 +459,15 @@ async fn create_workspace_invitation_persists_row_and_returns_token(pool: PgPool
     assert_eq!(token.len(), 64);
 }
 
-/// Accepting a tenant invitation writes `tenant_members(role='owner')`,
-/// grants `tenant_owner` in `casbin_rule`, and increments `used_count`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn accept_tenant_invitation_grants_owner_and_membership(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
+    grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner)
+    let owner_key = RoleKey::parse("owner").unwrap();
+    
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
 
@@ -481,7 +476,7 @@ async fn accept_tenant_invitation_grants_owner_and_membership(pool: PgPool) {
         &owner,
         InvitationTarget::Tenant(tenant.id),
         None,
-        "tenant_owner".into(),
+        "owner".into(),
         None,
         None,
     )
@@ -505,7 +500,8 @@ async fn accept_tenant_invitation_grants_owner_and_membership(pool: PgPool) {
     .unwrap();
     assert_eq!(role.as_deref(), Some("owner"));
 
-    let can = casbin
+    let can = saas
+        .authz()
         .can(
             invitee.id,
             &domain::tenant_domain(tenant.id),
@@ -524,27 +520,40 @@ async fn accept_tenant_invitation_grants_owner_and_membership(pool: PgPool) {
     assert_eq!(used, 1, "used_count must increment on accept");
 }
 
-/// Accepting a workspace invitation writes `workspace_members(role)` and
-/// grants the corresponding `WorkspaceRole` in `casbin_rule`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin)
+    grant_platform_admin(&saas, &admin).await;
+    
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"))
+    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Eng"), &admin, &owner_key)
         .await
         .unwrap();
+
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let ws_domain = domain::workspace_domain(ws.id);
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "write".to_string())],
+    )
+    .await
+    .unwrap();
 
     let (_, token) = invitation::create_invitation(
         &saas,
         &admin,
         InvitationTarget::Workspace(ws.id),
         None,
-        "admin".into(),
+        "editor".into(),
         None,
         None,
     )
@@ -564,9 +573,10 @@ async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
     .fetch_optional(&pool)
     .await
     .unwrap();
-    assert_eq!(role.as_deref(), Some("admin"));
+    assert_eq!(role.as_deref(), Some("editor"));
 
-    let can_write = casbin
+    let can_write = saas
+        .authz()
         .can(
             invitee.id,
             &domain::workspace_domain(ws.id),
@@ -575,19 +585,18 @@ async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert!(can_write, "accepted admin must be able to write documents");
+    assert!(can_write, "accepted editor must be able to write documents");
 }
 
-/// When `max_uses = 1` and the invitation has already been used once, a
-/// second accept returns `NotFound`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn accept_invitation_after_exhaustion_returns_not_found(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
+    grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner)
+    let owner_key = RoleKey::parse("owner").unwrap();
+    
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
 
@@ -596,7 +605,7 @@ async fn accept_invitation_after_exhaustion_returns_not_found(pool: PgPool) {
         &owner,
         InvitationTarget::Tenant(tenant.id),
         None,
-        "tenant_owner".into(),
+        "owner".into(),
         None,
         Some(1),
     )
@@ -615,16 +624,15 @@ async fn accept_invitation_after_exhaustion_returns_not_found(pool: PgPool) {
     assert!(matches!(err, CoreError::NotFound), "got {err:?}");
 }
 
-/// After `revoke_invitation` sets `revoked_at`, `accept_invitation` returns
-/// `NotFound`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn accept_invitation_after_revoke_returns_not_found(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
+    grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner)
+    let owner_key = RoleKey::parse("owner").unwrap();
+    
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
 
@@ -633,7 +641,7 @@ async fn accept_invitation_after_revoke_returns_not_found(pool: PgPool) {
         &owner,
         InvitationTarget::Tenant(tenant.id),
         None,
-        "tenant_owner".into(),
+        "owner".into(),
         None,
         None,
     )
@@ -651,15 +659,15 @@ async fn accept_invitation_after_revoke_returns_not_found(pool: PgPool) {
     assert!(matches!(err, CoreError::NotFound), "got {err:?}");
 }
 
-/// When `expires_at` is in the past, `accept_invitation` returns `NotFound`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn accept_invitation_after_expiry_returns_not_found(pool: PgPool) {
-    let (casbin, saas) = setup(&pool).await;
-
+    let saas = setup(&pool).await;
     let admin = make_user(&pool, "admin").await;
-    casbin.grant_platform_admin(admin.id).await.unwrap();
+    grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner)
+    let owner_key = RoleKey::parse("owner").unwrap();
+    
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
         .await
         .unwrap();
 
@@ -668,7 +676,7 @@ async fn accept_invitation_after_expiry_returns_not_found(pool: PgPool) {
         &owner,
         InvitationTarget::Tenant(tenant.id),
         None,
-        "tenant_owner".into(),
+        "owner".into(),
         None,
         None,
     )

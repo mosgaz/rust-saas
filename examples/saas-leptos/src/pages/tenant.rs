@@ -20,12 +20,14 @@ pub async fn list_my_tenants() -> Result<Vec<domain::Tenant>, ServerFnError> {
         .map_err(crate::error::core_error_to_server_fn)
 }
 
-/// Creates a workspace inside a tenant; the creator becomes `workspace_admin`.
+/// Creates a workspace inside a tenant; the creator becomes `owner`.
 #[server]
 pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
-    saas::tenant::create_workspace(&state.saas, &user, tenant_id, name)
+    let owner_key = access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
+    
+    saas::tenant::create_workspace(&state.saas, &user, tenant_id, name, &user, &owner_key)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }

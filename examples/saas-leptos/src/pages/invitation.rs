@@ -230,15 +230,15 @@ pub fn InvitationsPanel(target: InvitationTarget) -> impl IntoView {
 
 fn default_role(target: InvitationTarget) -> &'static str {
     match target {
-        InvitationTarget::Tenant(_) => "tenant_owner",
-        InvitationTarget::Workspace(_) => "admin",
+        InvitationTarget::Tenant(_) => "owner",
+        InvitationTarget::Workspace(_) => "editor",
     }
 }
 
 fn role_options(target: InvitationTarget) -> &'static [&'static str] {
     match target {
-        InvitationTarget::Tenant(_) => &["tenant_owner"],
-        InvitationTarget::Workspace(_) => &["admin", "editor", "viewer"],
+        InvitationTarget::Tenant(_) => &["owner"],
+        InvitationTarget::Workspace(_) => &["owner", "editor", "viewer"],
     }
 }
 

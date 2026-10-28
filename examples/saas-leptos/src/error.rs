@@ -2,11 +2,11 @@
 //! status codes.
 //!
 //! Mapping:
-//! - `Validation` (Core / Identity)                              -> 400
+//! - `Validation`, `InvalidRoleKey`                              -> 400
 //! - `Unauthorized`, `InvalidCredentials`, `TokenInvalid`,
 //!   `TokenExpired`, `RefreshInvalid`, `RefreshReused`           -> 401
-//! - `Forbidden`                                                 -> 403
-//! - `NotFound` (Core / Identity)                                -> 404
+//! - `Forbidden`, `Protected`, `Immutable`                       -> 403
+//! - `NotFound`, `RoleNotFound`, `PermissionNotFound`            -> 404
 //! - `DuplicateEmail` (Identity)                                 -> 409
 //! - `Internal`, `Db`                                            -> 500
 //!
@@ -18,6 +18,7 @@
 
 use leptos::prelude::*;
 
+use access::AccessError;
 use authn::AuthnError;
 use identity::IdentityError;
 use saas::CoreError;
@@ -52,6 +53,15 @@ fn status_for_authn(e: &AuthnError) -> u16 {
     }
 }
 
+fn status_for_access(e: &AccessError) -> u16 {
+    match e {
+        AccessError::Validation(_) | AccessError::InvalidRoleKey(_) => 400,
+        AccessError::Forbidden | AccessError::Protected | AccessError::Immutable => 403,
+        AccessError::RoleNotFound(_) | AccessError::PermissionNotFound(_, _) => 404,
+        AccessError::Internal(_) | AccessError::Db(_) => 500,
+    }
+}
+
 fn set_status(status: u16) {
     let Some(response) = use_context::<leptos_axum::ResponseOptions>() else {
         return;
@@ -70,6 +80,12 @@ pub fn core_error_to_server_fn(e: CoreError) -> ServerFnError {
 /// Maps `authn::AuthnError` into `ServerFnError` with the corresponding HTTP code.
 pub fn authn_error_to_server_fn(e: AuthnError) -> ServerFnError {
     set_status(status_for_authn(&e));
+    ServerFnError::new(e.to_string())
+}
+
+/// Maps `access::AccessError` into `ServerFnError` with the corresponding HTTP code.
+pub fn access_error_to_server_fn(e: AccessError) -> ServerFnError {
+    set_status(status_for_access(&e));
     ServerFnError::new(e.to_string())
 }
 

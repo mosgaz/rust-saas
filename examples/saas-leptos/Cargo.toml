@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 domain = { path = "../../crates/domain", default-features = false }
 authz = { path = "../../crates/authz", optional = true }
 authz-casbin = { path = "../../crates/authz-casbin", optional = true }
+access = { path = "../../crates/access", optional = true }
 identity = { path = "../../crates/identity", optional = true }
 authn = { path = "../../crates/authn", optional = true }
 saas = { path = "../../crates/saas", optional = true }
@@ -48,6 +49,7 @@ hydrate = [
 ssr = [
     "dep:authz",
     "dep:authz-casbin",
+    "dep:access",
     "dep:identity",
     "dep:authn",
     "dep:saas",
@@ -70,9 +72,7 @@ ssr = [
 output-name = "rust-saas-leptos"
 site-root = "target/site"
 site-pkg-dir = "pkg"
-# style-file = "style/main.css"
 tailwind-input-file = "assets/styles/tailwind.css"
-# tailwind-input-file = "styles/tailwind.css"
 assets-dir = "public"
 site-addr = "127.0.0.1:3395"
 reload-port = 3396
@@ -81,17 +81,3 @@ lib-features = ["hydrate"]
 
 # Independent workspace: consumer example, not part of the library.
 [workspace]
-
-# [package.metadata.leptos]
-# output-name = "rust-lms-client"
-# # site-name = "rust-lms"
-# site-root = "target/site"
-# site-pkg-dir = "pkg"
-# bin-target = "rust-lms-client"
-# # lib-target = "rust-lms-client"
-# lib-features = ["hydrate"]
-# bin-features = ["ssr"]
-# tailwind-input-file = "assets/styles/tailwind.css"
-# assets-dir = "public"
-# site-addr = "127.0.0.1:3726"
-# reload-port = 3727

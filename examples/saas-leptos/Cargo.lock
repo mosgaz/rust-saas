@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "access"
+version = "0.1.0"
+dependencies = [
+ "authz",
+ "domain",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2646,6 +2658,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 name = "saas"
 version = "0.1.0"
 dependencies = [
+ "access",
  "authz",
  "domain",
  "identity",
@@ -2659,6 +2672,7 @@ dependencies = [
 name = "saas-leptos"
 version = "0.1.0"
 dependencies = [
+ "access",
  "anyhow",
  "authn",
  "authz",

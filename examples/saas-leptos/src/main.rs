@@ -67,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(authz_casbin::CasbinAuthz::new(&database_url).await?);
 
+    let access = Arc::new(access::AccessState::new(pool.clone(), authz.clone()));
+
     let authn = Arc::new(authn::Authn::with_ttl(
         pool.clone(),
         jwt_secret,
@@ -77,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let saas = Arc::new(
         saas::SaasBuilder::new(pool)
             .with_authz(authz)
+            .with_access(access)
             .build()?,
     );
 
