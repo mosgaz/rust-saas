@@ -5,6 +5,15 @@
 //! issuing/verification, and the `refresh_tokens` table. Cookies, HTTP,
 //! Leptos, and Casbin are not part of this crate — that is the consumer's
 //! responsibility.
+//!
+//! Stage 2d: rotation includes a grace window
+//! ([`REFRESH_GRACE_SECONDS`]). A refresh token presented within the window
+//! after it was used returns [`AuthnError::RefreshInvalid`] and does **not**
+//! revoke the family — this absorbs the parallel-request race where two
+//! in-flight requests carry the same cookie (e.g. an SSR page and its
+//! subresource fetches). Presenting an already-used token **after** the
+//! window returns [`AuthnError::RefreshReused`] and revokes the family — a
+//! genuine reuse signal.
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
@@ -27,6 +36,21 @@ pub const DEFAULT_ACCESS_TTL_MINUTES: i64 = 15;
 /// Default refresh-token lifetime (Stage 2b).
 pub const DEFAULT_REFRESH_TTL_DAYS: i64 = 30;
 
+/// Grace window (Stage 2d) around refresh-token rotation.
+///
+/// When a refresh token that was already consumed is presented within
+/// [`REFRESH_GRACE_SECONDS`] seconds of its `used_at`, rotation returns
+/// [`AuthnError::RefreshInvalid`] and leaves the family intact. This absorbs
+/// the common race where two parallel in-flight requests share the same
+/// cookie (SSR page + subresource fetches, two tabs, etc.): the winner
+/// rotates and the loser fails cleanly instead of revoking the family.
+///
+/// Presenting the same token after the window is still treated as a genuine
+/// reuse ([`AuthnError::RefreshReused`], family revoked). The value is an
+/// internal knob (not deployment-specific) and is not read from the
+/// environment.
+pub const REFRESH_GRACE_SECONDS: i64 = 10;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthnError {
     #[error("invalid credentials")]
@@ -38,8 +62,8 @@ pub enum AuthnError {
     /// Refresh token not found, revoked, or expired (Stage 2b).
     #[error("refresh token invalid")]
     RefreshInvalid,
-    /// A previously used refresh token was presented; the whole family was
-    /// revoked as a compromise signal (Stage 2b).
+    /// A previously used refresh token was presented after the grace window;
+    /// the whole family was revoked as a compromise signal (Stage 2b/2d).
     #[error("refresh token reused")]
     RefreshReused,
     #[error("internal authentication error: {0}")]
@@ -163,7 +187,21 @@ impl Authn {
         Ok(raw)
     }
 
-    /// Rotates a refresh token; reuse detection revokes the whole family.
+    /// Rotates a refresh token.
+    ///
+    /// Order:
+    /// 1. Look up the row by `token_hash` (`FOR UPDATE`).
+    /// 2. `revoked_at` set → [`AuthnError::RefreshInvalid`].
+    /// 3. `used_at` set within [`REFRESH_GRACE_SECONDS`] → [`AuthnError::RefreshInvalid`]
+    ///    (parallel-request race; the family is left intact).
+    /// 4. `used_at` set after the grace window → revoke the family and
+    ///    return [`AuthnError::RefreshReused`] (genuine reuse).
+    /// 5. `expires_at` in the past → [`AuthnError::RefreshInvalid`].
+    /// 6. Mark the row used, insert a new row in the same family, commit,
+    ///    and return `(new_raw, user)`.
+    ///
+    /// Reuse detection revokes the whole family (Stage 2b), except within the
+    /// grace window (Stage 2d), where the family survives.
     pub async fn rotate_refresh_token(&self, raw: &str) -> Result<(String, AuthUser), AuthnError> {
         let token_hash = hash_token(raw);
         let mut tx = self.pool.begin().await?;
@@ -185,7 +223,13 @@ impl Authn {
             return Err(AuthnError::RefreshInvalid);
         }
 
-        if row.used_at.is_some() {
+        if let Some(used_at) = row.used_at {
+            let elapsed = Utc::now().signed_duration_since(used_at);
+            if elapsed.num_seconds() < REFRESH_GRACE_SECONDS {
+                // Parallel-request race: another request already rotated this
+                // token a moment ago. Do not revoke the family; just reject.
+                return Err(AuthnError::RefreshInvalid);
+            }
             sqlx::query(
                 r#"
                 update refresh_tokens

@@ -11,6 +11,10 @@
 //!   and `saas::tenant::create_workspace` with `owner_role_key = "owner"`.
 //! - Demo custom roles (`editor`, `viewer`) are created via
 //!   `saas::access::create_role` and assigned via `saas::access::assign_role`.
+//!
+//! The `AuthorizationEngine` shares the same `PgPool` as `saas`/`access`
+//! (`CasbinAuthz::from_pool`), so a single connection pool serves the whole
+//! process (Stage 2d).
 
 use std::sync::Arc;
 
@@ -29,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await?;
 
     let authz: Arc<dyn AuthorizationEngine> =
-        Arc::new(authz_casbin::CasbinAuthz::new(&database_url).await?);
+        Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
     let access_state = Arc::new(AccessState::new(pool.clone(), authz.clone()));
 
     let state = SaasBuilder::new(pool.clone())

@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await?;
 
     let authz: Arc<dyn AuthorizationEngine> =
-        Arc::new(authz_casbin::CasbinAuthz::new(&database_url).await?);
+        Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
 
     let access = Arc::new(access::AccessState::new(pool.clone(), authz.clone()));
 
@@ -91,7 +91,20 @@ async fn main() -> anyhow::Result<()> {
 
     let routes = generate_route_list(saas_leptos::App);
 
-    let router = Router::new()
+    // TODO(Stage 3): auth-scoping ADR — formalize which routes require auth
+    // (see handoff §16). This split is the pragmatic boundary: SSR pages and
+    // Leptos `_server/*` handlers go through `auto_refresh`; static files and
+    // the 404 fallback do not. Open policy questions (does `_server/*` always
+    // require auth? how are public `#[server]` functions like `login` /
+    // `register` handled at this layer? should 404 fail-open or fail-closed?)
+    // are deferred to that ADR.
+    //
+    // `protected` covers SSR pages (`leptos_routes_with_context`) and, on the
+    // same router, Leptos server-function handlers (`/_server/*`). Both need
+    // `Extension<Option<AuthUser>>` injected by `auto_refresh`; `#[server]`
+    // functions that require an actor call `CurrentUser::require()` and get
+    // HTTP 401 when the extension is `None`.
+    let protected: Router<saas_leptos::state::AppState> = Router::new()
         .leptos_routes_with_context(
             &app_state,
             routes,
@@ -104,12 +117,24 @@ async fn main() -> anyhow::Result<()> {
                 move || saas_leptos::shell(opts.clone())
             },
         )
-        .fallback(leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell))
-        .layer(TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn_with_state(
+        .route_layer(axum::middleware::from_fn_with_state(
             authn,
             saas_leptos::middleware::auto_refresh,
-        ))
+        ));
+
+    // `public` covers static files served by `file_and_error_handler`
+    // (`/pkg/*`, `/assets/*`, `/favicon.ico`, and any other files under
+    // `public/`) and the 404 fallback. These responses never depended on
+    // cookies; running `auto_refresh` here used to verify JWTs, rotate
+    // refresh tokens, and set `Cache-Control: no-store` on `.wasm` / `.css`
+    // fetches (Stage 2b–2c bug). Stage 2d fixes this at the router structure
+    // level.
+    let public: Router<saas_leptos::state::AppState> = Router::new()
+        .fallback(leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell));
+
+    let router = protected
+        .merge(public)
+        .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)

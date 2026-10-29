@@ -512,6 +512,27 @@ mod tests {
             ));
             Ok(())
         }
+
+        async fn has_role(
+            &self,
+            _user_id: Uuid,
+            _domain: &str,
+            _role_key: &str,
+        ) -> Result<bool, AuthzError> {
+            Ok(false)
+        }
+
+        async fn count_users_with_role(
+            &self,
+            _domain: &str,
+            _role_key: &str,
+        ) -> Result<i64, AuthzError> {
+            Ok(0)
+        }
+
+        async fn purge_role(&self, _domain: &str, _role_key: &str) -> Result<u64, AuthzError> {
+            Ok(0)
+        }
     }
 
     fn lazy_state(mock: Arc<MockAuthz>) -> SaasState {

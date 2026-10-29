@@ -1,10 +1,11 @@
-//! Access-control crate (ADR-0001, Stage 2e).
+//! Access-control crate (ADR-0001, Stage 2e; Stage 2d cleanup helpers).
 //!
 //! Sole owner of `permissions`, `roles`, and `role_permissions`. DTOs
 //! (`Role`, `Permission`, `RoleKey`), `AccessState`, `AccessError`, and the
 //! role/permission services (`create_role`, `update_role`, `delete_role`,
-//! `list_roles`, `list_permissions`, `get_role`, `get_permissions_for_role`,
-//! `create_owner_role`) live here.
+//! `list_roles`, `list_permissions`, `get_role`, `get_role_by_id`,
+//! `delete_role_by_id`, `get_permissions_for_role`, `create_owner_role`)
+//! live here.
 //!
 //! This crate does not know about HTTP, UI, Leptos, JWT, Argon2, or business
 //! tables (`tenants`, `workspaces`, `documents`, `invitations`,
@@ -14,8 +15,8 @@
 //! Invariant (§5 p.5): every mutation service calls
 //! `authz.require(actor.id, domain, "roles", "<action>")` first, except the
 //! following helpers (no `actor`, called after `require` in a caller):
-//! `get_role`, `get_permissions_for_role`, `list_permissions`,
-//! `create_owner_role`.
+//! `get_role`, `get_role_by_id`, `delete_role_by_id`,
+//! `get_permissions_for_role`, `list_permissions`, `create_owner_role`.
 
 use std::sync::Arc;
 
@@ -28,7 +29,10 @@ mod permission;
 mod role;
 
 pub use permission::{get_permissions_for_role, list_permissions};
-pub use role::{create_owner_role, create_role, delete_role, get_role, list_roles, update_role};
+pub use role::{
+    create_owner_role, create_role, delete_role, delete_role_by_id, get_role, get_role_by_id,
+    list_roles, update_role,
+};
 
 /// Errors produced by `access::*`.
 #[derive(Debug, thiserror::Error)]
