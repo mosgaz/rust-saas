@@ -11,9 +11,11 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - Email and password authentication
 - Argon2 password hashing
 - **JWT access tokens (short-lived) and opaque refresh tokens (rotation with family revocation)**
-- **Auto-refresh middleware (transparent token rotation)**
+- **Refresh grace window: parallel-request race does not revoke the token family**
+- **Auto-refresh middleware scoped to protected routes (SSR + server functions); static assets bypass it**
 - **Server-side logout (revokes refresh token family)**
-- **Domain-ownership RBAC (ADR-0001): roles are data, owner of a domain has all permissions**
+- **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
+- **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list, assign/remove role, permission-gated UI)**
 - **UI gating by effective permissions (`my_permissions`, batched per domain)**
 - Platform, tenant, and workspace authorization domains
@@ -35,13 +37,17 @@ The repository is split into two layers:
 crates/                  (library — the Cargo workspace)
 ├── domain/             Shared DTOs (Tenant, Workspace, Document, AuthUser, Invitation, Member),
 │                       InvitationTarget, domain helpers, PLATFORM_DOMAIN
-├── authz/              AuthorizationEngine trait (can/require/grant_role/revoke_role) + AuthzError
+├── authz/              AuthorizationEngine trait
+│                       (can / require / grant_role / revoke_role / has_role /
+│                        count_users_with_role / purge_role) + AuthzError
 ├── authz-casbin/       CasbinAuthz: canonical trait implementation
 ├── access/             Sole owner of `permissions`, `roles`, `role_permissions`:
 │                       Role, Permission, RoleKey, AccessState, AccessError, role CRUD,
-│                       create_owner_role, list_permissions, get_permissions_for_role
+│                       create_owner_role, get_role_by_id, delete_role_by_id,
+│                       list_permissions, get_permissions_for_role
 ├── identity/           Sole owner of `users`: AuthUser, UserRecord, validation, CRUD
 ├── authn/              Argon2, JWT access tokens, opaque refresh tokens, rotation
+│                       with grace window
 ├── saas/               Business logic: platform, tenant, workspace, invitation, member,
 │                       access (wrappers, incl. my_permissions)
 ├── db/                 PostgreSQL connection and migrations
@@ -87,7 +93,7 @@ Forbidden edges:
 - `authn` does not depend on `authz`. `sha2` is used only for `refresh_tokens.token_hash`.
 - `identity` does not depend on `authn` or `authz`.
 - `authz` does not depend on Casbin, SQL, HTTP, Leptos, or JWT. It does not know about specific roles.
-- `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`, `refresh_tokens`, `roles`, `permissions`).
+- `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`, `refresh_tokens`, `roles`, `permissions`). It uses raw SQL only against its own `casbin_rule` table (`has_role`, `count_users_with_role`, `purge_role`).
 - The example (`examples/saas-leptos`) does not call `casbin_rule` directly and does not call `authz.require` — only `saas::*`, `saas::access::*`, `saas::member::*`, and `authn::*`.
 - Library crates do not depend on `examples/*`.
 
@@ -116,13 +122,14 @@ Casbin policies are scoped by domain:
 | `tenant:{tenant_id}` | Tenant-level operations |
 | `workspace:{workspace_id}` | Workspace-level operations |
 
-### Domain-ownership RBAC (ADR-0001)
+### Domain-ownership RBAC
 
 - A **role** is a named set of permissions in a **domain** (not in a tenant).
 - A **permission** is a `(resource, action)` pair from the `permissions` reference table.
 - The **owner** role in a domain has **all permissions** from the reference table, is `protected=true` and `immutable=true`. It is created by `access::create_owner_role(domain)` (idempotent) from `saas::platform::provision_tenant` and `saas::tenant::create_workspace`, and via the bootstrap SQL migration for the `platform` domain.
 - The owner of a domain creates custom roles and assigns them to users of that domain (`saas::access::create_role` / `saas::access::assign_role`).
 - Users can hold **multiple roles** in the same domain. `tenant_members` and `workspace_members` use `PRIMARY KEY (scope_id, user_id, role)`.
+- The **owner guard** prevents removing the last holder of a `protected` role from a domain (`saas::member::{change_role, remove_role}` return `Forbidden`). Non-protected roles have no last-holder guard. The guard reads `casbin_rule` (the source of truth for authorization), not `*_members`.
 
 Example permissions and demo roles:
 
@@ -252,7 +259,7 @@ Demo users created by seed:
 
 The command applies database migrations (including `20261103000001_access_rbac_init.sql`, `20261103000002_saas_members_multi_role.sql`, and `20261104000001_access_members_list_permission.sql`) and creates initial platform, tenant, workspace, user, role, and authorization data. It is idempotent: re-running it re-hashes passwords and re-applies roles/policies without creating duplicate rows.
 
-Seed flow (ADR-0001):
+Seed flow:
 
 1. Grants `platform` `owner` role to the platform admin via `authz.grant_role` (permissions from `access::get_permissions_for_role`).
 2. Provisions the tenant via `saas::platform::provision_tenant(..., &RoleKey::parse("owner")?)`.
@@ -312,7 +319,7 @@ From the repository root:
 cargo test
 ```
 
-67 tests, all green (23 unit + 13 `authn` integration + 20 `saas` integration + 6 `access` integration + 5 `authz-casbin` integration).
+76 tests, all green (23 unit + 13 `authn` integration + 23 `saas` integration + 6 `access` integration + 9 `authz-casbin` integration).
 
 Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/access`, and `crates/saas`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
@@ -357,11 +364,26 @@ Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`, `Invitation`, `Membe
 
 ### authz
 
-The `AuthorizationEngine` trait — `can`, `require`, `grant_role`, `revoke_role` — and `AuthzError`. Trait-only: no Casbin, no SQL, no HTTP, no specific roles. `grant_role(user_id, domain, role_key, permissions)` writes one `g`-row (`user → role_key → domain`) and one `p`-row per `(resource, action)`. `revoke_role` removes the `g`-row (shared `p`-rows remain while the role exists).
+The `AuthorizationEngine` trait — seven methods: `can`, `require`, `grant_role`, `revoke_role`, `has_role`, `count_users_with_role`, `purge_role` — and `AuthzError`. Trait-only: no Casbin, no SQL, no HTTP, no specific roles.
+
+- `grant_role(user_id, domain, role_key, permissions)` writes one `g`-row (`user → role_key → domain`) and one `p`-row per `(resource, action)`.
+- `revoke_role` removes the `g`-row (shared `p`-rows remain while the role exists).
+- `has_role(user_id, domain, role_key)` returns `true` iff the `g`-row `(user_id, role_key, domain)` exists.
+- `count_users_with_role(domain, role_key)` returns the number of distinct holders, counted from `casbin_rule` (not `*_members`).
+- `purge_role(domain, role_key)` deletes every `g`-row and `p`-row for `(domain, role_key)`; returns the number of deleted rows. Idempotent.
+
+`has_role`, `count_users_with_role`, and `purge_role` are non-transactional; they are safe to retry.
 
 ### authz-casbin
 
-`CasbinAuthz` — the canonical implementation of `AuthorizationEngine` on top of Casbin and `sqlx-adapter`. The `g`/`p` matcher and `grant_role`/`revoke_role` live here. Business code never talks to Casbin directly. Two constructors: `CasbinAuthz::new(&database_url)` (production, own pool) and `CasbinAuthz::from_pool(PgPool)` (consumers and tests, e.g. `#[sqlx::test]`). Does not know about `roles`/`permissions`/`users`/`tenants`; only `casbin_rule`.
+`CasbinAuthz` — the canonical implementation of `AuthorizationEngine` on top of Casbin and `sqlx-adapter`. The `g`/`p` matcher and all seven trait methods live here. Business code never talks to Casbin directly. Two constructors:
+
+- `CasbinAuthz::new(&database_url)` — convenience wrapper that opens its own `PgPool` and delegates to `from_pool`.
+- `CasbinAuthz::from_pool(PgPool)` — the recommended constructor. The same `PgPool` is used by `SqlxAdapter` (Casbin persistence) and by the raw-SQL helpers (`has_role`, `count_users_with_role`, `purge_role`). Consumers that already hold a `PgPool` should use this.
+
+`has_role` and `count_users_with_role` query `casbin_rule` directly (the source of truth for authorization). `purge_role` uses a single raw `DELETE` for both `g`- and `p`-rows and then calls `enforcer.load_policy()` to sync the in-memory model. This is the only place where `authz-casbin` uses raw SQL; the table is its own.
+
+Does not know about `roles`/`permissions`/`users`/`tenants`; only `casbin_rule`.
 
 ### access
 
@@ -372,12 +394,14 @@ The sole owner of the `permissions`, `roles`, and `role_permissions` tables.
 - Services (all take `&AccessState`):
   - `create_role(actor, domain, key, name, description, permissions)` — requires `(roles, create)`.
   - `update_role(actor, role_id, name, description, permissions)` — requires `(roles, manage)`; rejects `protected`/`immutable`.
-  - `delete_role(actor, role_id)` — requires `(roles, delete)`; rejects `protected`.
+  - `delete_role(actor, role_id)` — requires `(roles, delete)`; rejects `protected`. Does not cascade to `casbin_rule` or `*_members`; consumers that want the full cleanup should use `saas::access::delete_role`.
   - `list_roles(actor, domain)` — requires `(roles, list)`.
-  - `get_role(domain, role_key)` — **no actor** (§5 p.5): helper.
-  - `get_permissions_for_role(domain, role_key)` — **no actor**: helper for `saas::access::assign_role`.
-  - `list_permissions()` — **no actor**: public reference.
-  - `create_owner_role(domain)` — **no actor**: idempotent bootstrap; permissions = all from `permissions`.
+  - `get_role(domain, role_key)` — no actor: helper, called after `require` in a caller.
+  - `get_role_by_id(role_id)` — no actor: helper, returns `Option<Role>`; used by `saas::access::delete_role`.
+  - `delete_role_by_id(role_id)` — no actor: low-level `DELETE` of the `roles` row; idempotent; no `require`, no `protected` check. Used by `saas::access::delete_role` after its own `require` and `protected` check.
+  - `get_permissions_for_role(domain, role_key)` — no actor: helper for `saas::access::assign_role`.
+  - `list_permissions()` — no actor: public reference.
+  - `create_owner_role(domain)` — no actor: idempotent bootstrap; permissions = all from `permissions`.
 
 Does not know about `tenants`, `workspaces`, `documents`, `invitations`, `*_members`, HTTP, UI, JWT, or Argon2.
 
@@ -389,6 +413,8 @@ The sole owner of the `users` table. Provides `AuthUser`, `UserRecord` (includin
 
 The authentication mechanism on top of `identity`. Provides `Authn::with_ttl`, `register`, `login`, `issue_access_token`, `issue_refresh_token`, `rotate_refresh_token`, `revoke_refresh_token`, `revoke_family`, `verify_token`, and `hash_password`. Uses Argon2, `jsonwebtoken`, and `sha2` for opaque refresh tokens. Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`.
 
+`rotate_refresh_token` includes a **grace window** (`REFRESH_GRACE_SECONDS = 10`): when an already-used refresh token is presented within the window, rotation returns `RefreshInvalid` and leaves the token family intact. This absorbs the parallel-request race where two requests carry the same cookie (e.g. an SSR page and its subresource fetches, or two tabs). Presenting the same token **after** the window is a genuine reuse signal: `RefreshReused` is returned and the whole family is revoked. The value is a compile-time constant, not an env knob.
+
 ### saas
 
 Business logic, independent of UI framework. `SaasState { pool, authz, access }`, `SaasBuilder` (`with_authz`, `with_access`), `CoreError`, and services:
@@ -398,18 +424,22 @@ Business logic, independent of UI framework. `SaasState { pool, authz, access }`
 - `tenant::create_workspace(actor, tenant_id, name, owner, &owner_role_key)` — side effect preserved: the creator receives `owner_role_key` (usually `"owner"`).
 - `tenant::list_memberships` / `workspace::list_memberships` — membership queries via `EXISTS` (multi-role).
 - `workspace::create_document` / `list_documents` / `get_document`.
-- `member::list(actor, MemberScope)`, `member::change_role`, `member::remove_role` — tenant/workspace member management (Stage 2c).
+- `member::list(actor, MemberScope)`, `member::change_role`, `member::remove_role` — tenant/workspace member management.
+  - `change_role` performs `assign(new)` before `revoke(old)`. On a partial failure (revoke fails after assign commits), the user is temporarily over-permissioned with both roles; this is recoverable idempotently by calling `change_role` again.
+  - `change_role` and `remove_role` include an **owner guard**: removing the last holder of a `protected` role from a domain returns `Forbidden`. Non-protected roles have no last-holder guard. `assign_role` is never guarded.
 - `invitation::create_invitation` — validates `role` against `access::get_role(domain, &RoleKey)`.
 - `invitation::accept_invitation` — by raw token; writes `*_members` (multi-role PK) and grants the role via `authz.grant_role`.
 - `invitation::revoke_invitation` / `list_invitations`.
-- `saas::access::{create_role, update_role, delete_role, list_roles, list_permissions, assign_role, revoke_role, my_permissions}` — wrappers over `access` + `authz` + `*_members`. `my_permissions` returns the actor's effective `(resource, action)` pairs in a domain (batched UX helper for the client; does not replace `authz.require`).
+- `saas::access::{create_role, update_role, delete_role, list_roles, list_permissions, assign_role, revoke_role, my_permissions}` — wrappers over `access` + `authz` + `*_members`.
+  - `delete_role` performs the full cleanup in six retry-safe steps: `get_role_by_id` → `protected` check → `require` → `purge_role` (g+p) → `DELETE *_members` → `delete_role_by_id`. A partial failure at any step after `require` can be retried by calling `delete_role` again with the same `role_id`.
+  - `my_permissions` returns the actor's effective `(resource, action)` pairs in a domain (batched UX helper for the client; does not replace `authz.require`).
 
-Every service calls `state.authz.require(...)` before touching the database, **except** the explicit exceptions in handoff §5 p.5:
+Every service calls `state.authz.require(...)` before touching the database, **except** the following helpers (no `actor`, called after `require` in a caller):
 
 - `invitation::accept_invitation` and `invitation::check_invitation` — authorized by the invitation token.
 - `tenant::list_memberships` / `workspace::list_memberships` — membership queries.
-- `access::get_permissions_for_role`, `access::create_owner_role`, `access::list_permissions`, `access::get_role` — helpers, called after `require` in a caller.
-- `access::my_permissions` — read-only UX helper; any authenticated actor may discover their own effective permissions in a domain.
+- `access::get_role`, `access::get_role_by_id`, `access::delete_role_by_id`, `access::get_permissions_for_role`, `access::create_owner_role`, `access::list_permissions` — helpers, called after `require` in a caller.
+- `saas::access::my_permissions` — read-only UX helper; any authenticated actor may discover their own effective permissions in a domain.
 
 Does not know about Leptos, Axum, HTTP handlers, `casbin::Enforcer`, JWT, Argon2, or the `permissions`/`roles`/`role_permissions` tables (owned by `access`).
 
@@ -428,17 +458,28 @@ Includes a `build.rs` with `cargo:rerun-if-changed=migrations` (and a `cargo:war
 
 ### seed
 
-Standalone binary for creating initial platform, tenant, workspace, user, role, and policy data. Bootstrap flow (ADR-0001):
+Standalone binary for creating initial platform, tenant, workspace, user, role, and policy data. Bootstrap flow:
 
 1. Grants `platform` `owner` to the platform admin via `authz.grant_role` with permissions from `access::get_permissions_for_role`.
 2. Provisions the tenant (`saas::platform::provision_tenant`) and workspace (`saas::tenant::create_workspace`) with `RoleKey::parse("owner")?`.
 3. Creates demo roles `editor`/`viewer` via `saas::access::create_role` and assigns them via `saas::access::assign_role`.
 
+Uses a single `PgPool` for `authz-casbin`, `access`, `saas`, and `authn` (`CasbinAuthz::from_pool`).
+
 Idempotent: re-runs re-hash passwords, skip existing tenant/workspace, and re-apply role assignments without duplicates.
 
 ### examples/saas-leptos
 
-The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*`, `saas::access::*`, `saas::member::*`, or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn` / `error::access_error_to_server_fn`, which map to HTTP 400/401/403/409/500. `AppState` holds `authn`, `saas` (which contains `access`), and `leptos_options`. `src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout. `src/pages/{member,role}.rs` hold tenant/workspace member and role management. This crate is **not** part of the library workspace.
+The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*`, `saas::access::*`, `saas::member::*`, or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn` / `error::access_error_to_server_fn`, which map to HTTP 400/401/403/409/500. `AppState` holds `authn`, `saas` (which contains `access`), and `leptos_options`.
+
+`src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout. `src/pages/{member,role}.rs` hold tenant/workspace member and role management. This crate is **not** part of the library workspace.
+
+`main.rs` builds two routers and merges them:
+
+- `protected` — SSR pages (via `leptos_routes_with_context`) and Leptos `/_server/*` handlers; `auto_refresh` is attached via `.route_layer`.
+- `public` — `file_and_error_handler` fallback (static files under `public/`, `/pkg/*`, `/assets/*`, and 404 responses); no middleware.
+
+The split avoids running JWT verification, refresh-token rotation, and `Set-Cookie` on static assets.
 
 Routes:
 
@@ -502,7 +543,7 @@ m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act
 
 Both `g` (user → role in domain) and `p` (role → resource, action in domain) are required; `grant_role` adds both.
 
-Authorization is always checked on the server before business logic executes. Exceptions: `accept_invitation`/`check_invitation` (by token), `*::list_memberships` (membership queries), and `access` helpers (`get_role`, `get_permissions_for_role`, `list_permissions`, `create_owner_role`, `my_permissions`) — see handoff §5 p.5.
+Authorization is always checked on the server before business logic executes. Exceptions: `accept_invitation`/`check_invitation` (by token), `*::list_memberships` (membership queries), and `access` helpers (`get_role`, `get_role_by_id`, `delete_role_by_id`, `get_permissions_for_role`, `list_permissions`, `create_owner_role`, `my_permissions`).
 
 UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and links; this is a UX convenience, not a security boundary — `authz.require` in `saas::*` remains authoritative.
 
@@ -520,9 +561,13 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Library errors (`CoreError`, `AuthnError`, `IdentityError`, `AccessError`) are mapped to HTTP status codes in the example (`src/error.rs`); keep new variants covered by that mapping.
 - Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored.
 - Refresh raw tokens are returned once from `authn::issue_refresh_token` and are never persisted; only `refresh_tokens.token_hash` (SHA-256) is stored.
-- `accept_invitation` does not compare `actor.email` to `invitation.email` until email verification (Stage 3).
-- Auto-refresh middleware serializes refresh within a single HTTP request; parallel HTTP requests with the same refresh token are a known limitation (Stage 2d will add single-flight).
-- `saas::member::change_role` is not atomic: it is `revoke_role` followed by `assign_role`. If `assign_role` fails after `revoke_role` commits, the user loses the old role. Stage 2d will unify the SQL connection (see handoff §16).
+- `accept_invitation` does not compare `actor.email` to `invitation.email` until email verification is implemented.
+- `authn::rotate_refresh_token` has a 10-second grace window for parallel refresh requests; a parallel request within the window returns `RefreshInvalid` and does not revoke the token family. Distributed single-flight for multi-instance deployments is not implemented.
+- `saas::member::change_role` performs `assign` before `revoke`. A partial failure leaves the user over-permissioned with both roles (recoverable by retrying `change_role`); under-permissioning on partial failure is not possible.
+- `saas::member::{change_role, remove_role}` include an owner guard: the last holder of a `protected` role cannot be removed from a domain. The guard reads `casbin_rule`, not `*_members`.
+- `saas::access::delete_role` cleans up `casbin_rule` (g+p) and `*_members` in six retry-safe steps; a partial failure can be recovered by calling `delete_role` again.
+- All library crates (`authz-casbin`, `access`, `saas`, `authn`) in the reference app and `seed` share a single `PgPool` (`CasbinAuthz::from_pool`).
+- The reference app's `auto_refresh` middleware runs on the protected router (SSR + `/_server/*`); static files and 404 responses bypass it.
 
 ## Roadmap
 
@@ -531,11 +576,11 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Stage 1.1 (done): `create_tenant` container only; `provision_tenant(actor, name, owner)` for explicit owner assignment; `create_workspace` side effect preserved.
 - Stage 2a (done): invitations core.
 - Stage 2b (done): refresh tokens with rotation + family revocation, auto-refresh middleware, logout with server-side invalidation, shorter access TTL, `access_token` + `refresh_token` cookies, global layout, document pages.
-- Stage 2e (done): domain-ownership RBAC (ADR-0001), `access` crate, `grant_role`/`revoke_role`, `*_members` multi-role PK, `seed` bootstrap via `saas::*`.
-- **Stage 2e.1 (done): cleanup — page naming convention (`EntityOperationPage`), EN comments, migration set sync, docs counters.**
-- **Stage 2c (done): tenant and workspace member management, roles UI, UI gating via `saas::access::my_permissions`, Renew-demo removed.**
-- Stage 2d (next): Casbin policy cleanup on delete, single Casbin/`saas` connection, single-flight refresh, atomic `change_role`.
-- Stage 3: platform admin UI, tenant suspension, email verification, audit log, return-URL preservation for `/invitations/:token`.
+- Stage 2e (done): domain-ownership RBAC, `access` crate, `grant_role`/`revoke_role`, `*_members` multi-role PK, `seed` bootstrap via `saas::*`.
+- Stage 2e.1 (done): cleanup — page naming convention (`EntityOperationPage`), EN comments, migration set sync, docs counters.
+- Stage 2c (done): tenant and workspace member management, roles UI, UI gating via `saas::access::my_permissions`, Renew-demo removed.
+- **Stage 2d (done): casbin cleanup (`purge_role`, `delete_role_by_id`), single `PgPool` (`from_pool`), owner guard, refresh grace window, `.route_layer` split for auto-refresh.**
+- Stage 3 (next): platform admin UI, tenant suspension, email verification, audit log, password reset, return-URL preservation for `/invitations/:token`, distributed single-flight (optional).
 - Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (incl. `/refresh`), optional RLS, E2E HTTP tests.
 
 ## License
