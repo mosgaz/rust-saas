@@ -1,4 +1,12 @@
-use crate::auth::{login, register};
+//! Login and registration pages.
+//!
+//! Stage 3a: after a successful `login` / `register`, the page consumes the
+//! `return_url` cookie (set by `pages::invitation::InvitationAcceptPage` for
+//! anonymous visitors) via `crate::auth::take_return_url` and navigates
+//! there. If the cookie is absent or unsafe (open-redirect attempts), the
+//! page falls back to `/`.
+
+use crate::auth::{login, register, take_return_url};
 use domain::AuthUser;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -20,7 +28,9 @@ pub fn LoginPage() -> impl IntoView {
                 match login(email.get(), password.get()).await {
                     Ok(u) => {
                         user.set(Some(u));
-                        navigate("/", Default::default());
+                        let back = take_return_url().await.ok().flatten();
+                        let target = back.unwrap_or_else(|| "/".to_string());
+                        navigate(&target, Default::default());
                     }
                     Err(e) => error.set(Some(e.to_string())),
                 }
@@ -60,7 +70,9 @@ pub fn RegisterPage() -> impl IntoView {
                 match register(email.get(), password.get()).await {
                     Ok(u) => {
                         user.set(Some(u));
-                        navigate("/", Default::default());
+                        let back = take_return_url().await.ok().flatten();
+                        let target = back.unwrap_or_else(|| "/".to_string());
+                        navigate(&target, Default::default());
                     }
                     Err(e) => error.set(Some(e.to_string())),
                 }

@@ -1,16 +1,19 @@
-//! Tenant and workspace roles: list, create, delete.
+//! Tenant and workspace roles: list, create, edit, delete.
 //!
 //! `RoleView` is a client-side mirror of `access::Role` (which is SSR-only
 //! because `access` pulls `sqlx`). Conversion happens server-side only.
 //!
-//! `update_role` and a dedicated `RoleFormPage` are deferred to Stage 2.5;
-//! MVP uses the inline create form in `RoleListPage` and `delete` per row.
+//! Stage 3a: `RoleFormPage` edits `name`, `description`, and `permissions`.
+//! `key` is read-only (ADR-0001: `roles.key` is immutable — renaming is
+//! delete + create). `protected`/`immutable` roles are rejected client-side
+//! (`navigate(back_url)` on direct entry) and server-side
+//! (`AccessError::Protected`/`Immutable` → `CoreError::Forbidden` → 403).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos_router::hooks::use_params;
+use leptos_router::hooks::{use_navigate, use_params};
 use leptos_router::params::Params;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -63,6 +66,22 @@ pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> 
     Ok(roles.into_iter().map(RoleView::from).collect())
 }
 
+/// Returns a role by `role_id`, or `None` if not found.
+///
+/// Uses `access::get_role_by_id` (no `actor`, §5 p.5 helper): any
+/// authenticated user who knows the `role_id` can read its metadata. The
+/// mutation (`update_role`) performs `authz.require(actor, domain,
+/// "roles", "manage")` server-side.
+#[server]
+pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let _user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let role = access::get_role_by_id(state.saas.access(), role_id)
+        .await
+        .map_err(crate::error::access_error_to_server_fn)?;
+    Ok(role.map(RoleView::from))
+}
+
 /// Returns the `(resource, action, description)` triples of the
 /// `permissions` reference table.
 #[server]
@@ -106,6 +125,25 @@ pub async fn create_role(
     Ok(RoleView::from(role))
 }
 
+/// Updates a role's `name`, `description`, and `permissions`. Never `key`
+/// (ADR-0001: `roles.key` is immutable).
+#[server]
+pub async fn update_role(
+    role_id: Uuid,
+    name: String,
+    description: String,
+    permissions: Vec<String>,
+) -> Result<RoleView, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let pairs = parse_permission_pairs(&permissions)?;
+
+    let role = saas::access::update_role(&state.saas, &user, role_id, name, description, &pairs)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(RoleView::from(role))
+}
+
 /// Deletes a role.
 #[server]
 pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
@@ -145,11 +183,12 @@ fn parse_permission_pairs(raw: &[String]) -> Result<Vec<(String, String)>, Serve
         .collect()
 }
 
-// ─── Shared panel ───────────────────────────────────────────────────────────
+// ─── Shared list panel ──────────────────────────────────────────────────────
 
-/// Inline roles panel. Lists roles in `domain`, offers a delete button per
-/// non-protected role (if `(roles, delete)`), and an inline create form (if
-/// `(roles, create)`).
+/// Inline roles panel. Lists roles in `domain`, offers an Edit button per
+/// non-protected/non-immutable role (if `(roles, manage)`), a Delete button
+/// per non-protected role (if `(roles, delete)`), and an inline create form
+/// (if `(roles, create)`).
 #[component]
 pub fn RoleListPage(domain: String) -> impl IntoView {
     let domain = StoredValue::new(domain);
@@ -183,6 +222,17 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
 
     let can = move |resource: &'static str, action: &'static str| {
         perms.with(|p| p.contains(&(resource.to_string(), action.to_string())))
+    };
+
+    let edit_url_for = move |r: &RoleView| -> Option<String> {
+        let d = domain.get_value();
+        if let Some(tid) = d.strip_prefix("tenant:") {
+            Some(format!("/tenants/{tid}/roles/{}", r.id))
+        } else if let Some(wid) = d.strip_prefix("workspace:") {
+            Some(format!("/workspaces/{wid}/roles/{}", r.id))
+        } else {
+            None
+        }
     };
 
     let submit_create = move |_| {
@@ -231,12 +281,22 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
                                 let id = r.id;
                                 let key = r.key.clone();
                                 let protected = r.protected;
+                                let immutable = r.immutable;
                                 let perms_str = r
                                     .permissions
                                     .iter()
                                     .map(|(res, act)| format!("{res}:{act}"))
                                     .collect::<Vec<_>>()
                                     .join(", ");
+                                let edit_href = edit_url_for(&r);
+                                let can_manage = perms.with(|p| {
+                                    p.contains(&("roles".to_string(), "manage".to_string()))
+                                });
+                                let can_delete = perms.with(|p| {
+                                    p.contains(&("roles".to_string(), "delete".to_string()))
+                                });
+                                let show_edit =
+                                    !protected && !immutable && can_manage && edit_href.is_some();
                                 view! {
                                     <li class="py-3 flex items-start justify-between gap-4">
                                         <div>
@@ -251,6 +311,15 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
                                                 } else {
                                                     None
                                                 }}
+                                                {if immutable && !protected {
+                                                    Some(view! {
+                                                        <span class="ml-2 text-xs text-neutral-500">
+                                                            "(immutable)"
+                                                        </span>
+                                                    })
+                                                } else {
+                                                    None
+                                                }}
                                             </p>
                                             <p class="text-sm text-neutral-400">
                                                 {format!("{} — {}", r.name, r.description)}
@@ -259,28 +328,38 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
                                                 {format!("id: {id} · perms: [{perms_str}]")}
                                             </p>
                                         </div>
-                                        {move || if !protected && can("roles", "delete") {
-                                            Some(view! {
-                                                <button
-                                                    class="btn text-sm"
-                                                    on:click=move |_| {
-                                                        spawn_local(async move {
-                                                            match delete_role(id).await {
-                                                                Ok(()) => {
-                                                                    error.set(None);
-                                                                    refresh.update(|n| *n += 1);
+                                        <div class="flex gap-2">
+                                            {if show_edit {
+                                                let href = edit_href.unwrap();
+                                                Some(view! {
+                                                    <a class="btn text-sm" href=href>"Edit"</a>
+                                                })
+                                            } else {
+                                                None
+                                            }}
+                                            {if !protected && can_delete {
+                                                Some(view! {
+                                                    <button
+                                                        class="btn text-sm"
+                                                        on:click=move |_| {
+                                                            spawn_local(async move {
+                                                                match delete_role(id).await {
+                                                                    Ok(()) => {
+                                                                        error.set(None);
+                                                                        refresh.update(|n| *n += 1);
+                                                                    }
+                                                                    Err(e) => error.set(Some(e.to_string())),
                                                                 }
-                                                                Err(e) => error.set(Some(e.to_string())),
-                                                            }
-                                                        });
-                                                    }
-                                                >
-                                                    "Delete"
-                                                </button>
-                                            })
-                                        } else {
-                                            None
-                                        }}
+                                                            });
+                                                        }
+                                                    >
+                                                        "Delete"
+                                                    </button>
+                                                })
+                                            } else {
+                                                None
+                                            }}
+                                        </div>
                                     </li>
                                 }
                             })
@@ -316,7 +395,172 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
     }
 }
 
-// ─── Route pages ────────────────────────────────────────────────────────────
+// ─── Shared form panel ──────────────────────────────────────────────────────
+
+/// Inline role edit form for a `domain` and `role_id`.
+///
+/// State:
+/// - `name` — required (UI validation; backend unchanged);
+/// - `description` — free-form;
+/// - `selected` — `HashSet<(resource, action)>`, initialised from the
+///   loaded role; permissions present in the role but missing from the
+///   reference (an anomaly, FK prevents writes) are silently dropped by the
+///   checkbox rendering — they are not re-submitted.
+///
+/// Behaviour:
+/// - Direct entry to a `protected` or `immutable` role: `navigate(back_url)`.
+/// - Submit error (403/404/500): stay on the form, show banner.
+/// - Submit success: `navigate(back_url)` (the list refetches on mount).
+/// - `key` is displayed read-only (ADR-0001).
+#[component]
+pub fn RoleFormPage(domain: String, role_id: Uuid, back_url: String) -> impl IntoView {
+    let _ = &domain;
+    let domain = StoredValue::new(domain);
+    let back_url = StoredValue::new(back_url);
+
+    let role = RwSignal::new(None::<RoleView>);
+    let reference = RwSignal::new(Vec::<(String, String, String)>::new());
+    let error = RwSignal::new(None::<String>);
+    let refresh = RwSignal::new(0u32);
+
+    let name = RwSignal::new(String::new());
+    let description = RwSignal::new(String::new());
+    let selected = RwSignal::new(HashSet::<(String, String)>::new());
+
+    let navigate = use_navigate();
+    let navigate_for_guard = navigate.clone();
+
+    Effect::new(move |_| {
+        let _ = refresh.get();
+        let _ = domain.get_value();
+        let back = back_url.get_value();
+        let nav = navigate_for_guard.clone();
+        spawn_local(async move {
+            match get_role(role_id).await {
+                Ok(Some(r)) => {
+                    if r.protected || r.immutable {
+                        nav(&back, Default::default());
+                        return;
+                    }
+                    name.set(r.name.clone());
+                    description.set(r.description.clone());
+                    selected.set(r.permissions.iter().cloned().collect());
+                    role.set(Some(r));
+                    error.set(None);
+                }
+                Ok(None) => error.set(Some("role not found".into())),
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            match list_permissions().await {
+                Ok(p) => reference.set(p),
+                Err(e) => error.set(Some(e.to_string())),
+            }
+        });
+    });
+
+    let submit = {
+        let navigate = navigate.clone();
+        move |_| {
+            let name_v = name.get().trim().to_string();
+            if name_v.is_empty() {
+                error.set(Some("Name is required".into()));
+                return;
+            }
+            let description_v = description.get();
+            let perms: Vec<String> = selected
+                .get()
+                .into_iter()
+                .map(|(r, a)| format!("{r}:{a}"))
+                .collect();
+            let back = back_url.get_value();
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                match update_role(role_id, name_v, description_v, perms).await {
+                    Ok(_) => {
+                        error.set(None);
+                        navigate(&back, Default::default());
+                    }
+                    Err(e) => error.set(Some(e.to_string())),
+                }
+            });
+        }
+    };
+
+    view! {
+        <div class="card mt-6">
+            <h2 class="text-lg font-semibold">"Edit role"</h2>
+            <a class="text-sm text-neutral-400" href=move || back_url.get_value()>
+                "← Back to roles"
+            </a>
+
+            {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
+
+            {move || role.get().map(|r| view! {
+                <div class="mt-4">
+                    <p class="text-sm text-neutral-400">
+                        {format!("key: {} · id: {} · domain: {}", r.key, r.id, r.domain)}
+                    </p>
+                    <input class="input mt-2" placeholder="name" bind:value=name />
+                    <input class="input mt-2" placeholder="description" bind:value=description />
+
+                    <h3 class="mt-6 text-sm font-semibold">"Permissions"</h3>
+                    {move || {
+                        let current = selected.get();
+                        let mut groups: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+                        for (r, a, d) in reference.get() {
+                            groups.entry(r.clone()).or_default().push((r, a, d));
+                        }
+                        if groups.is_empty() {
+                            view! {
+                                <p class="mt-2 text-neutral-500">"No permissions reference loaded."</p>
+                            }.into_any()
+                        } else {
+                            groups.into_iter().map(|(resource, items)| {
+                                view! {
+                                    <div class="mt-3">
+                                        <h4 class="text-xs font-semibold text-neutral-400 uppercase tracking-wide">
+                                            {resource.clone()}
+                                        </h4>
+                                        <div class="mt-2 space-y-1">
+                                            {items.into_iter().map(|(r, a, d)| {
+                                                let key = (r.clone(), a.clone());
+                                                let checked = current.contains(&key);
+                                                let r_for = r.clone();
+                                                let a_for = a.clone();
+                                                view! {
+                                                    <label class="flex items-start gap-2 text-sm">
+                                                        <input
+                                                            type="checkbox"
+                                                            prop:checked=checked
+                                                            on:change=move |_| {
+                                                                selected.update(|s| {
+                                                                    let k = (r_for.clone(), a_for.clone());
+                                                                    if s.contains(&k) { s.remove(&k); } else { s.insert(k); }
+                                                                });
+                                                            }
+                                                        />
+                                                        <span>
+                                                            <span class="font-medium">{a.clone()}</span>
+                                                            <span class="text-neutral-500 ml-2">{d.clone()}</span>
+                                                        </span>
+                                                    </label>
+                                                }
+                                            }).collect_view()}
+                                        </div>
+                                    </div>
+                                }
+                            }).collect_view().into_any()
+                        }
+                    }}
+                </div>
+            })}
+
+            <button class="btn mt-4" on:click=submit>"Save"</button>
+        </div>
+    }
+}
+
+// ─── Route pages: role lists ────────────────────────────────────────────────
 
 #[derive(Params, PartialEq)]
 struct TenantIdParams {
@@ -372,6 +616,90 @@ pub fn WorkspaceRoleListPage() -> impl IntoView {
                     <RoleListPage domain=domain />
                 }
             })}
+        </main>
+    }
+}
+
+// ─── Route pages: role edit forms (Stage 3a) ────────────────────────────────
+
+#[derive(Params, PartialEq)]
+struct TenantRoleFormParams {
+    tenant_id: Uuid,
+    role_id: Uuid,
+}
+
+/// `/tenants/:tenant_id/roles/:role_id` — edit a tenant role.
+#[component]
+pub fn TenantRoleFormPage() -> impl IntoView {
+    let params = use_params::<TenantRoleFormParams>();
+    let ids = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .map(|p| (p.tenant_id, p.role_id))
+        })
+    };
+
+    view! {
+        <main class="mx-auto max-w-2xl p-8">
+            <a class="text-sm text-neutral-400" href="/tenants">"← All tenants"</a>
+            <h1 class="mt-2 text-2xl font-bold">"Edit tenant role"</h1>
+            {move || match ids() {
+                Some((tid, rid)) => {
+                    let domain_str = domain::tenant_domain(tid);
+                    let back_url = format!("/tenants/{tid}/roles");
+                    view! {
+                        <RoleFormPage domain=domain_str role_id=rid back_url=back_url />
+                    }.into_any()
+                }
+                None => view! {
+                    <div class="mt-4">
+                        <p class="text-red-400">"Invalid tenant or role id."</p>
+                        <a class="btn text-sm mt-2 inline-block" href="/tenants">"Back to tenants"</a>
+                    </div>
+                }.into_any(),
+            }}
+        </main>
+    }
+}
+
+#[derive(Params, PartialEq)]
+struct WorkspaceRoleFormParams {
+    workspace_id: Uuid,
+    role_id: Uuid,
+}
+
+/// `/workspaces/:workspace_id/roles/:role_id` — edit a workspace role.
+#[component]
+pub fn WorkspaceRoleFormPage() -> impl IntoView {
+    let params = use_params::<WorkspaceRoleFormParams>();
+    let ids = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .map(|p| (p.workspace_id, p.role_id))
+        })
+    };
+
+    view! {
+        <main class="mx-auto max-w-2xl p-8">
+            <a class="text-sm text-neutral-400" href="/workspaces">"← All workspaces"</a>
+            <h1 class="mt-2 text-2xl font-bold">"Edit workspace role"</h1>
+            {move || match ids() {
+                Some((wid, rid)) => {
+                    let domain_str = domain::workspace_domain(wid);
+                    let back_url = format!("/workspaces/{wid}/roles");
+                    view! {
+                        <RoleFormPage domain=domain_str role_id=rid back_url=back_url />
+                    }.into_any()
+                }
+                None => view! {
+                    <div class="mt-4">
+                        <p class="text-red-400">"Invalid workspace or role id."</p>
+                        <a class="btn text-sm mt-2 inline-block" href="/workspaces">"Back to workspaces"</a>
+                    </div>
+                }.into_any(),
+            }}
         </main>
     }
 }

@@ -5,6 +5,11 @@
 //! `saas::access::{assign_role, my_permissions}`; errors go through
 //! `crate::error::core_error_to_server_fn`.
 //!
+//! Stage 3a: `MemberListPage` uses `<select>` for user (all current members,
+//! including the actor) and role (all roles from `list_roles`), replacing the
+//! former free-text inputs. "Invite instead" links to `scope_url`, the
+//! invitations page for the same tenant or workspace.
+//!
 //! Role key is passed to the server as a raw string and parsed into
 //! `access::RoleKey` server-side; the client never sees `access` types
 //! (`access` is SSR-only).
@@ -17,6 +22,8 @@ use leptos::task::spawn_local;
 use leptos_router::hooks::use_params;
 use leptos_router::params::Params;
 use uuid::Uuid;
+
+use crate::pages::role::{list_roles, RoleView};
 
 #[cfg(feature = "ssr")]
 use access::RoleKey;
@@ -96,12 +103,19 @@ fn parse_scope(domain: &str) -> Result<saas::member::MemberScope, ServerFnError>
 // ─── Shared panel ───────────────────────────────────────────────────────────
 
 /// Inline member panel for a domain. Renders the member list and, when the
-/// actor has `(members, manage)`, per-role remove buttons and an "Assign role"
-/// form.
+/// actor has `(members, manage)`, per-role remove buttons, a role- and
+/// member-select "Assign role" form, and an "Invite instead" link to
+/// `scope_url`.
+///
+/// `scope_url` is the invitations page for the same tenant or workspace
+/// (e.g. `/tenants/{id}/invitations`). Explicit parameter so the panel does
+/// not have to re-derive the URL from `domain`.
 #[component]
-pub fn MemberListPage(domain: String) -> impl IntoView {
+pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
     let domain = StoredValue::new(domain);
+    let scope_url = StoredValue::new(scope_url);
     let members = RwSignal::new(Vec::<Member>::new());
+    let roles = RwSignal::new(Vec::<RoleView>::new());
     let perms = RwSignal::new(HashSet::<(String, String)>::new());
     let error = RwSignal::new(None::<String>);
     let refresh = RwSignal::new(0u32);
@@ -120,8 +134,19 @@ pub fn MemberListPage(domain: String) -> impl IntoView {
                 }
                 Err(e) => error.set(Some(e.to_string())),
             }
-            match my_permissions(d).await {
+            match my_permissions(d.clone()).await {
                 Ok(p) => perms.set(p.into_iter().collect()),
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            match list_roles(d).await {
+                Ok(rs) => {
+                    if new_role.get_untracked().is_empty() {
+                        if let Some(first) = rs.first() {
+                            new_role.set(first.key.clone());
+                        }
+                    }
+                    roles.set(rs);
+                }
                 Err(e) => error.set(Some(e.to_string())),
             }
         });
@@ -134,11 +159,9 @@ pub fn MemberListPage(domain: String) -> impl IntoView {
     let submit_assign = move |_| {
         let d = domain.get_value();
         let uid = new_user.get();
-        let uid = uid.trim().to_string();
         let role = new_role.get();
-        let role = role.trim().to_string();
         if uid.is_empty() || role.is_empty() {
-            error.set(Some("user id and role key are required".into()));
+            error.set(Some("select a member and a role".into()));
             return;
         }
         let uid = match Uuid::parse_str(&uid) {
@@ -152,7 +175,6 @@ pub fn MemberListPage(domain: String) -> impl IntoView {
             match assign_member_role(d, uid, role).await {
                 Ok(()) => {
                     new_user.set(String::new());
-                    new_role.set(String::new());
                     error.set(None);
                     refresh.update(|n| *n += 1);
                 }
@@ -236,20 +258,42 @@ pub fn MemberListPage(domain: String) -> impl IntoView {
             </ul>
 
             {move || if can_manage() {
+                let member_opts = members.get();
+                let role_opts = roles.get();
+                let invite_href = scope_url.get_value();
                 Some(view! {
                     <div class="mt-6 border-t border-neutral-800 pt-4">
                         <h3 class="text-sm font-semibold">"Assign role"</h3>
-                        <input
-                            class="input mt-2"
-                            placeholder="user id (uuid)"
-                            bind:value=new_user
-                        />
-                        <input
-                            class="input mt-2"
-                            placeholder="role key (e.g. editor)"
-                            bind:value=new_role
-                        />
+                        <select class="input mt-2" bind:value=new_user>
+                            <option value="">"— select member —"</option>
+                            {member_opts
+                                .into_iter()
+                                .map(|m| {
+                                    let id = m.user_id.to_string();
+                                    let label = m.email.clone();
+                                    view! { <option value=id.clone()>{label}</option> }
+                                })
+                                .collect_view()}
+                        </select>
+                        <select class="input mt-2" bind:value=new_role>
+                            <option value="">"— select role —"</option>
+                            {role_opts
+                                .into_iter()
+                                .map(|r| {
+                                    let v = r.key.clone();
+                                    let label = format!("{} — {}", r.key, r.name);
+                                    view! { <option value=v.clone()>{label}</option> }
+                                })
+                                .collect_view()}
+                        </select>
                         <button class="btn mt-3" on:click=submit_assign>"Assign"</button>
+
+                        <p class="mt-4 text-sm text-neutral-400">
+                            "Member not in the list? "
+                            <a class="text-blue-400 hover:underline" href=invite_href>
+                                "Invite instead"
+                            </a>
+                        </p>
                     </div>
                 })
             } else {
@@ -278,13 +322,14 @@ pub fn TenantMemberListPage() -> impl IntoView {
             <h1 class="mt-2 text-2xl font-bold">"Tenant members"</h1>
             {move || tenant_id().map(|id| {
                 let domain = domain::tenant_domain(id);
+                let scope_url = format!("/tenants/{id}/invitations");
                 view! {
                     <div class="mt-2">
                         <a class="btn text-sm" href=format!("/tenants/{id}")>
                             "Open tenant"
                         </a>
                     </div>
-                    <MemberListPage domain=domain />
+                    <MemberListPage domain=domain scope_url=scope_url />
                 }
             })}
         </main>
@@ -308,13 +353,14 @@ pub fn WorkspaceMemberListPage() -> impl IntoView {
             <h1 class="mt-2 text-2xl font-bold">"Workspace members"</h1>
             {move || workspace_id().map(|id| {
                 let domain = domain::workspace_domain(id);
+                let scope_url = format!("/workspaces/{id}/invitations");
                 view! {
                     <div class="mt-2">
                         <a class="btn text-sm" href=format!("/workspaces/{id}")>
                             "Open workspace"
                         </a>
                     </div>
-                    <MemberListPage domain=domain />
+                    <MemberListPage domain=domain scope_url=scope_url />
                 }
             })}
         </main>

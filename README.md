@@ -16,8 +16,10 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **Server-side logout (revokes refresh token family)**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
-- **Tenant and workspace member management (list, assign/remove role, permission-gated UI)**
+- **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
+- **Role management: list, create, edit (Stage 3a), delete; `key` is read-only after creation**
 - **UI gating by effective permissions (`my_permissions`, batched per domain)**
+- **Return-URL preservation across login/registration (anonymous visitor on `/invitations/:token` is redirected back after sign-in; open-redirect attempts rejected by `is_safe_return_url`)**
 - Platform, tenant, and workspace authorization domains
 - Invitations (reusable links and addressed) with `token_hash` (SHA-256), `expires_at`, `max_uses`, `revoked_at`
 - Document pages (view and create inside workspaces)
@@ -127,7 +129,7 @@ Casbin policies are scoped by domain:
 - A **role** is a named set of permissions in a **domain** (not in a tenant).
 - A **permission** is a `(resource, action)` pair from the `permissions` reference table.
 - The **owner** role in a domain has **all permissions** from the reference table, is `protected=true` and `immutable=true`. It is created by `access::create_owner_role(domain)` (idempotent) from `saas::platform::provision_tenant` and `saas::tenant::create_workspace`, and via the bootstrap SQL migration for the `platform` domain.
-- The owner of a domain creates custom roles and assigns them to users of that domain (`saas::access::create_role` / `saas::access::assign_role`).
+- The owner of a domain creates custom roles and assigns them to users of that domain (`saas::access::create_role` / `assign_role` / `update_role`). Roles can be edited (`name`, `description`, `permissions`) and deleted; `key` is immutable (`update_role` never changes it; rename = delete + create, ADR-0001).
 - Users can hold **multiple roles** in the same domain. `tenant_members` and `workspace_members` use `PRIMARY KEY (scope_id, user_id, role)`.
 - The **owner guard** prevents removing the last holder of a `protected` role from a domain (`saas::member::{change_role, remove_role}` return `Forbidden`). Non-protected roles have no last-holder guard. The guard reads `casbin_rule` (the source of truth for authorization), not `*_members`.
 
@@ -293,14 +295,14 @@ Then in the browser:
 2. `/platform` — as platform owner, create a tenant (the creator becomes its `owner` via `provision_tenant`).
 3. `/tenants` — list of tenants you're a member of; click **Open**.
 4. `/tenants/<tenant_id>` — as tenant owner, create a workspace; the creator becomes its `owner`.
-5. `/tenants/<tenant_id>/members` — as tenant owner, see members and assign or remove roles.
-6. `/tenants/<tenant_id>/roles` — as tenant owner, list and create custom roles.
+5. `/tenants/<tenant_id>/members` — as tenant owner, see members; assign or remove roles via member/role selects; "Invite instead" jumps to invitations.
+6. `/tenants/<tenant_id>/roles` — as tenant owner, list, create, edit, and delete custom roles.
 7. `/workspaces` — list of workspaces you're a member of.
 8. `/workspaces/<workspace_id>` — as editor, create documents; click a document title to view it on its dedicated page.
-9. `/workspaces/<workspace_id>/members` — as workspace owner, see members and assign or remove roles.
-10. `/workspaces/<workspace_id>/roles` — as workspace owner, list and create custom roles.
+9. `/workspaces/<workspace_id>/members` — as workspace owner, see members; assign or remove roles via member/role selects; "Invite instead" jumps to invitations.
+10. `/workspaces/<workspace_id>/roles` — as workspace owner, list, create, edit, and delete custom roles.
 11. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace owner, create a workspace invitation.
-12. Paste `/invitations/<64 hex>` into another browser/session (after logging in as someone else) — accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`.
+12. Paste `/invitations/<64 hex>` into another browser/session (not logged in) — the page stores the URL in the `return_url` cookie; click **Log in** or **Register**, sign in, and you are redirected back to the same invitation page, where you can accept it. Accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`.
 13. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work.
 
 ### Checking the build
@@ -397,7 +399,7 @@ The sole owner of the `permissions`, `roles`, and `role_permissions` tables.
   - `delete_role(actor, role_id)` — requires `(roles, delete)`; rejects `protected`. Does not cascade to `casbin_rule` or `*_members`; consumers that want the full cleanup should use `saas::access::delete_role`.
   - `list_roles(actor, domain)` — requires `(roles, list)`.
   - `get_role(domain, role_key)` — no actor: helper, called after `require` in a caller.
-  - `get_role_by_id(role_id)` — no actor: helper, returns `Option<Role>`; used by `saas::access::delete_role`.
+  - `get_role_by_id(role_id)` — no actor: helper, returns `Option<Role>`; used by `saas::access::delete_role` and by the example's role edit form.
   - `delete_role_by_id(role_id)` — no actor: low-level `DELETE` of the `roles` row; idempotent; no `require`, no `protected` check. Used by `saas::access::delete_role` after its own `require` and `protected` check.
   - `get_permissions_for_role(domain, role_key)` — no actor: helper for `saas::access::assign_role`.
   - `list_permissions()` — no actor: public reference.
@@ -486,21 +488,23 @@ Routes:
 | Route | Component | Purpose |
 |---|---|---|
 | `/` | `pages::home::HomePage` | landing page, links |
-| `/login` | `pages::auth::LoginPage` | sign in |
-| `/register` | `pages::auth::RegisterPage` | sign up |
+| `/login` | `pages::auth::LoginPage` | sign in; consumes `return_url` after success (Stage 3a) |
+| `/register` | `pages::auth::RegisterPage` | sign up; consumes `return_url` after success (Stage 3a) |
 | `/platform` | `pages::platform::PlatformPage` | create a tenant (as platform owner) |
 | `/tenants` | `pages::tenant::TenantListPage` | list of my tenants |
 | `/tenants/:tenant_id` | `pages::tenant::TenantPage` | single tenant (create workspace) |
 | `/tenants/:tenant_id/invitations` | `pages::invitation::TenantInvitationListPage` | tenant invitations |
-| `/tenants/:tenant_id/members` | `pages::member::TenantMemberListPage` | tenant members and role changes |
-| `/tenants/:tenant_id/roles` | `pages::role::TenantRoleListPage` | tenant roles (list/create/delete) |
+| `/tenants/:tenant_id/members` | `pages::member::TenantMemberListPage` | tenant members and role changes (selects, Stage 3a) |
+| `/tenants/:tenant_id/roles` | `pages::role::TenantRoleListPage` | tenant roles (list/create/edit/delete) |
+| `/tenants/:tenant_id/roles/:role_id` | `pages::role::TenantRoleFormPage` | edit tenant role (Stage 3a) |
 | `/workspaces` | `pages::workspace::WorkspaceListPage` | list of my workspaces |
 | `/workspaces/:workspace_id` | `pages::workspace::WorkspacePage` | single workspace (documents) |
 | `/workspaces/:workspace_id/documents/:document_id` | `pages::workspace::DocumentPage` | single document view |
 | `/workspaces/:workspace_id/invitations` | `pages::invitation::WorkspaceInvitationListPage` | workspace invitations |
-| `/workspaces/:workspace_id/members` | `pages::member::WorkspaceMemberListPage` | workspace members and role changes |
-| `/workspaces/:workspace_id/roles` | `pages::role::WorkspaceRoleListPage` | workspace roles (list/create/delete) |
-| `/invitations/:token` | `pages::invitation::InvitationAcceptPage` | accept-flow |
+| `/workspaces/:workspace_id/members` | `pages::member::WorkspaceMemberListPage` | workspace members and role changes (selects, Stage 3a) |
+| `/workspaces/:workspace_id/roles` | `pages::role::WorkspaceRoleListPage` | workspace roles (list/create/edit/delete) |
+| `/workspaces/:workspace_id/roles/:role_id` | `pages::role::WorkspaceRoleFormPage` | edit workspace role (Stage 3a) |
+| `/invitations/:token` | `pages::invitation::InvitationAcceptPage` | accept-flow; sets `return_url` for anonymous visitors (Stage 3a) |
 
 ## Authorization model
 
@@ -554,7 +558,8 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Never trust client-supplied tenant or workspace identifiers without server-side validation.
 - Always scope database queries by tenant or workspace.
 - Treat UI visibility as convenience, not as a security boundary.
-- **Roles are data, not code.** No built-in role enums; `owner` is a row created by `access::create_owner_role`/the SQL migration; custom roles are created by the domain owner.
+- **Roles are data, not code.** No built-in role enums; `owner` is a row created by `access::create_owner_role`/the SQL migration; custom roles are created and edited by the domain owner.
+- **Role edit is UI-editable for `name`, `description`, and `permissions`.** `key` is read-only after creation (ADR-0001: rename = delete + create). `protected`/`immutable` roles (`owner`) cannot be edited or deleted.
 - `saas` and `authn` do not know about Leptos, Axum, or Casbin. `saas` does not know about `permissions`/`roles`/`role_permissions` — those belong to `access`.
 - Library crates do not depend on `examples/*`; each example has its own `Cargo.toml` and `Cargo.lock`.
 - Server functions resolve the actor through `extract::CurrentUser`; a missing actor is HTTP 401.
@@ -562,12 +567,14 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored.
 - Refresh raw tokens are returned once from `authn::issue_refresh_token` and are never persisted; only `refresh_tokens.token_hash` (SHA-256) is stored.
 - `accept_invitation` does not compare `actor.email` to `invitation.email` until email verification is implemented.
+- **Post-auth return-URL preservation (Stage 3a):** anonymous visitors on `/invitations/:token` store the path in the `return_url` cookie (`auth::set_return_url`); `pages::auth::{LoginPage, RegisterPage}` call `auth::take_return_url` after successful sign-in and navigate there, falling back to `/` when the cookie is absent or unsafe. `is_safe_return_url` rejects `//`, `:` in the first segment, `;`/`,`/`"`/`\`/whitespace, and prefixes `/login`/`/register`. The cookie is `httpOnly`, `SameSite=Lax`, `Path=/`, session lifetime; `Secure` is deferred to Stage 4 (added to all auth cookies together).
 - `authn::rotate_refresh_token` has a 10-second grace window for parallel refresh requests; a parallel request within the window returns `RefreshInvalid` and does not revoke the token family. Distributed single-flight for multi-instance deployments is not implemented.
 - `saas::member::change_role` performs `assign` before `revoke`. A partial failure leaves the user over-permissioned with both roles (recoverable by retrying `change_role`); under-permissioning on partial failure is not possible.
 - `saas::member::{change_role, remove_role}` include an owner guard: the last holder of a `protected` role cannot be removed from a domain. The guard reads `casbin_rule`, not `*_members`.
 - `saas::access::delete_role` cleans up `casbin_rule` (g+p) and `*_members` in six retry-safe steps; a partial failure can be recovered by calling `delete_role` again.
 - All library crates (`authz-casbin`, `access`, `saas`, `authn`) in the reference app and `seed` share a single `PgPool` (`CasbinAuthz::from_pool`).
 - The reference app's `auto_refresh` middleware runs on the protected router (SSR + `/_server/*`); static files and 404 responses bypass it.
+- **Hydrate host check.** `cargo check --features hydrate` runs on the host and catches type-level errors; it does **not** catch wasm-only errors. A full `cargo leptos watch` is part of the merge checklist (Stage 3a).
 
 ## Roadmap
 
@@ -579,9 +586,17 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Stage 2e (done): domain-ownership RBAC, `access` crate, `grant_role`/`revoke_role`, `*_members` multi-role PK, `seed` bootstrap via `saas::*`.
 - Stage 2e.1 (done): cleanup — page naming convention (`EntityOperationPage`), EN comments, migration set sync, docs counters.
 - Stage 2c (done): tenant and workspace member management, roles UI, UI gating via `saas::access::my_permissions`, Renew-demo removed.
-- **Stage 2d (done): casbin cleanup (`purge_role`, `delete_role_by_id`), single `PgPool` (`from_pool`), owner guard, refresh grace window, `.route_layer` split for auto-refresh.**
-- Stage 3 (next): platform admin UI, tenant suspension, email verification, audit log, password reset, return-URL preservation for `/invitations/:token`, distributed single-flight (optional).
-- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (incl. `/refresh`), optional RLS, E2E HTTP tests.
+- Stage 2d (done): casbin cleanup (`purge_role`, `delete_role_by_id`), single `PgPool` (`from_pool`), owner guard, refresh grace window, `.route_layer` split for auto-refresh.
+- **Stage 3.0 (done): ADRs 0002/0003/0004 (auth-scoping, cross-table transactions, audit log) — doc-only.**
+- **Stage 3a (done): UX 2.5 — role edit (`RoleFormPage`, `update_role` UI, read-only `key`), member selects (`<select>` for user and role), "Invite instead" link, return-URL preservation across login/registration (`set_return_url` / `take_return_url` / `is_safe_return_url`).**
+- Stage 3b (next): email verification, claims cleanup (`-email`, `+iat`), Mailpit + `lettre`, rate limiter.
+- Stage 3c: addressed invitations (`accept_invitation` checks `actor.email_verified`).
+- Stage 3d: password reset (`password_reset_tokens`, `revoke_all_user_tokens`, `revoked_reason`).
+- Stage 3e: audit log (`audit` + `audit-pg`, 21 events).
+- Stage 3f: platform admin (`list_tenants`, `suspend_tenant`, `activate_tenant`, `resolve_active_tenant`, `ActiveTenant`, `TenantSuspended`); audit view.
+- Stage 3g: `axum-minimal` (portability proof).
+- Stage 3h: infra + minor (`has_policy` pre-check, `pg_advisory_xact_lock`, `my_permissions` cache, `casbin_rule` dedup).
+- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (incl. `/refresh`), optional RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention.
 
 ## License
 
