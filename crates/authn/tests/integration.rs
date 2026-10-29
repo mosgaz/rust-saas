@@ -9,7 +9,7 @@
 //! where the user has the `CREATE DATABASE` privilege (the default postgres
 //! superuser satisfies this).
 
-use authn::{Authn, AuthnError};
+use authn::{Authn, AuthnError, REFRESH_GRACE_SECONDS};
 use identity::IdentityError;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -117,7 +117,7 @@ async fn verify_token_returns_none_for_deleted_user(pool: PgPool) {
     assert!(verified.is_none(), "deleted user must yield Ok(None)");
 }
 
-// ─── Refresh tokens (Stage 2b) ──────────────────────────────────────────────
+// ─── Refresh tokens (Stage 2b/2d) ───────────────────────────────────────────
 
 /// `issue_refresh_token` persists exactly one row: `used_at` and `revoked_at`
 /// NULL, `expires_at` in the future.
@@ -203,23 +203,42 @@ async fn rotate_refresh_token_success(pool: PgPool) {
     );
 }
 
-/// Reusing an already-used refresh token revokes the whole family and returns
-/// `RefreshReused`.
+/// Reusing an already-used refresh token **after** the grace window revokes
+/// the whole family and returns `RefreshReused`.
+///
+/// Stage 2d: `used_at` is forced to be older than
+/// [`REFRESH_GRACE_SECONDS`] before the second rotation attempt, so the
+/// second call is treated as a genuine reuse (not as a parallel-request
+/// race).
 #[sqlx::test(migrations = "../db/migrations")]
 async fn rotate_refresh_token_reuse_revokes_family(pool: PgPool) {
     let authn = fresh(pool.clone());
     let email = unique_email("refresh-reuse");
     let user = authn.register(&email, "Password123!").await.unwrap();
     let r1 = authn.issue_refresh_token(&user).await.unwrap();
-    let _r2 = authn
-        .rotate_refresh_token(&r1)
-        .await
-        .expect("first rotate must succeed");
+	let _r2 = authn
+		.rotate_refresh_token(&r1)
+		.await
+		.expect("first rotate must succeed");
+
+    // Push the used_at well past the grace window.
+    sqlx::query(
+        r#"
+        update refresh_tokens
+        set used_at = now() - make_interval(secs => $2)
+        where user_id = $1 and used_at is not null
+        "#,
+    )
+    .bind(user.id)
+    .bind((REFRESH_GRACE_SECONDS + 60) as f64)
+    .execute(&pool)
+    .await
+    .expect("force old used_at");
 
     let err = authn
         .rotate_refresh_token(&r1)
         .await
-        .expect_err("reuse must be rejected");
+        .expect_err("reuse outside the grace window must be rejected");
     assert!(matches!(err, AuthnError::RefreshReused), "got {err:?}");
 
     let revoked: i64 = sqlx::query_scalar(
@@ -239,6 +258,98 @@ async fn rotate_refresh_token_reuse_revokes_family(pool: PgPool) {
         total >= 2,
         "family must have at least two rows after rotate"
     );
+}
+
+/// Stage 2d: presenting an already-used token **within** the grace window is
+/// treated as a parallel-request race — `RefreshInvalid`, and the family is
+/// **not** revoked.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn rotate_refresh_token_within_grace_returns_invalid(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("refresh-grace");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let r1 = authn.issue_refresh_token(&user).await.unwrap();
+	let (r2, _) = authn
+		.rotate_refresh_token(&r1)
+		.await
+		.expect("first rotate must succeed");
+
+    // Immediately present the same r1 again — within the default grace window.
+    let err = authn
+        .rotate_refresh_token(&r1)
+        .await
+        .expect_err("parallel-request race must be rejected");
+    assert!(
+        matches!(err, AuthnError::RefreshInvalid),
+        "within grace must be RefreshInvalid, got {err:?}"
+    );
+
+    // Family survives.
+    let revoked: i64 = sqlx::query_scalar(
+        "select count(*) from refresh_tokens where user_id = $1 and revoked_at is not null",
+    )
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(revoked, 0, "grace-window race must not revoke the family");
+
+    // The new token (r2) is still usable.
+    let family_id: Uuid =
+        sqlx::query_scalar("select family_id from refresh_tokens where user_id = $1 limit 1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let _ = family_id;
+	let _r3 = authn
+		.rotate_refresh_token(&r2)
+		.await
+		.expect("the new token from the first rotate must still be usable");
+}
+
+/// Stage 2d: a genuine reuse **after** the grace window still revokes the
+/// family; sanity-check the boundary between the two behaviours.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn rotate_refresh_token_old_reuse_revokes_family(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("refresh-old");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let r1 = authn.issue_refresh_token(&user).await.unwrap();
+    let _r2 = authn.rotate_refresh_token(&r1).await.unwrap();
+
+    sqlx::query(
+        r#"
+        update refresh_tokens
+        set used_at = now() - make_interval(secs => $2)
+        where user_id = $1 and used_at is not null
+        "#,
+    )
+    .bind(user.id)
+    .bind((REFRESH_GRACE_SECONDS + 1) as f64)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = authn
+        .rotate_refresh_token(&r1)
+        .await
+        .expect_err("reuse past grace must be rejected");
+    assert!(matches!(err, AuthnError::RefreshReused), "got {err:?}");
+
+    let revoked: i64 = sqlx::query_scalar(
+        "select count(*) from refresh_tokens where user_id = $1 and revoked_at is not null",
+    )
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let total: i64 = sqlx::query_scalar("select count(*) from refresh_tokens where user_id = $1")
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(revoked, total, "past grace, reuse must revoke the family");
 }
 
 /// `revoke_refresh_token` (logout) sets `revoked_at`; a subsequent rotate

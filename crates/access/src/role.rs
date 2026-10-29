@@ -3,7 +3,10 @@
 //! Invariant (§5 p.5):
 //! - `create_role`, `update_role`, `delete_role`, `list_roles` — with
 //!   `authz.require(actor.id, domain, "roles", "<action>")`.
-//! - `get_role` — no actor (helper, called after `require` in a caller).
+//! - `get_role`, `get_role_by_id` — no actor (helper, called after
+//!   `require` in a caller).
+//! - `delete_role_by_id` — no actor (low-level `DELETE`, called by
+//!   `saas::access::delete_role` after its own `require`; idempotent).
 //! - `create_owner_role` — no actor (bootstrap / provisioning helper,
 //!   idempotent; called after `require` in a caller).
 //!
@@ -172,7 +175,10 @@ pub async fn update_role(
 /// 4. `DELETE roles` (cascades `role_permissions`).
 ///
 /// Residual `casbin_rule` and `*_members.role` rows for the deleted
-/// `role_key` remain — cleanup is Stage 2d (handoff §16).
+/// `role_key` remain at the `access` layer; `saas::access::delete_role`
+/// handles their cleanup via [`crate::delete_role_by_id`] +
+/// `authz.purge_role` + `DELETE *_members` (Stage 2d). Consumers that call
+/// this function directly are responsible for that cleanup themselves.
 pub async fn delete_role(
     state: &AccessState,
     actor: &AuthUser,
@@ -268,6 +274,50 @@ pub async fn get_role(
     }
 }
 
+/// Returns a role by its `id`, if any.
+///
+/// **No `actor`** (§5 p.5 exception): helper, called after `require` in a
+/// caller. Used by `saas::access::delete_role` to obtain the role's
+/// `(domain, key)` before purging its Casbin rows and deleting the row.
+pub async fn get_role_by_id(
+    state: &AccessState,
+    role_id: Uuid,
+) -> Result<Option<Role>, AccessError> {
+    let row: Option<RoleRow> = sqlx::query_as(
+        r#"
+        select id, domain, key, name, description, protected, immutable
+        from roles
+        where id = $1
+        "#,
+    )
+    .bind(role_id)
+    .fetch_optional(state.pool())
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(row) => {
+            let permissions = get_permissions_for_role_id(state.pool(), row.id).await?;
+            Ok(Some(row.into_role(permissions)))
+        }
+    }
+}
+
+/// Low-level `DELETE` of a role row by `id`. Does not `require`, does not
+/// check `protected`, does not cascade to `casbin_rule` / `*_members`.
+///
+/// **No `actor`** (§5 p.5 exception): called by
+/// `saas::access::delete_role` after its own `require`, `protected` check,
+/// `authz.purge_role`, and `DELETE *_members`. Idempotent: deleting a
+/// missing row is a no-op (`Ok(())`), so the caller's sequence is retry-safe.
+pub async fn delete_role_by_id(state: &AccessState, role_id: Uuid) -> Result<(), AccessError> {
+    sqlx::query("delete from roles where id = $1")
+        .bind(role_id)
+        .execute(state.pool())
+        .await?;
+    Ok(())
+}
+
 /// Creates (idempotently) the `owner` role in `domain` and grants it every
 /// `(resource, action)` from the `permissions` reference table.
 ///
@@ -334,7 +384,7 @@ pub async fn create_owner_role(state: &AccessState, domain: &str) -> Result<Role
 }
 
 /// Loads `permissions` for a role id (join `role_permissions` →
-/// `permissions`). Shared with `permission.rs` (step 4).
+/// `permissions`). Shared with `permission.rs`.
 pub(crate) async fn get_permissions_for_role_id(
     pool: &PgPool,
     role_id: Uuid,
