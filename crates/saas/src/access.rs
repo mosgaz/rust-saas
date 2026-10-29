@@ -7,6 +7,11 @@
 //! `authz.grant_role`/`revoke_role`) and the `*_members` bookkeeping tables in
 //! one flow. `access` is the sole owner of `roles`/`permissions`;
 //! `*_members` belong to `saas`.
+//!
+//! Stage 2d: `delete_role` performs a full cleanup — `casbin_rule` (`g`+`p`,
+//! via `authz.purge_role`), `*_members`, and the `roles` row. Steps after
+//! `require` are idempotent, so a partial failure can be retried by calling
+//! `delete_role` again with the same `role_id`.
 
 use ::access::{Permission, Role, RoleKey};
 use domain::AuthUser;
@@ -58,15 +63,58 @@ pub async fn update_role(
     .map_err(Into::into)
 }
 
-/// Deletes a role. Delegates to `access::delete_role`.
+/// Deletes a role and cleans up its residuals.
+///
+/// Order:
+/// 1. `access::get_role_by_id(role_id)` — obtain `domain`, `key`,
+///    `protected` (no `actor`, §5 p.5).
+/// 2. Reject `protected=true` ([`CoreError::Forbidden`]).
+/// 3. `require(actor.id, role.domain, "roles", "delete")`.
+/// 4. `authz.purge_role(domain, key)` — deletes all `g`-rows (`user →
+///    role_key → domain`) and `p`-rows (`role_key → domain → resource →
+///    action`) for this role in this domain.
+/// 5. `DELETE *_members WHERE role = role_key` — `tenant_members` /
+///    `workspace_members`; `platform` has no members table.
+/// 6. `access::delete_role_by_id(role_id)` — low-level `DELETE` of the
+///    `roles` row (no `require`, no `protected` check; the caller performed
+///    both). Idempotent, so a partial failure at any step can be retried by
+///    calling `delete_role` again with the same `role_id`.
+///
+/// The `require` runs once, in this function; it is not re-executed after
+/// the actor's own `g`-row for `role_key` has been purged in step 4. This
+/// avoids the self-delete deadlock where the actor is the sole holder of
+/// the very role being deleted.
 pub async fn delete_role(
     state: &SaasState,
     actor: &AuthUser,
     role_id: Uuid,
 ) -> Result<(), CoreError> {
-    ::access::delete_role(state.access(), actor, role_id)
+    let role = ::access::get_role_by_id(state.access(), role_id)
         .await
-        .map_err(Into::into)
+        .map_err(CoreError::from)?
+        .ok_or(CoreError::NotFound)?;
+
+    if role.protected {
+        return Err(CoreError::Forbidden);
+    }
+
+    state
+        .authz()
+        .require(actor.id, &role.domain, "roles", "delete")
+        .await?;
+
+    state
+        .authz()
+        .purge_role(&role.domain, role.key.as_str())
+        .await?;
+
+    delete_members_by_domain(state, &role.domain, role.key.as_str()).await?;
+
+    ::access::delete_role_by_id(state.access(), role_id)
+        .await
+        .map_err(CoreError::from)?;
+
+    Ok(())
 }
 
 /// Lists roles in `domain`. Delegates to `access::list_roles`.
@@ -254,6 +302,41 @@ pub async fn revoke_role(
         .revoke_role(user_id, domain, role_key.as_str())
         .await?;
 
+    Ok(())
+}
+
+/// Deletes every `*_members` row for `(domain, role_key)`. `platform` is a
+/// no-op (no `*_members` table). Called from [`delete_role`] only; not
+/// exposed publicly.
+async fn delete_members_by_domain(
+    state: &SaasState,
+    domain: &str,
+    role_key: &str,
+) -> Result<(), CoreError> {
+    match parse_domain(domain) {
+        Some(Scope::Tenant(tenant_id)) => {
+            sqlx::query("delete from tenant_members where tenant_id = $1 and role = $2")
+                .bind(tenant_id)
+                .bind(role_key)
+                .execute(state.pool())
+                .await?;
+        }
+        Some(Scope::Workspace(workspace_id)) => {
+            sqlx::query("delete from workspace_members where workspace_id = $1 and role = $2")
+                .bind(workspace_id)
+                .bind(role_key)
+                .execute(state.pool())
+                .await?;
+        }
+        Some(Scope::Platform) => {
+            // `platform` has no `*_members` table.
+        }
+        None => {
+            return Err(CoreError::Validation(format!(
+                "invalid domain for delete_role: {domain}"
+            )));
+        }
+    }
     Ok(())
 }
 

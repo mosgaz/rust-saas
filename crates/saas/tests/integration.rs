@@ -4,9 +4,11 @@
 //! `crates/db/migrations` (including `casbin_rule`, `roles`, `permissions`,
 //! and `invitations`), and drops it afterwards.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use access::{AccessState, RoleKey};
+use authz::{AuthorizationEngine, AuthzError};
 use authz_casbin::CasbinAuthz;
 use domain::{AuthUser, InvitationTarget};
 use saas::member::MemberScope;
@@ -17,6 +19,18 @@ use saas::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Builds a `SaasState` with an arbitrary `AuthorizationEngine` sharing the
+/// test pool. Used by `setup` (real `CasbinAuthz`) and by tests that need a
+/// wrapped engine with controlled failures (Stage 2d).
+async fn setup_with(pool: &PgPool, authz: Arc<dyn AuthorizationEngine>) -> SaasState {
+    let access = Arc::new(AccessState::new(pool.clone(), authz.clone()));
+    SaasBuilder::new(pool.clone())
+        .with_authz(authz)
+        .with_access(access)
+        .build()
+        .expect("saas builder")
+}
+
 /// Builds a `CasbinAuthz` + `AccessState` + `SaasState` sharing the test pool.
 async fn setup(pool: &PgPool) -> SaasState {
     let casbin = Arc::new(
@@ -24,12 +38,7 @@ async fn setup(pool: &PgPool) -> SaasState {
             .await
             .expect("casbin init"),
     );
-    let access = Arc::new(AccessState::new(pool.clone(), casbin.clone()));
-    SaasBuilder::new(pool.clone())
-        .with_authz(casbin)
-        .with_access(access)
-        .build()
-        .expect("saas builder")
+    setup_with(pool, casbin as Arc<dyn AuthorizationEngine>).await
 }
 
 /// Creates a user with a random email and a known password.
@@ -1138,4 +1147,411 @@ async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
         outsider_perms.is_empty(),
         "non-member must see no permissions"
     );
+}
+
+// ─── Stage 2d: owner guard, flip order, delete_role cleanup ────────────────
+
+/// Removing the last `protected` holder of a role is rejected; the user
+/// remains a holder and retains the effective permissions of the role.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn remove_role_last_protected_holder_is_rejected(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let holders = saas
+        .authz()
+        .count_users_with_role(&ws_domain, "owner")
+        .await
+        .unwrap();
+    assert_eq!(holders, 1, "admin must be the sole owner of the workspace");
+
+    let err = member::remove_role(
+        &saas,
+        &admin,
+        MemberScope::Workspace(ws.id),
+        admin.id,
+        &owner_key,
+    )
+    .await
+    .expect_err("removing the last protected holder must be forbidden");
+    assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
+
+    // Still a holder — the guard runs before any mutation.
+    let can = saas
+        .authz()
+        .can(admin.id, &ws_domain, "documents", "write")
+        .await
+        .unwrap();
+    assert!(can, "admin must still be able to write documents");
+    let holders_after = saas
+        .authz()
+        .count_users_with_role(&ws_domain, "owner")
+        .await
+        .unwrap();
+    assert_eq!(holders_after, 1, "owner count must not have changed");
+}
+
+/// Simulates a `revoke_role` failure after `assign_role` succeeded.
+///
+/// Verifies the Stage 2d flip order (`assign` then `revoke`):
+/// - after the failure the user is over-permissioned (new role assigned,
+///   old role still grants rights in `casbin_rule`);
+/// - the `*_members` bookkeeping row for the old role was already deleted
+///   (the SQL `DELETE` inside `revoke_role` runs before `authz.revoke_role`);
+/// - a repeated `change_role` (with the failing engine no longer failing)
+///   recovers to a consistent state.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers(
+    pool: PgPool,
+) {
+    /// Wraps a real `CasbinAuthz` and fails `revoke_role` while the flag is
+    /// set. Other methods delegate to the inner engine.
+    struct FailingRevokeAuthz {
+        inner: Arc<CasbinAuthz>,
+        fail_revoke: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthorizationEngine for FailingRevokeAuthz {
+        async fn can(
+            &self,
+            user_id: Uuid,
+            domain: &str,
+            resource: &str,
+            action: &str,
+        ) -> Result<bool, AuthzError> {
+            self.inner.can(user_id, domain, resource, action).await
+        }
+
+        async fn require(
+            &self,
+            user_id: Uuid,
+            domain: &str,
+            resource: &str,
+            action: &str,
+        ) -> Result<(), AuthzError> {
+            self.inner.require(user_id, domain, resource, action).await
+        }
+
+        async fn grant_role(
+            &self,
+            user_id: Uuid,
+            domain: &str,
+            role_key: &str,
+            permissions: &[(String, String)],
+        ) -> Result<(), AuthzError> {
+            self.inner
+                .grant_role(user_id, domain, role_key, permissions)
+                .await
+        }
+
+        async fn revoke_role(
+            &self,
+            user_id: Uuid,
+            domain: &str,
+            role_key: &str,
+        ) -> Result<(), AuthzError> {
+            if self.fail_revoke.load(Ordering::SeqCst) {
+                return Err(AuthzError::Internal("simulated revoke failure".into()));
+            }
+            self.inner.revoke_role(user_id, domain, role_key).await
+        }
+
+        async fn has_role(
+            &self,
+            user_id: Uuid,
+            domain: &str,
+            role_key: &str,
+        ) -> Result<bool, AuthzError> {
+            self.inner.has_role(user_id, domain, role_key).await
+        }
+
+        async fn count_users_with_role(
+            &self,
+            domain: &str,
+            role_key: &str,
+        ) -> Result<i64, AuthzError> {
+            self.inner.count_users_with_role(domain, role_key).await
+        }
+
+        async fn purge_role(&self, domain: &str, role_key: &str) -> Result<u64, AuthzError> {
+            self.inner.purge_role(domain, role_key).await
+        }
+    }
+
+    let casbin = Arc::new(
+        CasbinAuthz::from_pool(pool.clone())
+            .await
+            .expect("casbin init"),
+    );
+    let fail_revoke = Arc::new(AtomicBool::new(false));
+    let failing = Arc::new(FailingRevokeAuthz {
+        inner: casbin.clone(),
+        fail_revoke: fail_revoke.clone(),
+    });
+    let ok_state = setup_with(&pool, casbin.clone() as Arc<dyn AuthorizationEngine>).await;
+    let failing_state = setup_with(&pool, failing as Arc<dyn AuthorizationEngine>).await;
+
+    // Setup through the working state.
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&ok_state, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant =
+        platform::provision_tenant(&ok_state, &admin, unique_name("Acme"), &admin, &owner_key)
+            .await
+            .unwrap();
+    let ws = tenant::create_workspace(
+        &ok_state,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let viewer_key = RoleKey::parse("viewer").unwrap();
+    saas_access::create_role(
+        &ok_state,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "write".to_string())],
+    )
+    .await
+    .unwrap();
+    saas_access::create_role(
+        &ok_state,
+        &admin,
+        &ws_domain,
+        &viewer_key,
+        "Viewer".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let user = make_user(&pool, "user").await;
+    saas_access::assign_role(&ok_state, &admin, user.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
+
+    // First attempt through the failing engine: `assign(viewer)` succeeds,
+    // `revoke(editor)` fails.
+    fail_revoke.store(true, Ordering::SeqCst);
+    let err = member::change_role(
+        &failing_state,
+        &admin,
+        MemberScope::Workspace(ws.id),
+        user.id,
+        &editor_key,
+        &viewer_key,
+    )
+    .await
+    .expect_err("simulated revoke failure must propagate");
+    assert!(matches!(err, CoreError::Internal(_)), "got {err:?}");
+    fail_revoke.store(false, Ordering::SeqCst);
+
+    // Over-permissioned: new role (viewer) grants read; old role (editor)
+    // still grants write because `authz.revoke_role` never ran.
+    let can_read = casbin
+        .can(user.id, &ws_domain, "documents", "read")
+        .await
+        .unwrap();
+    let can_write = casbin
+        .can(user.id, &ws_domain, "documents", "write")
+        .await
+        .unwrap();
+    assert!(can_read, "viewer rights must be granted");
+    assert!(
+        can_write,
+        "editor rights must still be granted after simulated revoke failure"
+    );
+
+    // Bookkeeping is already consistent with the *intended* end state for
+    // the new role but not for the old one: `*_members` shows `viewer` only.
+    let members = member::list(&ok_state, &admin, MemberScope::Workspace(ws.id))
+        .await
+        .unwrap();
+    let entry = members
+        .iter()
+        .find(|m| m.user_id == user.id)
+        .expect("user must be listed");
+    assert_eq!(
+        entry.roles,
+        vec!["viewer".to_string()],
+        "old role must already be removed from *_members (SQL before authz)"
+    );
+
+    // Recovery: repeat `change_role` with the working engine.
+    member::change_role(
+        &ok_state,
+        &admin,
+        MemberScope::Workspace(ws.id),
+        user.id,
+        &editor_key,
+        &viewer_key,
+    )
+    .await
+    .expect("retry must recover");
+
+    let can_write_after = casbin
+        .can(user.id, &ws_domain, "documents", "write")
+        .await
+        .unwrap();
+    let can_read_after = casbin
+        .can(user.id, &ws_domain, "documents", "read")
+        .await
+        .unwrap();
+    assert!(!can_write_after, "editor rights must be gone after retry");
+    assert!(can_read_after, "viewer rights must remain after retry");
+}
+
+/// `saas::access::delete_role` removes the role row, its `g`/`p` rows in
+/// `casbin_rule`, and its `*_members` bookkeeping rows.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn delete_role_purges_casbin_and_members(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let temp_key = RoleKey::parse("temp").unwrap();
+    let role = saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &temp_key,
+        "Temp".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let user = make_user(&pool, "user").await;
+    saas_access::assign_role(&saas, &admin, user.id, &ws_domain, &temp_key)
+        .await
+        .unwrap();
+
+    // Preconditions: role, g-row, p-row, *_members row are all present.
+    assert!(saas
+        .authz()
+        .has_role(user.id, &ws_domain, "temp")
+        .await
+        .unwrap());
+    let g_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype='g' and v1='temp' and v2=$1",
+    )
+    .bind(&ws_domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(g_rows, 1);
+    let p_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype='p' and v0='temp' and v1=$1",
+    )
+    .bind(&ws_domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(p_rows, 1);
+    let member_rows: i64 = sqlx::query_scalar(
+        "select count(*) from workspace_members where workspace_id=$1 and user_id=$2 and role='temp'",
+    )
+    .bind(ws.id)
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(member_rows, 1);
+
+    // Delete.
+    saas_access::delete_role(&saas, &admin, role.id)
+        .await
+        .expect("delete_role must succeed");
+
+    // Role row gone.
+    let role_row: Option<Uuid> = sqlx::query_scalar("select id from roles where id=$1")
+        .bind(role.id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(role_row.is_none(), "roles row must be gone");
+
+    // Casbin cleaned.
+    let g_after: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype='g' and v1='temp' and v2=$1",
+    )
+    .bind(&ws_domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(g_after, 0, "g-rows must be purged");
+    let p_after: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype='p' and v0='temp' and v1=$1",
+    )
+    .bind(&ws_domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(p_after, 0, "p-rows must be purged");
+
+    // Members cleaned.
+    let member_after: i64 = sqlx::query_scalar(
+        "select count(*) from workspace_members where workspace_id=$1 and user_id=$2 and role='temp'",
+    )
+    .bind(ws.id)
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(member_after, 0, "*_members rows must be cleaned");
+
+    // Effective permissions gone.
+    let can_read = saas
+        .authz()
+        .can(user.id, &ws_domain, "documents", "read")
+        .await
+        .unwrap();
+    assert!(!can_read, "temp role no longer grants documents:read");
 }

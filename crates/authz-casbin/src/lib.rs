@@ -4,6 +4,14 @@
 //! talks to Casbin directly. This crate does not know about business tables
 //! (`users`, `tenants`, `roles`, `permissions`) or specific roles
 //! (`owner`, `editor`); it only writes and reads `casbin_rule` rows.
+//!
+//! Stage 2d: the struct carries its own `PgPool` (shared with `saas`/`access`
+//! via [`CasbinAuthz::from_pool`]) so that `has_role`, `count_users_with_role`,
+//! and `purge_role` can query `casbin_rule` directly. `purge_role` is the only
+//! method that uses raw `DELETE` instead of `MgmtApi` (mass delete by
+//! `(role, domain)` is not expressible through `remove_filtered_grouping_policy`
+//! without an N+1 loop); the in-memory model is reloaded via `load_policy()`
+//! afterwards.
 
 use std::sync::Arc;
 
@@ -40,28 +48,33 @@ type SharedEnforcer = Arc<RwLock<Enforcer>>;
 #[derive(Clone)]
 pub struct CasbinAuthz {
     enforcer: SharedEnforcer,
+    pool: PgPool,
 }
 
 impl CasbinAuthz {
-    /// Production constructor: own pool to `database_url` (`pool_size = 8`).
+    /// Convenience constructor: opens its own `PgPool` and delegates to
+    /// [`CasbinAuthz::from_pool`].
+    ///
+    /// Prefer [`CasbinAuthz::from_pool`] when the consumer already holds a
+    /// `PgPool` (single connection pool per process — Stage 2d).
     pub async fn new(database_url: &str) -> Result<Self, AuthzError> {
-        let adapter = SqlxAdapter::new(database_url, 8)
+        let pool = PgPool::connect(database_url)
             .await
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
-        Self::from_adapter(adapter).await
+        Self::from_pool(pool).await
     }
 
-    /// Constructor over an existing pool. Consumers and tests that already
-    /// have a `PgPool` (for example `#[sqlx::test]` in `saas` integration
-    /// tests) use this.
+    /// Constructor over an existing pool. The same pool is used both by
+    /// `SqlxAdapter` (Casbin persistence) and by the raw-SQL helpers
+    /// (`has_role`, `count_users_with_role`, `purge_role`).
     pub async fn from_pool(pool: PgPool) -> Result<Self, AuthzError> {
-        let adapter = SqlxAdapter::new_with_pool(pool)
+        let adapter = SqlxAdapter::new_with_pool(pool.clone())
             .await
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
-        Self::from_adapter(adapter).await
+        Self::from_adapter(adapter, pool).await
     }
 
-    async fn from_adapter(adapter: SqlxAdapter) -> Result<Self, AuthzError> {
+    async fn from_adapter(adapter: SqlxAdapter, pool: PgPool) -> Result<Self, AuthzError> {
         let model = DefaultModel::from_str(MODEL)
             .await
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
@@ -73,6 +86,7 @@ impl CasbinAuthz {
 
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
+            pool,
         })
     }
 }
@@ -157,5 +171,70 @@ impl AuthorizationEngine for CasbinAuthz {
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
 
         Ok(())
+    }
+
+    async fn has_role(
+        &self,
+        user_id: Uuid,
+        domain: &str,
+        role_key: &str,
+    ) -> Result<bool, AuthzError> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            select exists(
+                select 1 from casbin_rule
+                where ptype = 'g' and v0 = $1 and v1 = $2 and v2 = $3
+            )
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(role_key)
+        .bind(domain)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AuthzError::Internal(e.to_string()))?;
+        Ok(exists)
+    }
+
+    async fn count_users_with_role(
+        &self,
+        domain: &str,
+        role_key: &str,
+    ) -> Result<i64, AuthzError> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            select count(distinct v0) from casbin_rule
+            where ptype = 'g' and v1 = $1 and v2 = $2
+            "#,
+        )
+        .bind(role_key)
+        .bind(domain)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AuthzError::Internal(e.to_string()))?;
+        Ok(count)
+    }
+
+    async fn purge_role(&self, domain: &str, role_key: &str) -> Result<u64, AuthzError> {
+        let result = sqlx::query(
+            r#"
+            delete from casbin_rule
+            where (ptype = 'g' and v1 = $1 and v2 = $2)
+               or (ptype = 'p' and v0 = $1 and v1 = $2)
+            "#,
+        )
+        .bind(role_key)
+        .bind(domain)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthzError::Internal(e.to_string()))?;
+
+        let mut enforcer = self.enforcer.write().await;
+        enforcer
+            .load_policy()
+            .await
+            .map_err(|e| AuthzError::Internal(e.to_string()))?;
+
+        Ok(result.rows_affected())
     }
 }
