@@ -3,6 +3,12 @@
 //!
 //! Every server function delegates to `saas::invitation::*`; errors go
 //! through `crate::error::core_error_to_server_fn` (HTTP 400/401/403/404/500).
+//!
+//! Stage 3a: on `InvitationAcceptPage`, when the visitor is anonymous, the
+//! page calls `set_return_url("/invitations/{token}")`. The `return_url`
+//! cookie is then consumed by `pages::auth::{LoginPage, RegisterPage}` after
+//! a successful sign-in, so an anonymous user returning from the login page
+//! lands back on the invitation accept page and can finish the flow.
 
 use domain::{Invitation, InvitationTarget};
 use leptos::prelude::*;
@@ -10,6 +16,8 @@ use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params};
 use leptos_router::params::Params;
 use uuid::Uuid;
+
+use crate::auth::set_return_url;
 
 // ─── Server functions ───────────────────────────────────────────────────────
 
@@ -355,6 +363,23 @@ pub fn InvitationAcceptPage() -> impl IntoView {
                 Ok(email) => user_email.set(Some(email)),
                 Err(e) => error.set(Some(e.to_string())),
             }
+        });
+    });
+
+    // Stage 3a: if the visitor is anonymous, remember this page in the
+    // `return_url` cookie, so `pages::auth::{LoginPage, RegisterPage}` can
+    // redirect here after a successful sign-in. Idempotent: fire only once,
+    // and only when `who_am_i()` has resolved to `Some(None)`.
+    let return_url_set = RwSignal::new(false);
+    Effect::new(move |_| {
+        let Some(tok) = token() else { return };
+        let Some(user) = user_email.get() else { return };
+        if user.is_some() || return_url_set.get_untracked() {
+            return;
+        }
+        return_url_set.set(true);
+        spawn_local(async move {
+            let _ = set_return_url(format!("/invitations/{tok}")).await;
         });
     });
 

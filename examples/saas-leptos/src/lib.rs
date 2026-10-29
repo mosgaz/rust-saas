@@ -52,6 +52,10 @@ pub fn App() -> impl IntoView {
                         path=path!("/tenants/:tenant_id/roles")
                         view=pages::role::TenantRoleListPage
                     />
+                    <Route
+                        path=path!("/tenants/:tenant_id/roles/:role_id")
+                        view=pages::role::TenantRoleFormPage
+                    />
 
                     <Route path=path!("/workspaces") view=pages::workspace::WorkspaceListPage />
                     <Route
@@ -73,6 +77,10 @@ pub fn App() -> impl IntoView {
                     <Route
                         path=path!("/workspaces/:workspace_id/roles")
                         view=pages::role::WorkspaceRoleListPage
+                    />
+                    <Route
+                        path=path!("/workspaces/:workspace_id/roles/:role_id")
+                        view=pages::role::WorkspaceRoleFormPage
                     />
 
                     <Route
