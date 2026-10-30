@@ -3,6 +3,15 @@
 //! `#[sqlx::test]` creates an isolated database per test, applies
 //! `crates/db/migrations` (including `casbin_rule`, `roles`, `permissions`,
 //! and `invitations`), and drops it afterwards.
+//!
+//! Stage 3c adds the "Addressed invitations" section at the bottom
+//! (`accept_addressed_invitation_*`): `saas::invitation::accept_invitation`
+//! rejects an unverified actor for `invitation.email IS NOT NULL`
+//! (`CoreError::EmailNotVerified`, verified-first), then rejects a verified
+//! actor whose address does not match the invitation address
+//! case-insensitively (`CoreError::Forbidden`). Link invitations
+//! (`email IS NULL`) keep the Stage 2a behaviour and are covered by the
+//! existing `accept_link_invitation_unverified_still_works` regression test.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -41,13 +50,39 @@ async fn setup(pool: &PgPool) -> SaasState {
     setup_with(pool, casbin as Arc<dyn AuthorizationEngine>).await
 }
 
-/// Creates a user with a random email and a known password.
+/// Creates a user with a random email and a known password (unverified).
 async fn make_user(pool: &PgPool, label: &str) -> AuthUser {
     let email = format!("{label}-{}@test.local", Uuid::new_v4());
     let hash = authn::hash_password("Password123!").expect("hash");
     identity::create_user(pool, &email, &hash)
         .await
         .expect("user must be created")
+}
+
+/// Creates a user with an explicit `email`; `verified` controls
+/// `users.email_verified_at`. Used by Stage 3c addressed-invitation tests,
+/// where the exact address matters (addressed invitation target) and the
+/// verified flag controls the `EmailNotVerified` branch.
+async fn make_user_with_email(pool: &PgPool, email: &str, verified: bool) -> AuthUser {
+    let hash = authn::hash_password("Password123!").expect("hash");
+    let user = identity::create_user(pool, email, &hash)
+        .await
+        .expect("user must be created");
+    if verified {
+        sqlx::query(
+            "update users set email_verified_at = coalesce(email_verified_at, now()) where id = $1",
+        )
+        .bind(user.id)
+        .execute(pool)
+        .await
+        .expect("mark verified");
+        identity::find_by_id(pool, user.id)
+            .await
+            .expect("read verified user")
+            .expect("user must exist")
+    } else {
+        user
+    }
 }
 
 /// Grants `platform` owner to the given user.
@@ -1552,4 +1587,268 @@ async fn delete_role_purges_casbin_and_members(pool: PgPool) {
         .await
         .unwrap();
     assert!(!can_read, "temp role no longer grants documents:read");
+}
+
+// ─── Stage 3c: addressed invitations ────────────────────────────────────────
+
+/// Helper: provisions a tenant with an explicit owner, returns
+/// `(tenant_id, owner)`. Uses `make_user` for the platform admin and the
+/// owner; the caller creates the invitee.
+async fn provision_tenant_for_invitation(pool: &PgPool, saas: &SaasState) -> (Uuid, AuthUser) {
+    let admin = make_user(pool, "admin").await;
+    grant_platform_admin(saas, &admin).await;
+    let owner = make_user(pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(saas, &admin, unique_name("Acme"), &owner, &owner_key)
+        .await
+        .expect("provision_tenant");
+    (tenant.id, owner)
+}
+
+/// Addressed invitation: verified actor whose email matches (exact) →
+/// accept succeeds; `*_members` and `casbin_rule` reflect the role.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn accept_addressed_invitation_verified_match_grants_role(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    let invitee_email = format!("invitee-{}@test.local", Uuid::new_v4());
+    let invitee = make_user_with_email(&pool, &invitee_email, true).await;
+
+    let (_, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        Some(invitee_email.clone()),
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .expect("create addressed invitation");
+
+    invitation::accept_invitation(&saas, &invitee, &token)
+        .await
+        .expect("verified actor with matching email must accept");
+
+    let role: Option<String> =
+        sqlx::query_scalar("select role from tenant_members where tenant_id = $1 and user_id = $2")
+            .bind(tenant_id)
+            .bind(invitee.id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(role.as_deref(), Some("owner"));
+
+    let can = saas
+        .authz()
+        .can(
+            invitee.id,
+            &domain::tenant_domain(tenant_id),
+            "workspaces",
+            "create",
+        )
+        .await
+        .unwrap();
+    assert!(can, "accepted owner must be able to create workspaces");
+}
+
+/// Addressed invitation: unverified actor whose email matches →
+/// `EmailNotVerified`. No mutation (`used_count`, `*_members`, `casbin_rule`
+/// untouched).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn accept_addressed_invitation_unverified_returns_email_not_verified(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    let invitee_email = format!("invitee-{}@test.local", Uuid::new_v4());
+    let invitee = make_user_with_email(&pool, &invitee_email, false).await;
+
+    let (inv, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        Some(invitee_email.clone()),
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    let err = invitation::accept_invitation(&saas, &invitee, &token)
+        .await
+        .expect_err("unverified actor must be rejected");
+    assert!(matches!(err, CoreError::EmailNotVerified), "got {err:?}");
+
+    let used: i32 = sqlx::query_scalar("select used_count from invitations where id = $1")
+        .bind(inv.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(used, 0, "rejected accept must not consume a use");
+
+    let members: i64 = sqlx::query_scalar(
+        "select count(*) from tenant_members where tenant_id = $1 and user_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(invitee.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(members, 0, "rejected accept must not write *_members");
+
+    let granted = saas
+        .authz()
+        .has_role(invitee.id, &domain::tenant_domain(tenant_id), "owner")
+        .await
+        .unwrap();
+    assert!(!granted, "rejected accept must not grant casbin role");
+}
+
+/// Addressed invitation: unverified actor whose email does **not** match →
+/// `EmailNotVerified` (verified-first: unverified-ness is reported before
+/// mismatch).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn accept_addressed_invitation_unverified_mismatch_returns_email_not_verified(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    let addressee_email = format!("addressee-{}@test.local", Uuid::new_v4());
+    let wrong_email = format!("wrong-{}@test.local", Uuid::new_v4());
+    let unverified = make_user_with_email(&pool, &wrong_email, false).await;
+
+    let (_, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        Some(addressee_email),
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    let err = invitation::accept_invitation(&saas, &unverified, &token)
+        .await
+        .expect_err("unverified actor must be rejected");
+    assert!(
+        matches!(err, CoreError::EmailNotVerified),
+        "verified-first: unverified-ness wins over mismatch; got {err:?}"
+    );
+}
+
+/// Addressed invitation: verified actor whose email does **not** match →
+/// `Forbidden`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn accept_addressed_invitation_verified_mismatch_returns_forbidden(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    let addressee_email = format!("addressee-{}@test.local", Uuid::new_v4());
+    let wrong_email = format!("wrong-{}@test.local", Uuid::new_v4());
+    let verified_wrong = make_user_with_email(&pool, &wrong_email, true).await;
+
+    let (inv, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        Some(addressee_email),
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    let err = invitation::accept_invitation(&saas, &verified_wrong, &token)
+        .await
+        .expect_err("verified actor with mismatched email must be rejected");
+    assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
+
+    let used: i32 = sqlx::query_scalar("select used_count from invitations where id = $1")
+        .bind(inv.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(used, 0, "rejected accept must not consume a use");
+}
+
+/// Addressed invitation: case-insensitive match — invitation addressed to
+/// `Foo@Example.TEST`, actor registered as `foo@example.test` (lowercase)
+/// and verified → accept succeeds.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn accept_addressed_invitation_case_insensitive_match(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    let tag = Uuid::new_v4();
+    let user_email_lower = format!("user-{tag}@example.test");
+    let invite_email_mixed = format!("User-{tag}@Example.TEST");
+    let invitee = make_user_with_email(&pool, &user_email_lower, true).await;
+
+    let (_, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        Some(invite_email_mixed),
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    invitation::accept_invitation(&saas, &invitee, &token)
+        .await
+        .expect("case-insensitive match must accept");
+
+    let role: Option<String> =
+        sqlx::query_scalar("select role from tenant_members where tenant_id = $1 and user_id = $2")
+            .bind(tenant_id)
+            .bind(invitee.id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(role.as_deref(), Some("owner"));
+}
+
+/// Regression (Stage 2a behaviour preserved for links): a link invitation
+/// (`email IS NULL`) can be accepted by an unverified actor.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn accept_link_invitation_unverified_still_works(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    let unverified = make_user(&pool, "unverified").await;
+    assert!(
+        !unverified.email_verified,
+        "make_user returns an unverified user"
+    );
+
+    let (_, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        None,
+        "owner".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("create link invitation");
+
+    invitation::accept_invitation(&saas, &unverified, &token)
+        .await
+        .expect("link invitations must not require email verification");
+
+    let role: Option<String> =
+        sqlx::query_scalar("select role from tenant_members where tenant_id = $1 and user_id = $2")
+            .bind(tenant_id)
+            .bind(unverified.id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(role.as_deref(), Some("owner"));
 }
