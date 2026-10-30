@@ -7,14 +7,18 @@ description = "Role and permission ownership: permissions, roles, role_permissio
 [dependencies]
 domain = { path = "../domain", features = ["ssr"] }
 authz = { path = "../authz" }
+audit = { path = "../audit" }
 
 sqlx.workspace = true
 uuid.workspace = true
 serde.workspace = true
+serde_json = "1"
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 sqlx = { workspace = true, features = ["macros"] }
+audit-pg = { path = "../audit-pg" }

@@ -2,21 +2,28 @@
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
 //! `crates/db/migrations` (including `casbin_rule`, `roles`, `permissions`,
-//! and `invitations`), and drops it afterwards.
+//! `invitations`, and `audit_log`), and drops it afterwards.
 //!
-//! Stage 3c adds the "Addressed invitations" section at the bottom
-//! (`accept_addressed_invitation_*`): `saas::invitation::accept_invitation`
-//! rejects an unverified actor for `invitation.email IS NOT NULL`
-//! (`CoreError::EmailNotVerified`, verified-first), then rejects a verified
-//! actor whose address does not match the invitation address
-//! case-insensitively (`CoreError::Forbidden`). Link invitations
-//! (`email IS NULL`) keep the Stage 2a behaviour and are covered by the
-//! existing `accept_link_invitation_unverified_still_works` regression test.
+//! Stage 3c adds the "Addressed invitations" section (`accept_addressed_invitation_*`):
+//! `saas::invitation::accept_invitation` rejects an unverified actor for
+//! `invitation.email IS NOT NULL` (`CoreError::EmailNotVerified`,
+//! verified-first), then rejects a verified actor whose address does not
+//! match the invitation address case-insensitively
+//! (`CoreError::Forbidden`). Link invitations (`email IS NULL`) keep the
+//! Stage 2a behaviour and are covered by
+//! `accept_link_invitation_unverified_still_works`.
+//!
+//! Stage 3e adds the "Audit emission" section at the bottom: it wires a
+//! real `PgAuditLogger` into `SaasState` via `with_audit` and asserts that
+//! the expected `audit_log` rows appear for `provision_tenant`,
+//! `create_workspace`, the invitation lifecycle, and `change_role`
+//! (three events: assigned + revoked + changed).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use access::{AccessState, RoleKey};
+use audit_pg::PgAuditLogger;
 use authz::{AuthorizationEngine, AuthzError};
 use authz_casbin::CasbinAuthz;
 use domain::{AuthUser, InvitationTarget};
@@ -41,6 +48,7 @@ async fn setup_with(pool: &PgPool, authz: Arc<dyn AuthorizationEngine>) -> SaasS
 }
 
 /// Builds a `CasbinAuthz` + `AccessState` + `SaasState` sharing the test pool.
+/// Audit stays at the `NoopAuditLogger` default.
 async fn setup(pool: &PgPool) -> SaasState {
     let casbin = Arc::new(
         CasbinAuthz::from_pool(pool.clone())
@@ -48,6 +56,30 @@ async fn setup(pool: &PgPool) -> SaasState {
             .expect("casbin init"),
     );
     setup_with(pool, casbin as Arc<dyn AuthorizationEngine>).await
+}
+
+/// Builds a `CasbinAuthz` + `AccessState` + `SaasState` sharing the test
+/// pool, with a real `PgAuditLogger` plugged into every layer (Stage 3e):
+/// - `AccessState::with_audit` — so `access::create_role` /
+///   `access::update_role` write to `audit_log`.
+/// - `SaasBuilder::with_audit` — so `saas::*` writes there too.
+async fn setup_with_audit(pool: &PgPool) -> SaasState {
+    let casbin = Arc::new(
+        CasbinAuthz::from_pool(pool.clone())
+            .await
+            .expect("casbin init"),
+    );
+    let audit = Arc::new(PgAuditLogger::from_pool(pool.clone())) as Arc<dyn audit::AuditLogger>;
+    let access = Arc::new(
+        AccessState::new(pool.clone(), casbin.clone() as Arc<dyn AuthorizationEngine>)
+            .with_audit(audit.clone()),
+    );
+    SaasBuilder::new(pool.clone())
+        .with_authz(casbin as Arc<dyn AuthorizationEngine>)
+        .with_access(access)
+        .with_audit(audit)
+        .build()
+        .expect("saas builder")
 }
 
 /// Creates a user with a random email and a known password (unverified).
@@ -1851,4 +1883,350 @@ async fn accept_link_invitation_unverified_still_works(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(role.as_deref(), Some("owner"));
+}
+
+// ─── Stage 3e: audit emission ───────────────────────────────────────────────
+
+/// Fetches `(event_type, actor_id, actor_email, target_type, target_id,
+/// metadata)` for every row in `audit_log`, in insertion order.
+async fn audit_rows(
+    pool: &PgPool,
+) -> Vec<(
+    String,
+    Option<Uuid>,
+    Option<String>,
+    Option<String>,
+    Option<Uuid>,
+    serde_json::Value,
+)> {
+    sqlx::query_as(
+        r#"
+        select event_type, actor_id, actor_email, target_type, target_id, metadata
+        from audit_log
+        order by occurred_at asc, id asc
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .expect("audit_log query must succeed")
+}
+
+/// `provision_tenant` emits one `tenant.created` row with `actor = admin`,
+/// `target_id = tenant.id`, and `metadata.owner_id = owner.id` (the
+/// provisioning owner, not the actor — that distinction is what makes the
+/// row useful for "who got the tenant vs who created it").
+#[sqlx::test(migrations = "../db/migrations")]
+async fn provision_tenant_emits_tenant_created(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner = make_user(&pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+
+    let tenant = platform::provision_tenant(
+        &saas,
+        &admin,
+        unique_name("AuditAcme"),
+        &owner,
+        &owner_key,
+    )
+    .await
+    .expect("provision_tenant must succeed");
+
+    let rows = audit_rows(&pool).await;
+    let created: Vec<_> = rows
+        .iter()
+        .filter(|(et, ..)| et == "tenant.created")
+        .collect();
+    assert_eq!(created.len(), 1, "exactly one tenant.created");
+
+    let (_, actor_id, actor_email, target_type, target_id, metadata) = created[0];
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(actor_email.as_deref(), Some(admin.email.as_str()));
+    assert_eq!(target_type.as_deref(), Some("tenant"));
+    assert_eq!(*target_id, Some(tenant.id));
+    assert_eq!(metadata["owner_id"], owner.id.to_string());
+    assert_eq!(metadata["owner_role_key"], "owner");
+}
+
+/// `create_workspace` emits one `workspace.created` row with the actor and
+/// the tenant id in metadata.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_workspace_emits_workspace_created(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(
+        &saas,
+        &admin,
+        unique_name("AuditAcme"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("AuditEng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .expect("create_workspace must succeed");
+
+    let rows = audit_rows(&pool).await;
+    let created: Vec<_> = rows
+        .iter()
+        .filter(|(et, ..)| et == "workspace.created")
+        .collect();
+    assert_eq!(created.len(), 1, "exactly one workspace.created");
+
+    let (_, actor_id, actor_email, target_type, target_id, metadata) = created[0];
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(actor_email.as_deref(), Some(admin.email.as_str()));
+    assert_eq!(target_type.as_deref(), Some("workspace"));
+    assert_eq!(*target_id, Some(ws.id));
+    assert_eq!(metadata["tenant_id"], tenant.id.to_string());
+    assert_eq!(metadata["owner_id"], admin.id.to_string());
+}
+
+/// The invitation lifecycle emits `invitation.created` and
+/// `invitation.accepted` (and `invitation.revoked` when revoked) with the
+/// expected actor / target / metadata.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn invitation_lifecycle_emits_created_accepted(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner = make_user(&pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+
+    let tenant = platform::provision_tenant(
+        &saas,
+        &admin,
+        unique_name("AuditAcme"),
+        &owner,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let (inv, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant.id),
+        None,
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .expect("create_invitation");
+
+    // A separate actor accepts the invitation so actor_id differs from
+    // the creator's actor_id in the audit trail.
+    let invitee = make_user(&pool, "invitee").await;
+    invitation::accept_invitation(&saas, &invitee, &token)
+        .await
+        .expect("accept_invitation");
+
+    // And revoke a second invitation to exercise invitation.revoked.
+    let (inv2, _) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant.id),
+        None,
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+    invitation::revoke_invitation(&saas, &owner, InvitationTarget::Tenant(tenant.id), inv2.id)
+        .await
+        .expect("revoke_invitation");
+
+    let rows = audit_rows(&pool).await;
+
+    // invitation.created × 2, invitation.accepted × 1, invitation.revoked × 1.
+    let created: Vec<_> = rows
+        .iter()
+        .filter(|(et, ..)| et == "invitation.created")
+        .collect();
+    let accepted: Vec<_> = rows
+        .iter()
+        .filter(|(et, ..)| et == "invitation.accepted")
+        .collect();
+    let revoked: Vec<_> = rows
+        .iter()
+        .filter(|(et, ..)| et == "invitation.revoked")
+        .collect();
+    assert_eq!(created.len(), 2, "two invitation.created");
+    assert_eq!(accepted.len(), 1, "one invitation.accepted");
+    assert_eq!(revoked.len(), 1, "one invitation.revoked");
+
+    // created: actor = owner, target = the invitation, metadata.role.
+    for row in &created {
+        let (_, actor_id, actor_email, target_type, _, metadata) = row;
+        assert_eq!(*actor_id, Some(owner.id));
+        assert_eq!(actor_email.as_deref(), Some(owner.email.as_str()));
+        assert_eq!(target_type.as_deref(), Some("invitation"));
+        assert_eq!(metadata["role"], "owner");
+        assert_eq!(metadata["email"], serde_json::Value::Null);
+        assert_eq!(
+            metadata["target"],
+            domain::tenant_domain(tenant.id).as_str()
+        );
+    }
+
+    // accepted: actor = invitee, target = the first invitation.
+    let (_, actor_id, actor_email, target_type, target_id, metadata) = accepted[0];
+    assert_eq!(*actor_id, Some(invitee.id));
+    assert_eq!(actor_email.as_deref(), Some(invitee.email.as_str()));
+    assert_eq!(target_type.as_deref(), Some("invitation"));
+    assert_eq!(*target_id, Some(inv.id));
+    assert_eq!(metadata["role"], "owner");
+
+    // revoked: actor = owner, target = the second invitation.
+    let (_, actor_id, _, target_type, target_id, _) = revoked[0];
+    assert_eq!(*actor_id, Some(owner.id));
+    assert_eq!(target_type.as_deref(), Some("invitation"));
+    assert_eq!(*target_id, Some(inv2.id));
+}
+
+/// `change_role` is composable: three audit rows for one call —
+/// `member.role_assigned` (from `assign_role`), `member.role_revoked`
+/// (from `revoke_role`), and `member.role_changed` (from `change_role`
+/// itself). All three target the same user; `role_changed` carries
+/// `{scope, from_role, to_role}` in metadata.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn change_role_emits_three_events(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(
+        &saas,
+        &admin,
+        unique_name("AuditAcme"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("AuditEng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let editor_key = RoleKey::parse("editor").unwrap();
+    let viewer_key = RoleKey::parse("viewer").unwrap();
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "write".to_string())],
+    )
+    .await
+    .unwrap();
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &viewer_key,
+        "Viewer".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let user = make_user(&pool, "user").await;
+    saas_access::assign_role(&saas, &admin, user.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
+
+    // Snapshot the audit count just before `change_role` so we only inspect
+    // rows produced by this call.
+    let before: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    member::change_role(
+        &saas,
+        &admin,
+        MemberScope::Workspace(ws.id),
+        user.id,
+        &editor_key,
+        &viewer_key,
+    )
+    .await
+    .expect("change_role must succeed");
+
+    let rows: Vec<(String, Option<Uuid>, Option<String>, Option<String>, Option<Uuid>, serde_json::Value)> =
+        sqlx::query_as(
+            r#"
+            select event_type, actor_id, actor_email, target_type, target_id, metadata
+            from audit_log
+            order by occurred_at asc, id asc
+            offset $1
+            "#,
+        )
+        .bind(before)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        3,
+        "change_role must emit exactly 3 audit rows"
+    );
+
+    // 1. member.role_assigned (from assign_role) — target user, role_key = new.
+    let (et, actor_id, actor_email, target_type, target_id, metadata) = &rows[0];
+    assert_eq!(et, "member.role_assigned");
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(actor_email.as_deref(), Some(admin.email.as_str()));
+    assert_eq!(target_type.as_deref(), Some("user"));
+    assert_eq!(*target_id, Some(user.id));
+    assert_eq!(metadata["domain"], ws_domain.as_str());
+    assert_eq!(metadata["role_key"], "viewer");
+
+    // 2. member.role_revoked (from revoke_role) — target user, role_key = old.
+    let (et, actor_id, _, target_type, target_id, metadata) = &rows[1];
+    assert_eq!(et, "member.role_revoked");
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(target_type.as_deref(), Some("user"));
+    assert_eq!(*target_id, Some(user.id));
+    assert_eq!(metadata["domain"], ws_domain.as_str());
+    assert_eq!(metadata["role_key"], "editor");
+
+    // 3. member.role_changed (from change_role itself) — target user,
+    //    metadata {scope, from_role, to_role}.
+    let (et, actor_id, _, target_type, target_id, metadata) = &rows[2];
+    assert_eq!(et, "member.role_changed");
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(target_type.as_deref(), Some("user"));
+    assert_eq!(*target_id, Some(user.id));
+    assert_eq!(metadata["scope"], ws_domain.as_str());
+    assert_eq!(metadata["from_role"], "editor");
+    assert_eq!(metadata["to_role"], "viewer");
 }

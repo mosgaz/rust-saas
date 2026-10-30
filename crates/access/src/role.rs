@@ -13,7 +13,20 @@
 //! `roles.key` is immutable: `update_role` never changes it. Renaming is
 //! `delete_role` + `create_role` (a new row). This keeps `casbin_rule`
 //! `g(user, key, domain)` valid forever.
+//!
+//! **Stage 3e (ADR-0004, decision A):** `create_role` emits
+//! `role.created`; `update_role` emits `role.updated`. Both run **after**
+//! the DB transaction commits, in a separate transaction, via
+//! [`AccessState::audit_or_warn`] (failure → `tracing::warn!`).
+//!
+//! `delete_role` (this function) does **not** emit `role.deleted`: it
+//! deletes only the `roles` row, leaving orphan `casbin_rule` and
+//! `*_members` rows (documented behaviour, Stage 2d). The canonical
+//! `role.deleted` emission lives in `saas::access::delete_role` — the
+//! 6-step cleanup path used by the UI (`saas::access::delete_role` calls
+//! `access::delete_role_by_id`, which is also audit-silent).
 
+use audit::{events, AuditEvent};
 use domain::AuthUser;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -54,6 +67,8 @@ impl RoleRow {
 /// 3. `INSERT role_permissions` for each `(resource, action)`; a missing
 ///    `(resource, action)` in `permissions` yields
 ///    [`AccessError::PermissionNotFound`].
+/// 4. Commit; emit `role.created` (Stage 3e; best-effort, `warn!` on
+///    failure).
 ///
 /// `key` must be a valid [`RoleKey`].
 pub async fn create_role(
@@ -92,6 +107,21 @@ pub async fn create_role(
 
     let permissions = get_permissions_for_role_id(state.pool(), id).await?;
 
+    state
+        .audit_or_warn(AuditEvent {
+            event_type: events::ROLE_CREATED.into(),
+            actor_id: Some(actor.id),
+            actor_email: Some(actor.email.clone()),
+            target_type: Some("role".into()),
+            target_id: Some(id),
+            metadata: serde_json::json!({
+                "domain": domain,
+                "key": key.as_str(),
+                "name": name,
+            }),
+        })
+        .await;
+
     Ok(Role {
         id,
         domain: domain.to_string(),
@@ -112,6 +142,7 @@ pub async fn create_role(
 /// 3. Reject `protected=true` ([`AccessError::Protected`]) and
 ///    `immutable=true` ([`AccessError::Immutable`]).
 /// 4. `UPDATE roles` + replace `role_permissions` in one transaction.
+/// 5. Commit; emit `role.updated` (Stage 3e).
 pub async fn update_role(
     state: &AccessState,
     actor: &AuthUser,
@@ -154,6 +185,21 @@ pub async fn update_role(
 
     let permissions = get_permissions_for_role_id(state.pool(), role_id).await?;
 
+    state
+        .audit_or_warn(AuditEvent {
+            event_type: events::ROLE_UPDATED.into(),
+            actor_id: Some(actor.id),
+            actor_email: Some(actor.email.clone()),
+            target_type: Some("role".into()),
+            target_id: Some(role_id),
+            metadata: serde_json::json!({
+                "domain": role.domain,
+                "key": role.key.as_str(),
+                "name": name,
+            }),
+        })
+        .await;
+
     Ok(Role {
         id: role.id,
         domain: role.domain,
@@ -179,6 +225,12 @@ pub async fn update_role(
 /// handles their cleanup via [`crate::delete_role_by_id`] +
 /// `authz.purge_role` + `DELETE *_members` (Stage 2d). Consumers that call
 /// this function directly are responsible for that cleanup themselves.
+///
+/// **Stage 3e (decision A):** this function does **not** emit
+/// `role.deleted`. The canonical emission point is
+/// `saas::access::delete_role` — the 6-step cleanup path. Auditing here
+/// would report a "delete" that leaves orphan `casbin_rule` and
+/// `*_members` rows — misleading.
 pub async fn delete_role(
     state: &AccessState,
     actor: &AuthUser,
@@ -310,6 +362,9 @@ pub async fn get_role_by_id(
 /// `saas::access::delete_role` after its own `require`, `protected` check,
 /// `authz.purge_role`, and `DELETE *_members`. Idempotent: deleting a
 /// missing row is a no-op (`Ok(())`), so the caller's sequence is retry-safe.
+///
+/// Audit-silent — the caller (`saas::access::delete_role`) emits
+/// `role.deleted` (Stage 3e, decision A).
 pub async fn delete_role_by_id(state: &AccessState, role_id: Uuid) -> Result<(), AccessError> {
     sqlx::query("delete from roles where id = $1")
         .bind(role_id)
@@ -328,6 +383,10 @@ pub async fn delete_role_by_id(state: &AccessState, role_id: Uuid) -> Result<(),
 /// Idempotent: concurrent callers on the same `domain` are serialized by
 /// `INSERT ... ON CONFLICT (domain, key) DO NOTHING RETURNING id`; only the
 /// winning insert copies permissions. The loser re-selects the existing row.
+///
+/// Audit-silent: `role.created` for the owner is not emitted (the event is
+/// reserved for user-facing role creation; owner is a provisioning side
+/// effect). See ADR-0004 §2.5.
 pub async fn create_owner_role(state: &AccessState, domain: &str) -> Result<Role, AccessError> {
     let key = RoleKey::parse("owner")?;
 

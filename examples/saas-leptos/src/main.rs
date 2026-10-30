@@ -2,6 +2,10 @@
 use std::sync::Arc;
 
 #[cfg(feature = "ssr")]
+use audit::AuditLogger;
+#[cfg(feature = "ssr")]
+use audit_pg::PgAuditLogger;
+#[cfg(feature = "ssr")]
 use authz::AuthorizationEngine;
 #[cfg(feature = "ssr")]
 use axum::Router;
@@ -67,19 +71,29 @@ async fn main() -> anyhow::Result<()> {
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
 
-    let access = Arc::new(access::AccessState::new(pool.clone(), authz.clone()));
+    // Stage 3e: real audit logger. Shared by `AccessState`, `Authn`, and
+    // `SaasState` — one pool, one logger, one `audit_log` table.
+    let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
-    let authn = Arc::new(authn::Authn::with_ttl(
-        pool.clone(),
-        jwt_secret,
-        chrono::Duration::minutes(access_ttl_minutes),
-        chrono::Duration::days(refresh_ttl_days),
-    ));
+    let access = Arc::new(
+        access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
+    );
+
+    let authn = Arc::new(
+        authn::Authn::with_ttl(
+            pool.clone(),
+            jwt_secret,
+            chrono::Duration::minutes(access_ttl_minutes),
+            chrono::Duration::days(refresh_ttl_days),
+        )
+        .with_audit(audit.clone()),
+    );
 
     let saas = Arc::new(
         saas::SaasBuilder::new(pool)
             .with_authz(authz)
             .with_access(access)
+            .with_audit(audit)
             .build()?,
     );
 
@@ -122,13 +136,8 @@ async fn main() -> anyhow::Result<()> {
 
     let routes = generate_route_list(saas_leptos::App);
 
-    // TODO(Stage 3): auth-scoping ADR — formalize which routes require auth
-    // (see handoff §16). This split is the pragmatic boundary: SSR pages and
-    // Leptos `_server/*` handlers go through `auto_refresh`; static files and
-    // the 404 fallback do not. Open policy questions (does `_server/*` always
-    // require auth? how are public `#[server]` functions like `login` /
-    // `register` handled at this layer? should 404 fail-open or fail-closed?)
-    // are deferred to that ADR.
+    // Auth-scoping (ADR-0002): SSR pages and Leptos `_server/*` handlers go
+    // through `auto_refresh`; static files and the 404 fallback do not.
     let protected: Router<saas_leptos::state::AppState> = Router::new()
         .leptos_routes_with_context(
             &app_state,

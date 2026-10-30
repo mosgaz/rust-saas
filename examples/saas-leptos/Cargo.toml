@@ -16,6 +16,8 @@ identity = { path = "../../crates/identity", optional = true }
 authn = { path = "../../crates/authn", optional = true }
 saas = { path = "../../crates/saas", optional = true }
 db = { path = "../../crates/db", optional = true }
+audit = { path = "../../crates/audit", optional = true }
+audit-pg = { path = "../../crates/audit-pg", optional = true }
 
 leptos = { version = "0.8" }
 leptos_meta = { version = "0.8" }
@@ -67,6 +69,8 @@ ssr = [
     "dep:authn",
     "dep:saas",
     "dep:db",
+    "dep:audit",
+    "dep:audit-pg",
     "dep:axum",
     "dep:axum-extra",
     "dep:tokio",

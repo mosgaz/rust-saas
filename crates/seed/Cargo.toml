@@ -17,6 +17,8 @@ identity = { path = "../identity" }
 db = { path = "../db" }
 domain = { path = "../domain" }
 saas = { path = "../saas" }
+audit = { path = "../audit" }
+audit-pg = { path = "../audit-pg" }
 
 sqlx.workspace = true
 tokio.workspace = true

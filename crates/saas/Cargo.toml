@@ -9,11 +9,14 @@ authz = { path = "../authz" }
 access = { path = "../access" }
 domain = { path = "../domain", features = ["ssr"] }
 identity = { path = "../identity" }
+audit = { path = "../audit" }
 
 sqlx.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+serde_json = "1"
+tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
@@ -21,6 +24,7 @@ tokio.workspace = true
 chrono.workspace = true
 authz-casbin = { path = "../authz-casbin" }
 authn = { path = "../authn" }
+audit-pg = { path = "../audit-pg" }
 # `macros` enables `#[sqlx::test]`; the macro reads `.env` on its own via the
 # built-in `dotenvy` in `sqlx-macros`.
 sqlx = { workspace = true, features = ["macros"] }
