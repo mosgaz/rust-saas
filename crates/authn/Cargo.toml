@@ -7,6 +7,7 @@ description = "Authentication: Argon2, JWT access tokens, opaque refresh tokens 
 [dependencies]
 identity = { path = "../identity" }
 domain = { path = "../domain" }
+audit = { path = "../audit" }
 
 sqlx.workspace = true
 argon2.workspace = true
@@ -16,6 +17,7 @@ serde_json = "1"
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 # SHA-256 for `refresh_tokens.token_hash` (Stage 2b). Not used for passwords
 # (passwords are Argon2, see `hash_password`).
 sha2.workspace = true
@@ -25,3 +27,4 @@ tokio.workspace = true
 # `macros` enables `#[sqlx::test]`; the macro reads `.env` on its own via the
 # built-in `dotenvy` in `sqlx-macros`, so no separate feature is needed.
 sqlx = { workspace = true, features = ["macros"] }
+audit-pg = { path = "../audit-pg" }

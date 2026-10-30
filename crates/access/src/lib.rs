@@ -1,4 +1,5 @@
-//! Access-control crate (ADR-0001, Stage 2e; Stage 2d cleanup helpers).
+//! Access-control crate (ADR-0001, Stage 2e; Stage 2d cleanup helpers;
+//! Stage 3e audit).
 //!
 //! Sole owner of `permissions`, `roles`, and `role_permissions`. DTOs
 //! (`Role`, `Permission`, `RoleKey`), `AccessState`, `AccessError`, and the
@@ -17,9 +18,20 @@
 //! following helpers (no `actor`, called after `require` in a caller):
 //! `get_role`, `get_role_by_id`, `delete_role_by_id`,
 //! `get_permissions_for_role`, `list_permissions`, `create_owner_role`.
+//!
+//! **Stage 3e (ADR-0004):** `AccessState` carries an
+//! `Arc<dyn AuditLogger>` (default [`NoopAuditLogger`]) used by
+//! `role::{create_role, update_role}` to emit `role.created` /
+//! `role.updated`. `delete_role` does **not** emit here (decision A: the
+//! canonical `role.deleted` point is `saas::access::delete_role`, the
+//! 6-step cleanup path; the direct `access::delete_role` leaves orphans in
+//! `casbin_rule`/`*_members` and would be misleading to audit). A failed
+//! audit write is `tracing::warn!` — the caller's business operation has
+//! already committed, audit is not a security boundary.
 
 use std::sync::Arc;
 
+use audit::{AuditLogger, NoopAuditLogger};
 use authz::AuthorizationEngine;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -134,20 +146,33 @@ pub struct Role {
     pub permissions: Vec<Permission>,
 }
 
-/// State shared by every `access::*` service: the database pool and the
-/// authorization engine. The actual `casbin_rule` writes on role assignment
-/// live in `saas::access::{assign_role, revoke_role}` (which call
-/// `authz.grant_role`/`authz.revoke_role`); `access` only stores the role
-/// rows and permissions.
+/// State shared by every `access::*` service: the database pool, the
+/// authorization engine, and the audit logger. The actual `casbin_rule`
+/// writes on role assignment live in `saas::access::{assign_role,
+/// revoke_role}` (which call `authz.grant_role`/`authz.revoke_role`);
+/// `access` only stores the role rows and permissions.
 pub struct AccessState {
     pool: PgPool,
     authz: Arc<dyn AuthorizationEngine>,
+    audit: Arc<dyn AuditLogger>,
 }
 
 impl AccessState {
-    /// Builds an [`AccessState`].
+    /// Builds an [`AccessState`] with a [`NoopAuditLogger`]. Use
+    /// [`AccessState::with_audit`] to plug in a real logger (Stage 3e).
     pub fn new(pool: PgPool, authz: Arc<dyn AuthorizationEngine>) -> Self {
-        Self { pool, authz }
+        Self {
+            pool,
+            authz,
+            audit: Arc::new(NoopAuditLogger),
+        }
+    }
+
+    /// Replaces the default [`NoopAuditLogger`] with a real [`AuditLogger`]
+    /// (e.g. `PgAuditLogger`). Builder-style, additive: `new` is not broken.
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLogger>) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Shared pool.
@@ -158,5 +183,25 @@ impl AccessState {
     /// Shared authorization engine.
     pub fn authz(&self) -> &Arc<dyn AuthorizationEngine> {
         &self.authz
+    }
+
+    /// Shared audit logger.
+    pub fn audit(&self) -> &Arc<dyn AuditLogger> {
+        &self.audit
+    }
+
+    /// Best-effort audit write: a failure is logged via `tracing::warn!` and
+    /// does **not** propagate (ADR-0004 §2.4).
+    pub(crate) async fn audit_or_warn(&self, event: audit::AuditEvent) {
+        let event_type = event.event_type.clone();
+        let actor_id = event.actor_id;
+        if let Err(e) = self.audit.log(&event).await {
+            tracing::warn!(
+                error = %e,
+                event_type = %event_type,
+                actor_id = ?actor_id,
+                "audit log failed"
+            );
+        }
     }
 }

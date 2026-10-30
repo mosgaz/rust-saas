@@ -8,7 +8,15 @@
 //! No manual `createdb` is required. `DATABASE_URL` must point at a server
 //! where the user has the `CREATE DATABASE` privilege (the default postgres
 //! superuser satisfies this).
+//!
+//! Stage 3e adds the "Audit emission" section at the bottom: it wires a real
+//! `PgAuditLogger` into `Authn` via `with_audit` and asserts that the
+//! expected `audit_log` row appears for `register`, `login` (success and
+//! failure), and `verify_email` (transition only).
 
+use std::sync::Arc;
+
+use audit_pg::PgAuditLogger;
 use authn::{
     Authn, AuthnError, EMAIL_VERIFICATION_TTL_HOURS, PASSWORD_RESET_TTL_HOURS,
     REFRESH_GRACE_SECONDS,
@@ -19,6 +27,12 @@ use uuid::Uuid;
 
 fn fresh(pool: PgPool) -> Authn {
     Authn::new(pool, "test-jwt-secret-not-for-production")
+}
+
+/// Builds an `Authn` with a real `PgAuditLogger` sharing the test pool.
+fn fresh_with_audit(pool: PgPool) -> Authn {
+    let logger = Arc::new(PgAuditLogger::from_pool(pool.clone())) as Arc<dyn audit::AuditLogger>;
+    Authn::new(pool, "test-jwt-secret-not-for-production").with_audit(logger)
 }
 
 fn unique_email(label: &str) -> String {
@@ -1085,4 +1099,168 @@ async fn revoke_all_user_tokens_revokes_every_family_of_user(pool: PgPool) {
         .await
         .expect("second call must succeed");
     assert_eq!(again, 0, "already-revoked rows must be a no-op");
+}
+
+// ─── Stage 3e: audit emission ───────────────────────────────────────────────
+
+/// Fetches `(event_type, actor_id, actor_email, target_type, target_id,
+/// metadata)` for every row in `audit_log`, in insertion order.
+async fn audit_rows(
+    pool: &PgPool,
+) -> Vec<(
+    String,
+    Option<Uuid>,
+    Option<String>,
+    Option<String>,
+    Option<Uuid>,
+    serde_json::Value,
+)> {
+    sqlx::query_as(
+        r#"
+        select event_type, actor_id, actor_email, target_type, target_id, metadata
+        from audit_log
+        order by occurred_at asc, id asc
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .expect("audit_log query must succeed")
+}
+
+/// `register` emits `user.registered` with the actor fields set.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn register_emits_user_registered(pool: PgPool) {
+    let authn = fresh_with_audit(pool.clone());
+    let email = unique_email("audit-register");
+
+    let user = authn
+        .register(&email, "Password123!")
+        .await
+        .expect("register must succeed");
+
+    let rows = audit_rows(&pool).await;
+    assert_eq!(rows.len(), 1, "exactly one audit row after register");
+    let (event_type, actor_id, actor_email, target_type, target_id, metadata) = &rows[0];
+    assert_eq!(event_type, "user.registered");
+    assert_eq!(*actor_id, Some(user.id));
+    assert_eq!(actor_email.as_deref(), Some(email.as_str()));
+    assert_eq!(target_type.as_deref(), Some("user"));
+    assert_eq!(*target_id, Some(user.id));
+    assert_eq!(metadata, &serde_json::json!({}));
+}
+
+/// `login` (success) emits `user.login_succeeded` **after** `user.registered`
+/// from the setup `register` call. Both rows carry the actor fields.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn login_success_emits_login_succeeded(pool: PgPool) {
+    let authn = fresh_with_audit(pool.clone());
+    let email = unique_email("audit-login-ok");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+
+    authn
+        .login(&email, "Password123!")
+        .await
+        .expect("login must succeed");
+
+    let rows = audit_rows(&pool).await;
+    assert_eq!(rows.len(), 2, "register + login_succeeded");
+    let (event_type, actor_id, actor_email, target_type, target_id, _) = &rows[1];
+    assert_eq!(event_type, "user.login_succeeded");
+    assert_eq!(*actor_id, Some(user.id));
+    assert_eq!(actor_email.as_deref(), Some(email.as_str()));
+    assert_eq!(target_type.as_deref(), Some("user"));
+    assert_eq!(*target_id, Some(user.id));
+}
+
+/// `login` (wrong password) emits `user.login_failed` with
+/// `actor_id = NULL` and `actor_email` = the attempted address. The reason is
+/// `invalid_credentials` — the row does not distinguish wrong-password from
+/// unknown-email (no enumeration oracle).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn login_fail_emits_login_failed_with_actor_email_only(pool: PgPool) {
+    let authn = fresh_with_audit(pool.clone());
+    let email = unique_email("audit-login-fail");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+
+    let err = authn
+        .login(&email, "WrongPassword123!")
+        .await
+        .expect_err("must reject");
+    assert!(matches!(err, AuthnError::InvalidCredentials), "got {err:?}");
+
+    // Also exercise the unknown-email branch: it must produce an equivalent
+    // row with the same metadata (no enumeration signal).
+    let unknown = unique_email("audit-login-unknown");
+    let _ = authn
+        .login(&unknown, "Password123!")
+        .await
+        .expect_err("must reject");
+
+    let rows = audit_rows(&pool).await;
+    assert_eq!(rows.len(), 3, "register + two login_failed");
+
+    // First failure: known email, wrong password.
+    let (event_type, actor_id, actor_email, _, _, metadata) = &rows[1];
+    assert_eq!(event_type, "user.login_failed");
+    assert!(
+        actor_id.is_none(),
+        "login_failed must not attribute the actor (actor_id = NULL)"
+    );
+    assert_eq!(actor_email.as_deref(), Some(email.as_str()));
+    assert_eq!(
+        metadata,
+        &serde_json::json!({ "reason": "invalid_credentials" })
+    );
+
+    // Second failure: unknown email — same shape.
+    let (event_type, actor_id, actor_email, _, _, metadata) = &rows[2];
+    assert_eq!(event_type, "user.login_failed");
+    assert!(actor_id.is_none());
+    assert_eq!(actor_email.as_deref(), Some(unknown.as_str()));
+    assert_eq!(
+        metadata,
+        &serde_json::json!({ "reason": "invalid_credentials" })
+    );
+
+    // Sanity: the registered user's id never appears as `actor_id` in a
+    // `login_failed` row.
+    assert!(rows[1..]
+        .iter()
+        .all(|(et, aid, ..)| et != "user.login_failed" || *aid != Some(user.id)));
+}
+
+/// `verify_email` emits `user.email_verified` on the transition path; the
+/// idempotent no-op path (already verified) does **not** emit.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn email_verified_emits_user_email_verified(pool: PgPool) {
+    let authn = fresh_with_audit(pool.clone());
+    let email = unique_email("audit-verify");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn.create_email_verification(user.id).await.unwrap();
+
+    let verified = authn.verify_email(&raw).await.expect("verify_email");
+    assert!(verified.email_verified);
+
+    // Idempotent replay: no second `user.email_verified`.
+    authn
+        .verify_email(&raw)
+        .await
+        .expect("second verify must be Ok");
+
+    let rows = audit_rows(&pool).await;
+    let email_verified: Vec<_> = rows
+        .iter()
+        .filter(|(et, ..)| et == "user.email_verified")
+        .collect();
+    assert_eq!(
+        email_verified.len(),
+        1,
+        "exactly one user.email_verified row (idempotent replay must not emit)"
+    );
+    let (_, actor_id, actor_email, target_type, target_id, metadata) = email_verified[0];
+    assert_eq!(*actor_id, Some(user.id));
+    assert_eq!(actor_email.as_deref(), Some(email.as_str()));
+    assert_eq!(target_type.as_deref(), Some("user"));
+    assert_eq!(*target_id, Some(user.id));
+    assert_eq!(metadata, &serde_json::json!({}));
 }

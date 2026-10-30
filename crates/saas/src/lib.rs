@@ -10,10 +10,32 @@
 //! `invitation.email IS NOT NULL` before comparing the address
 //! (verified-first), and rejects a verified actor whose email does not match
 //! the invitation address (case-insensitive) with [`CoreError::Forbidden`].
+//!
+//! Stage 3e (ADR-0004): [`SaasState`] carries an `Arc<dyn AuditLogger>`
+//! (default [`NoopAuditLogger`]); [`SaasBuilder::with_audit`] plugs in a
+//! real logger (`PgAuditLogger`). Emissions live in submodules:
+//! - `platform::create_tenant` / `platform::provision_tenant` →
+//!   `tenant.created`.
+//! - `tenant::create_workspace` → `workspace.created`.
+//! - `invitation::{create, accept, revoke}_invitation` →
+//!   `invitation.{created, accepted, revoked}`.
+//! - `access::{assign_role, revoke_role, delete_role}` →
+//!   `member.role_assigned` / `member.role_revoked` / `role.deleted`.
+//! - `member::change_role` → `member.role_changed` (in addition to the
+//!   `member.role_assigned` / `member.role_revoked` emitted by its inner
+//!   `saas::access::{assign_role, revoke_role}` calls — three events total).
+//!
+//! `tenant.suspended` / `tenant.activated` are declared in `audit::events`
+//! but only emitted in Stage 3f once `suspend_tenant` / `activate_tenant`
+//! exist (decision C).
+//!
+//! Audit is best-effort: a failed write is `tracing::warn!` and does not
+//! fail the business operation (ADR-0004 §2.4).
 
 use std::sync::Arc;
 
 use ::access::{AccessError, AccessState, RoleKey};
+use audit::{AuditEvent, AuditLogger, NoopAuditLogger};
 use authz::{AuthorizationEngine, AuthzError};
 use domain::{AuthUser, Document, Tenant, Workspace, PLATFORM_DOMAIN};
 use sqlx::PgPool;
@@ -75,6 +97,7 @@ pub struct SaasState {
     pub(crate) pool: PgPool,
     pub(crate) authz: Arc<dyn AuthorizationEngine>,
     pub(crate) access: Arc<AccessState>,
+    pub(crate) audit: Arc<dyn AuditLogger>,
 }
 
 impl SaasState {
@@ -89,12 +112,33 @@ impl SaasState {
     pub fn access(&self) -> &AccessState {
         &self.access
     }
+
+    pub fn audit(&self) -> &Arc<dyn AuditLogger> {
+        &self.audit
+    }
+
+    /// Best-effort audit write: a failure is `tracing::warn!` and does
+    /// **not** propagate (ADR-0004 §2.4). Used by this crate's modules
+    /// (platform, tenant, invitation, access, member).
+    pub(crate) async fn audit_or_warn(&self, event: AuditEvent) {
+        let event_type = event.event_type.clone();
+        let actor_id = event.actor_id;
+        if let Err(e) = self.audit.log(&event).await {
+            tracing::warn!(
+                error = %e,
+                event_type = %event_type,
+                actor_id = ?actor_id,
+                "audit log failed"
+            );
+        }
+    }
 }
 
 pub struct SaasBuilder {
     pool: PgPool,
     authz: Option<Arc<dyn AuthorizationEngine>>,
     access: Option<Arc<AccessState>>,
+    audit: Option<Arc<dyn AuditLogger>>,
 }
 
 impl SaasBuilder {
@@ -103,6 +147,7 @@ impl SaasBuilder {
             pool,
             authz: None,
             access: None,
+            audit: None,
         }
     }
 
@@ -116,6 +161,14 @@ impl SaasBuilder {
         self
     }
 
+    /// Plugs in a real [`AuditLogger`] (`PgAuditLogger`). Without this
+    /// call, [`NoopAuditLogger`] is used and no events are recorded
+    /// (dev / tests / seed bootstrap — visible as an empty `audit_log`).
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
     pub fn build(self) -> Result<SaasState, CoreError> {
         let authz = self.authz.ok_or_else(|| {
             CoreError::Internal("SaasBuilder: authorization engine is required".into())
@@ -123,18 +176,23 @@ impl SaasBuilder {
         let access = self
             .access
             .ok_or_else(|| CoreError::Internal("SaasBuilder: access state is required".into()))?;
+        let audit = self.audit.unwrap_or_else(|| Arc::new(NoopAuditLogger));
         Ok(SaasState {
             pool: self.pool,
             authz,
             access,
+            audit,
         })
     }
 }
 
 pub mod platform {
     use super::*;
+    use audit::events;
 
     /// Creates a tenant container. No side effects.
+    ///
+    /// Emits `tenant.created` (Stage 3e) after the row is committed.
     pub async fn create_tenant(
         state: &SaasState,
         actor: &AuthUser,
@@ -148,14 +206,28 @@ pub mod platform {
         let tenant = sqlx::query_as::<_, Tenant>(
             "insert into tenants (name) values ($1) returning id, name, status, created_at",
         )
-        .bind(name)
+        .bind(&name)
         .fetch_one(&state.pool)
         .await?;
+
+        state
+            .audit_or_warn(AuditEvent {
+                event_type: events::TENANT_CREATED.into(),
+                actor_id: Some(actor.id),
+                actor_email: Some(actor.email.clone()),
+                target_type: Some("tenant".into()),
+                target_id: Some(tenant.id),
+                metadata: serde_json::json!({ "name": name }),
+            })
+            .await;
 
         Ok(tenant)
     }
 
     /// Creates a tenant and assigns an explicit owner with `owner_role_key`.
+    ///
+    /// Emits `tenant.created` (Stage 3e) after the transaction commits;
+    /// the target is the new tenant, the actor is `actor` (not `owner`).
     pub async fn provision_tenant(
         state: &SaasState,
         actor: &AuthUser,
@@ -173,7 +245,7 @@ pub mod platform {
         let tenant = sqlx::query_as::<_, Tenant>(
             "insert into tenants (name) values ($1) returning id, name, status, created_at",
         )
-        .bind(name)
+        .bind(&name)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -208,14 +280,32 @@ pub mod platform {
 
         tx.commit().await?;
 
+        state
+            .audit_or_warn(AuditEvent {
+                event_type: events::TENANT_CREATED.into(),
+                actor_id: Some(actor.id),
+                actor_email: Some(actor.email.clone()),
+                target_type: Some("tenant".into()),
+                target_id: Some(tenant.id),
+                metadata: serde_json::json!({
+                    "name": name,
+                    "owner_id": owner.id.to_string(),
+                    "owner_role_key": owner_role_key.as_str(),
+                }),
+            })
+            .await;
+
         Ok(tenant)
     }
 }
 
 pub mod tenant {
     use super::*;
+    use audit::events;
 
     /// Creates a workspace inside a tenant and assigns the owner as `owner_role_key`.
+    ///
+    /// Emits `workspace.created` (Stage 3e) after the transaction commits.
     pub async fn create_workspace(
         state: &SaasState,
         actor: &AuthUser,
@@ -241,7 +331,7 @@ pub mod tenant {
             "#,
         )
         .bind(tenant_id)
-        .bind(name)
+        .bind(&name)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -275,6 +365,22 @@ pub mod tenant {
         .await?;
 
         tx.commit().await?;
+
+        state
+            .audit_or_warn(AuditEvent {
+                event_type: events::WORKSPACE_CREATED.into(),
+                actor_id: Some(actor.id),
+                actor_email: Some(actor.email.clone()),
+                target_type: Some("workspace".into()),
+                target_id: Some(workspace.id),
+                metadata: serde_json::json!({
+                    "name": name,
+                    "tenant_id": tenant_id.to_string(),
+                    "owner_id": owner.id.to_string(),
+                    "owner_role_key": owner_role_key.as_str(),
+                }),
+            })
+            .await;
 
         Ok(workspace)
     }

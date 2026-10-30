@@ -23,10 +23,25 @@
 //! email-verification banner out of the way and prepares for Stage 3c
 //! (`accept_invitation` requires `actor.email_verified`). Idempotent: an
 //! already-verified account keeps its original timestamp.
+//!
+//! **Stage 3e (ADR-0004):** a real `PgAuditLogger` is plugged into the
+//! bootstrap path (via `AccessState::with_audit` and
+//! `SaasBuilder::with_audit`). Seed-produced audit events are the visible
+//! proof that `audit_log` is wired: `tenant.created`, `workspace.created`,
+//! `role.created` (for `editor`/`viewer`), and `member.role_assigned`
+//! (for their grant). The `platform` owner grant is a direct
+//! `authz.grant_role` call — this is bootstrap and does not emit
+//! `member.role_assigned` (matching the `provision_tenant` /
+//! `create_workspace` behaviour, where the owner's role grant is also
+//! silent). `authn::Authn` is **not** constructed here — the seed binary
+//! only needs `authn::hash_password` — so there is nothing to plug into
+//! `Authn::with_audit` on this path.
 
 use std::sync::Arc;
 
 use access::{AccessState, RoleKey};
+use audit::AuditLogger;
+use audit_pg::PgAuditLogger;
 use authz::AuthorizationEngine;
 use domain::{AuthUser, Tenant, Workspace};
 use saas::{access as saas_access, platform, tenant, workspace, SaasBuilder};
@@ -43,11 +58,19 @@ async fn main() -> anyhow::Result<()> {
 
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
-    let access_state = Arc::new(AccessState::new(pool.clone(), authz.clone()));
+
+    // Stage 3e: real audit logger. Shared with `AccessState` and
+    // `SaasState` — one pool, one logger, one audit_log table.
+    let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
+
+    let access_state = Arc::new(
+        AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
+    );
 
     let state = SaasBuilder::new(pool.clone())
         .with_authz(authz.clone())
         .with_access(access_state)
+        .with_audit(audit)
         .build()?;
 
     let platform_admin =
@@ -59,6 +82,8 @@ async fn main() -> anyhow::Result<()> {
     let owner_key = RoleKey::parse("owner")?;
 
     // Grant platform admin the `owner` role in the `platform` domain.
+    // Bootstrap-only: direct `authz.grant_role`, no `member.role_assigned`
+    // audit event (matching `provision_tenant`/`create_workspace`).
     let platform_perms =
         ::access::get_permissions_for_role(state.access(), "platform", &owner_key).await?;
     state
@@ -119,7 +144,9 @@ async fn main() -> anyhow::Result<()> {
 
     let roles = saas_access::list_roles(&state, &tenant_owner, &ws_domain).await?;
 
-    // Create custom roles if they don't exist yet.
+    // Create custom roles if they don't exist yet. `saas_access::create_role`
+    // goes through `access::create_role` (which emits `role.created` when
+    // `AccessState::with_audit` was called — see Stage 3e above).
     if !roles.iter().any(|r| r.key == editor_key) {
         saas_access::create_role(
             &state,
@@ -150,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Assign roles. `assign_role` is idempotent (ON CONFLICT DO NOTHING for
-    // `*_members` and `add_policy` for `casbin_rule`).
+    // `*_members` and `add_policy` for `casbin_rule`). Each call emits
+    // `member.role_assigned` when `SaasState` has a real audit logger.
     saas_access::assign_role(
         &state,
         &tenant_owner,

@@ -6,11 +6,14 @@ version = 4
 name = "access"
 version = "0.1.0"
 dependencies = [
+ "audit",
  "authz",
  "domain",
  "serde",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
 ]
 
@@ -155,10 +158,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "audit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "audit-pg"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "audit",
+ "sqlx",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "authn"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "audit",
  "chrono",
  "domain",
  "identity",
@@ -168,6 +195,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
 ]
 
@@ -2724,12 +2752,15 @@ name = "saas"
 version = "0.1.0"
 dependencies = [
  "access",
+ "audit",
  "authz",
  "domain",
  "identity",
+ "serde_json",
  "sha2",
  "sqlx",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
 ]
 
@@ -2740,6 +2771,8 @@ dependencies = [
  "access",
  "anyhow",
  "async-trait",
+ "audit",
+ "audit-pg",
  "authn",
  "authz",
  "authz-casbin",

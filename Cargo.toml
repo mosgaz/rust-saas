@@ -10,6 +10,8 @@ members = [
     "crates/saas",
     "crates/db",
     "crates/seed",
+    "crates/audit",
+    "crates/audit-pg",
 ]
 exclude = ["examples/*"]
 

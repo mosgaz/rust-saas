@@ -26,10 +26,31 @@
 //!   `CoreError::Forbidden`. Non-protected roles have no last-holder guard.
 //! - The guard is non-transactional (a concurrent admin can race between
 //!   `count_users_with_role` and `revoke`). See handoff §16.
+//!
+//! **Stage 3e (ADR-0004, decision B):** `change_role` is composable — its
+//! two inner calls `saas::access::assign_role` and
+//! `saas::access::revoke_role` each emit their own audit event, and
+//! `change_role` itself emits a third one (`member.role_changed`). Three
+//! rows total:
+//! - `member.role_assigned` — from `assign_role` (target: user,
+//!   `metadata: { domain, role_key: new }`).
+//! - `member.role_revoked` — from `revoke_role` (target: user,
+//!   `metadata: { domain, role_key: old }`).
+//! - `member.role_changed` — from `change_role` itself
+//!   (target: user, `metadata: { scope, from_role, to_role }`).
+//!
+//! `remove_role` does **not** emit `member.role_changed`; its single
+//! `saas::access::revoke_role` call already emits `member.role_revoked`.
+//! `member.role_changed` is specific to a role **swap**; a plain revoke
+//! is not a "change".
+//!
+//! `change_role` with `old_role_key == new_role_key` is a no-op: no
+//! `require`, no SQL, no audit event.
 
 use std::collections::HashMap;
 
 use ::access::RoleKey;
+use audit::{events, AuditEvent};
 use domain::{AuthUser, Member};
 use sqlx::types::chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -138,9 +159,11 @@ pub async fn list(
 /// 3. Guard: if `old_role_key` is `protected`, the user holds it, and the
 ///    user is the last holder in the domain → `CoreError::Forbidden`.
 /// 4. `saas::access::assign_role(new_role_key)` — adds the new role to
-///    `*_members` and `casbin_rule`.
+///    `*_members` and `casbin_rule`; emits `member.role_assigned`.
 /// 5. `saas::access::revoke_role(old_role_key)` — removes the old role from
-///    `*_members` and `casbin_rule`.
+///    `*_members` and `casbin_rule`; emits `member.role_revoked`.
+/// 6. Emit `member.role_changed` (Stage 3e — this function, on top of the
+///    two events already emitted by its inner calls).
 ///
 /// Not atomic: steps 4 and 5 each run their own SQL. If step 5 fails after
 /// step 4 committed, the user ends up over-permissioned (both roles); this
@@ -172,6 +195,21 @@ pub async fn change_role(
     saas_access::assign_role(state, actor, user_id, &domain_str, new_role_key).await?;
     saas_access::revoke_role(state, actor, user_id, &domain_str, old_role_key).await?;
 
+    state
+        .audit_or_warn(AuditEvent {
+            event_type: events::MEMBER_ROLE_CHANGED.into(),
+            actor_id: Some(actor.id),
+            actor_email: Some(actor.email.clone()),
+            target_type: Some("user".into()),
+            target_id: Some(user_id),
+            metadata: serde_json::json!({
+                "scope": domain_str,
+                "from_role": old_role_key.as_str(),
+                "to_role": new_role_key.as_str(),
+            }),
+        })
+        .await;
+
     Ok(())
 }
 
@@ -182,13 +220,17 @@ pub async fn change_role(
 /// 2. Guard: if `role_key` is `protected`, the user holds it, and the user
 ///    is the last holder in the domain → `CoreError::Forbidden`.
 /// 3. `saas::access::revoke_role` — removes the role from `*_members` and
-///    `casbin_rule`.
+///    `casbin_rule`; emits `member.role_revoked`.
 ///
 /// Removing the last holder of a **non-protected** role is allowed. Owner
 /// demote at `count >= 2` is allowed; at `count == 1` it is forbidden
 /// (handoff §16). To transfer ownership: `assign_role` to the new owner
 /// first (`count` becomes 2), then `remove_role`/`change_role` on the old
 /// owner.
+///
+/// Does **not** emit `member.role_changed` — this is a revoke, not a swap
+/// (decision B). The audit trail already contains `member.role_revoked`
+/// from the inner `revoke_role`.
 pub async fn remove_role(
     state: &SaasState,
     actor: &AuthUser,

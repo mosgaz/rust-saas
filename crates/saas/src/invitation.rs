@@ -19,7 +19,22 @@
 //!
 //! The check runs after the `SELECT ... FOR UPDATE` lookup and before
 //! `used_count` is incremented, so a rejected accept does not consume a use.
+//!
+//! **Stage 3e (ADR-0004):** the three mutation services emit audit events
+//! after the business operation commits:
+//! - `create_invitation` → `invitation.created`
+//!   (`metadata: { role, email: Option<String>, target: "tenant:{id}" |
+//!   "workspace:{id}" }`).
+//! - `accept_invitation` → `invitation.accepted`
+//!   (`metadata: { role, target }`).
+//! - `revoke_invitation` → `invitation.revoked`
+//!   (`metadata: { target }`).
+//!
+//! Each write is best-effort via [`SaasState::audit_or_warn`] — a failed
+//! audit write is `tracing::warn!` and does not fail the business
+//! operation (ADR-0004 §2.4).
 
+use audit::{events, AuditEvent};
 use domain::{AuthUser, Invitation, InvitationTarget};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -30,6 +45,8 @@ use crate::{CoreError, SaasState};
 const DEFAULT_TTL_HOURS: i32 = 168;
 
 /// Creates an invitation.
+///
+/// Emits `invitation.created` (Stage 3e) after the row is committed.
 pub async fn create_invitation(
     state: &SaasState,
     actor: &AuthUser,
@@ -80,7 +97,7 @@ pub async fn create_invitation(
     )
     .bind(tenant_id)
     .bind(workspace_id)
-    .bind(email)
+    .bind(&email)
     .bind(&role)
     .bind(&token_hash)
     .bind(actor.id)
@@ -88,6 +105,22 @@ pub async fn create_invitation(
     .bind(max_uses)
     .fetch_one(state.pool())
     .await?;
+
+    state
+        .audit_or_warn(AuditEvent {
+            event_type: events::INVITATION_CREATED.into(),
+            actor_id: Some(actor.id),
+            actor_email: Some(actor.email.clone()),
+            target_type: Some("invitation".into()),
+            target_id: Some(invitation.id),
+            metadata: serde_json::json!({
+                "role": role,
+                "email": email,
+                "target": domain_str,
+                "max_uses": max_uses,
+            }),
+        })
+        .await;
 
     Ok((invitation, token))
 }
@@ -132,6 +165,7 @@ pub async fn check_invitation(
 /// 4. Insert `*_members` (`ON CONFLICT DO NOTHING`; multi-role PK) and
 ///    `authz.grant_role`.
 /// 5. `COMMIT`.
+/// 6. Emit `invitation.accepted` (Stage 3e).
 ///
 /// Link invitations (`email IS NULL`) skip step 2 entirely; unverified
 /// actors may still accept them (Stage 3c preserves the Stage 2a
@@ -236,10 +270,32 @@ pub async fn accept_invitation(
 
     tx.commit().await?;
 
+    let target = match (invitation.tenant_id, invitation.workspace_id) {
+        (Some(tid), _) => domain::tenant_domain(tid),
+        (_, Some(wid)) => domain::workspace_domain(wid),
+        _ => String::new(),
+    };
+
+    state
+        .audit_or_warn(AuditEvent {
+            event_type: events::INVITATION_ACCEPTED.into(),
+            actor_id: Some(user.id),
+            actor_email: Some(user.email.clone()),
+            target_type: Some("invitation".into()),
+            target_id: Some(invitation.id),
+            metadata: serde_json::json!({
+                "role": invitation.role,
+                "target": target,
+            }),
+        })
+        .await;
+
     Ok(invitation)
 }
 
 /// Revokes an invitation.
+///
+/// Emits `invitation.revoked` (Stage 3e) after the row is updated.
 pub async fn revoke_invitation(
     state: &SaasState,
     actor: &AuthUser,
@@ -277,6 +333,17 @@ pub async fn revoke_invitation(
     if result.rows_affected() == 0 {
         return Err(CoreError::NotFound);
     }
+
+    state
+        .audit_or_warn(AuditEvent {
+            event_type: events::INVITATION_REVOKED.into(),
+            actor_id: Some(actor.id),
+            actor_email: Some(actor.email.clone()),
+            target_type: Some("invitation".into()),
+            target_id: Some(invitation_id),
+            metadata: serde_json::json!({ "target": domain_str }),
+        })
+        .await;
 
     Ok(())
 }

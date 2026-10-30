@@ -34,11 +34,43 @@
 //! for the user, and revokes every refresh-token family
 //! ([`RevokeReason::PasswordReset`]). Access JWTs remain valid until their
 //! short `exp`; iat-vs-`password_changed_at` enforcement is Stage 4.
+//!
+//! Stage 3e: audit events (ADR-0004). [`Authn`] carries an
+//! `Arc<dyn AuditLogger>` (default [`NoopAuditLogger`]). After a successful
+//! business operation (or after a failed login), it emits the corresponding
+//! event via [`events::*`] — **synchronously after** the operation
+//! completes, in a separate transaction. A failed audit write is surfaced
+//! via `tracing::warn!` and does **not** fail the business operation
+//! (ADR-0004 §2.4). `login_failed` is the only event emitted for a
+//! **failed** operation; it carries `actor_id = None` and
+//! `actor_email = attempted` (the address may not exist).
+//!
+//! Events emitted here (8):
+//! - `user.registered` — after `register`.
+//! - `user.login_succeeded` — after `login`.
+//! - `user.login_failed` — on `InvalidCredentials` (unknown email or wrong
+//!   password; both paths share `metadata = { "reason": "invalid_credentials" }`
+//!   so the audit row does not leak which case fired).
+//! - `user.logout` — after `revoke_refresh_token` (only when a real token
+//!   row existed; an unknown raw is a silent no-op, no event).
+//! - `user.refresh_reused` — on genuine reuse in `rotate_refresh_token`
+//!   (i.e. the `RefreshReused` branch; not the grace-window race, which is
+//!   `RefreshInvalid`). Metadata carries `family_id`.
+//! - `user.email_verified` — after `verify_email` **transitions** the user
+//!   from unverified to verified. The idempotent no-op path (already
+//!   verified) does **not** emit.
+//! - `user.password_reset_requested` — after `request_password_reset`
+//!   returned `Ok(Some(raw))`. The silent `Ok(None)` path (unknown email)
+//!   does **not** emit.
+//! - `user.password_reset_completed` — after `reset_password`.
+
+use std::sync::Arc;
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
     Argon2, PasswordHash, PasswordVerifier,
 };
+use audit::{events, AuditEvent, AuditLogger, NoopAuditLogger};
 use chrono::{DateTime, Duration, Utc};
 use domain::AuthUser;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
@@ -174,10 +206,14 @@ pub struct Authn {
     jwt_secret: String,
     access_ttl: Duration,
     refresh_ttl: Duration,
+    audit: Arc<dyn AuditLogger>,
 }
 
 impl Authn {
-    /// Builds an [`Authn`] with the default TTLs.
+    /// Builds an [`Authn`] with the default TTLs and a [`NoopAuditLogger`].
+    ///
+    /// Use [`Authn::with_audit`] to plug in a real logger (e.g.
+    /// `PgAuditLogger`) without changing the signature of `new`.
     pub fn new(pool: PgPool, jwt_secret: impl Into<String>) -> Self {
         Self::with_ttl(
             pool,
@@ -187,7 +223,7 @@ impl Authn {
         )
     }
 
-    /// Builds an [`Authn`] with explicit TTLs.
+    /// Builds an [`Authn`] with explicit TTLs and a [`NoopAuditLogger`].
     pub fn with_ttl(
         pool: PgPool,
         jwt_secret: impl Into<String>,
@@ -199,7 +235,49 @@ impl Authn {
             jwt_secret: jwt_secret.into(),
             access_ttl,
             refresh_ttl,
+            audit: Arc::new(NoopAuditLogger),
         }
+    }
+
+    /// Replaces the default [`NoopAuditLogger`] with a real
+    /// [`AuditLogger`] (e.g. `PgAuditLogger`). Builder-style: caller
+    /// composes `Authn::with_ttl(...).with_audit(Arc::new(PgAuditLogger::from_pool(pool)))`.
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLogger>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Best-effort audit write: a failure is logged via `tracing::warn!` and
+    /// does **not** propagate (ADR-0004 §2.4). The business operation has
+    /// already committed; audit is not a security boundary.
+    async fn audit_or_warn(&self, event: AuditEvent) {
+        let event_type = event.event_type.clone();
+        let actor_id = event.actor_id;
+        if let Err(e) = self.audit.log(&event).await {
+            tracing::warn!(
+                error = %e,
+                event_type = %event_type,
+                actor_id = ?actor_id,
+                "audit log failed"
+            );
+        }
+    }
+
+    /// Emits `user.login_failed`. `actor_id = None` (the actor is not
+    /// proven); `actor_email` is the attempted address (may not exist).
+    /// Metadata `{reason: "invalid_credentials"}` — no distinction between
+    /// "unknown email" and "wrong password" so the audit row cannot be used
+    /// as an email-enumeration oracle.
+    async fn audit_login_failed(&self, attempted_email: &str) {
+        self.audit_or_warn(AuditEvent {
+            event_type: events::USER_LOGIN_FAILED.into(),
+            actor_id: None,
+            actor_email: Some(attempted_email.to_string()),
+            target_type: None,
+            target_id: None,
+            metadata: serde_json::json!({ "reason": "invalid_credentials" }),
+        })
+        .await;
     }
 
     pub async fn register(&self, email: &str, password: &str) -> Result<AuthUser, AuthnError> {
@@ -208,22 +286,58 @@ impl Authn {
 
         let hash = hash_password(password)?;
         let user = identity::create_user(&self.pool, email, &hash).await?;
+
+        self.audit_or_warn(AuditEvent {
+            event_type: events::USER_REGISTERED.into(),
+            actor_id: Some(user.id),
+            actor_email: Some(user.email.clone()),
+            target_type: Some("user".into()),
+            target_id: Some(user.id),
+            metadata: serde_json::json!({}),
+        })
+        .await;
+
         Ok(user)
     }
 
     pub async fn login(&self, email: &str, password: &str) -> Result<AuthUser, AuthnError> {
-        let record: UserRecord = identity::find_by_email(&self.pool, email)
-            .await?
-            .ok_or(AuthnError::InvalidCredentials)?;
+        let record: UserRecord = match identity::find_by_email(&self.pool, email).await? {
+            Some(r) => r,
+            None => {
+                self.audit_login_failed(email).await;
+                return Err(AuthnError::InvalidCredentials);
+            }
+        };
 
-        let parsed =
-            PasswordHash::new(&record.password_hash).map_err(|_| AuthnError::InvalidCredentials)?;
+        let parsed = match PasswordHash::new(&record.password_hash) {
+            Ok(p) => p,
+            Err(_) => {
+                self.audit_login_failed(email).await;
+                return Err(AuthnError::InvalidCredentials);
+            }
+        };
 
-        Argon2::default()
+        if Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
-            .map_err(|_| AuthnError::InvalidCredentials)?;
+            .is_err()
+        {
+            self.audit_login_failed(email).await;
+            return Err(AuthnError::InvalidCredentials);
+        }
 
-        Ok(record.into())
+        let user: AuthUser = record.into();
+
+        self.audit_or_warn(AuditEvent {
+            event_type: events::USER_LOGIN_SUCCEEDED.into(),
+            actor_id: Some(user.id),
+            actor_email: Some(user.email.clone()),
+            target_type: Some("user".into()),
+            target_id: Some(user.id),
+            metadata: serde_json::json!({}),
+        })
+        .await;
+
+        Ok(user)
     }
 
     /// Issues a short-lived access JWT (Stage 2b; claims cleanup in 3b).
@@ -278,8 +392,8 @@ impl Authn {
     /// 3. `used_at` set within [`REFRESH_GRACE_SECONDS`] → [`AuthnError::RefreshInvalid`]
     ///    (parallel-request race; the family is left intact).
     /// 4. `used_at` set after the grace window → revoke the family
-    ///    (`revoked_reason = "reuse_detected"`) and return
-    ///    [`AuthnError::RefreshReused`] (genuine reuse).
+    ///    (`revoked_reason = "reuse_detected"`), emit `user.refresh_reused`,
+    ///    and return [`AuthnError::RefreshReused`] (genuine reuse).
     /// 5. `expires_at` in the past → [`AuthnError::RefreshInvalid`].
     /// 6. Mark the row used, insert a new row in the same family, commit,
     ///    and return `(new_raw, user)`.
@@ -323,6 +437,17 @@ impl Authn {
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
+
+            self.audit_or_warn(AuditEvent {
+                event_type: events::USER_REFRESH_REUSED.into(),
+                actor_id: Some(row.user_id),
+                actor_email: None,
+                target_type: Some("user".into()),
+                target_id: Some(row.user_id),
+                metadata: serde_json::json!({ "family_id": row.family_id.to_string() }),
+            })
+            .await;
+
             return Err(AuthnError::RefreshReused);
         }
 
@@ -362,19 +487,38 @@ impl Authn {
     }
 
     /// Revokes the family of a refresh token (idempotent). Records
-    /// `revoked_reason = "logout"`.
+    /// `revoked_reason = "logout"` and emits `user.logout` when a matching
+    /// row exists. An unknown raw token is a silent no-op (no event) —
+    /// `logout` from the UI always sends a valid cookie; a missing row means
+    /// there is nothing to audit as a logout.
     pub async fn revoke_refresh_token(&self, raw: &str) -> Result<(), AuthnError> {
         let token_hash = hash_token(raw);
 
-        let family_id: Option<Uuid> =
-            sqlx::query_scalar("select family_id from refresh_tokens where token_hash = $1")
-                .bind(&token_hash)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
+            r#"
+            select rt.family_id, rt.user_id, u.email
+            from refresh_tokens rt
+            join users u on u.id = rt.user_id
+            where rt.token_hash = $1
+            "#,
+        )
+        .bind(&token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
 
-        if let Some(family_id) = family_id {
+        if let Some((family_id, user_id, user_email)) = row {
             self.revoke_family(family_id, Some(RevokeReason::Logout.as_str()))
                 .await?;
+
+            self.audit_or_warn(AuditEvent {
+                event_type: events::USER_LOGOUT.into(),
+                actor_id: Some(user_id),
+                actor_email: Some(user_email),
+                target_type: Some("user".into()),
+                target_id: Some(user_id),
+                metadata: serde_json::json!({}),
+            })
+            .await;
         }
         Ok(())
     }
@@ -492,6 +636,10 @@ impl Authn {
     /// **not** issue tokens or cookies — callers (e.g. `#[server]
     /// verify_email`) may then direct the user to log in.
     ///
+    /// Emits `user.email_verified` only when the call **transitions** the
+    /// user from unverified to verified; the idempotent no-op path does not
+    /// audit (Stage 3e).
+    ///
     /// Order:
     /// 1. Load the token row (`FOR UPDATE`) by `token_hash`; not found →
     ///    [`AuthnError::TokenInvalid`].
@@ -578,6 +726,19 @@ impl Authn {
         let user = identity::find_by_id(&self.pool, row.user_id)
             .await?
             .ok_or(AuthnError::TokenInvalid)?;
+
+        // Transitions only: this branch is reached when the user was
+        // unverified before the call.
+        self.audit_or_warn(AuditEvent {
+            event_type: events::USER_EMAIL_VERIFIED.into(),
+            actor_id: Some(user.id),
+            actor_email: Some(user.email.clone()),
+            target_type: Some("user".into()),
+            target_id: Some(user.id),
+            metadata: serde_json::json!({}),
+        })
+        .await;
+
         Ok(user)
     }
 
@@ -594,8 +755,10 @@ impl Authn {
     /// 4. Commit; return `Ok(Some(raw))` — the only time the raw token is
     ///    visible. Delivery (email) is the caller's responsibility.
     ///
-    /// Does **not** validate the target's password; does **not** touch
-    /// `email_verified_at` (reset ≠ verification).
+    /// Emits `user.password_reset_requested` only on the `Ok(Some(raw))`
+    /// path; the silent `Ok(None)` path (unknown email) does not audit
+    /// (Stage 3e). Does **not** validate the target's password; does
+    /// **not** touch `email_verified_at` (reset ≠ verification).
     pub async fn request_password_reset(
         &self,
         email: &str,
@@ -629,6 +792,16 @@ impl Authn {
 
         tx.commit().await?;
 
+        self.audit_or_warn(AuditEvent {
+            event_type: events::USER_PASSWORD_RESET_REQUESTED.into(),
+            actor_id: Some(record.id),
+            actor_email: Some(record.email.clone()),
+            target_type: Some("user".into()),
+            target_id: Some(record.id),
+            metadata: serde_json::json!({}),
+        })
+        .await;
+
         Ok(Some(raw))
     }
 
@@ -656,7 +829,8 @@ impl Authn {
     /// 8. `UPDATE refresh_tokens SET revoked_at = now(), revoked_reason =
     ///    'password_reset' WHERE user_id = $1 AND revoked_at IS NULL` —
     ///    invalidate all sessions.
-    /// 9. `COMMIT`; fetch and return the current `AuthUser`.
+    /// 9. `COMMIT`; fetch the current `AuthUser`, emit
+    ///    `user.password_reset_completed`, return it.
     ///
     /// Access JWTs remain valid until their short `exp` (iat-vs-
     /// `password_changed_at` enforcement is Stage 4). Does **not** issue
@@ -742,6 +916,17 @@ impl Authn {
         let user = identity::find_by_id(&self.pool, row.user_id)
             .await?
             .ok_or(AuthnError::TokenInvalid)?;
+
+        self.audit_or_warn(AuditEvent {
+            event_type: events::USER_PASSWORD_RESET_COMPLETED.into(),
+            actor_id: Some(user.id),
+            actor_email: Some(user.email.clone()),
+            target_type: Some("user".into()),
+            target_id: Some(user.id),
+            metadata: serde_json::json!({}),
+        })
+        .await;
+
         Ok(user)
     }
 
@@ -884,6 +1069,16 @@ mod tests {
         assert_eq!(RevokeReason::Logout.as_str(), "logout");
         assert_eq!(RevokeReason::ReuseDetected.as_str(), "reuse_detected");
         assert_eq!(RevokeReason::PasswordReset.as_str(), "password_reset");
+    }
+
+    #[tokio::test]
+    async fn with_audit_keeps_other_fields() {
+        // Cheap sanity: `with_audit` only replaces `audit`; the rest is
+        // unchanged. A real logger is exercised in the integration tests.
+        let a = Authn::new(lazy_pool(), "secret").with_audit(Arc::new(NoopAuditLogger));
+        assert_eq!(a.jwt_secret, "secret");
+        assert_eq!(a.access_ttl, Duration::minutes(DEFAULT_ACCESS_TTL_MINUTES));
+        assert_eq!(a.refresh_ttl, Duration::days(DEFAULT_REFRESH_TTL_DAYS));
     }
 
     #[tokio::test]
