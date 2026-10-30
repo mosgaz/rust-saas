@@ -13,7 +13,9 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **JWT access tokens (short-lived) and opaque refresh tokens (rotation with family revocation)**
 - **Refresh grace window: parallel-request race does not revoke the token family**
 - **Auto-refresh middleware scoped to protected routes (SSR + server functions); static assets bypass it**
-- **Server-side logout (revokes refresh token family)**
+- **Server-side logout (revokes refresh token family, records `revoked_reason`)**
+- **Access-token claims `{ sub, iat, exp }` (no `email`); user is resolved from `users` on every request**
+- **Email verification: single-active 24-hour token, idempotent verification, `/verify/:token` page, per-email rate limit (3/hour)**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
@@ -27,7 +29,7 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - Leptos server-side rendering and client hydration
 - Server functions for frontend-to-backend communication
 - PostgreSQL migrations with SQLx
-- Reproducible local development with Docker Compose
+- Reproducible local development with Docker Compose (PostgreSQL + Mailpit)
 - Database seed command for bootstrap data
 - Tailwind CSS v4 styling
 
@@ -38,7 +40,8 @@ The repository is split into two layers:
 ```text
 crates/                  (library — the Cargo workspace)
 ├── domain/             Shared DTOs (Tenant, Workspace, Document, AuthUser, Invitation, Member),
-│                       InvitationTarget, domain helpers, PLATFORM_DOMAIN
+│                       InvitationTarget, domain helpers, PLATFORM_DOMAIN;
+│                       AuthUser.email_verified (derived from users.email_verified_at)
 ├── authz/              AuthorizationEngine trait
 │                       (can / require / grant_role / revoke_role / has_role /
 │                        count_users_with_role / purge_role) + AuthzError
@@ -47,16 +50,19 @@ crates/                  (library — the Cargo workspace)
 │                       Role, Permission, RoleKey, AccessState, AccessError, role CRUD,
 │                       create_owner_role, get_role_by_id, delete_role_by_id,
 │                       list_permissions, get_permissions_for_role
-├── identity/           Sole owner of `users`: AuthUser, UserRecord, validation, CRUD
+├── identity/           Sole owner of `users`: AuthUser, UserRecord, validation, CRUD;
+│                       UserRecord.email_verified_at (source of truth for the derived flag)
 ├── authn/              Argon2, JWT access tokens, opaque refresh tokens, rotation
-│                       with grace window
+│                       with grace window; email verification (single-active, 24h);
+│                       RevokeReason (logout / reuse_detected / password_reset)
 ├── saas/               Business logic: platform, tenant, workspace, invitation, member,
 │                       access (wrappers, incl. my_permissions)
 ├── db/                 PostgreSQL connection and migrations
-└── seed/               Bootstrap data and demo accounts
+└── seed/               Bootstrap data and demo accounts (all email-verified)
 
 examples/                (reference consumers — outside the workspace)
 └── saas-leptos/        Leptos SSR + Axum + #[server] + middleware + cookies
+                        + SMTP transport (lettre) + in-memory rate limiter
 ```
 
 `examples/*` is listed in `workspace.exclude`; each example has its own `Cargo.toml` and `Cargo.lock`, and depends on the library crates via path dependencies pointing at `../../crates/*`.
@@ -66,7 +72,7 @@ The application separates five concerns:
 | Concern | Responsibility | Crate |
 |---|---|---|
 | Identity | Who you are as an entity (`users` table, `AuthUser`) | `identity` |
-| Authentication | How you proved you are who you are (Argon2, JWT, refresh tokens) | `authn` |
+| Authentication | How you proved you are who you are (Argon2, JWT, refresh tokens, email verification) | `authn` |
 | Authorization | What you are allowed to do (`AuthorizationEngine`) | `authz` / `authz-casbin` |
 | Roles & permissions | Who has which rights (`roles`, `permissions`, `role_permissions`) | `access` |
 | Data isolation | Which rows you can see (SQL filters by tenant/workspace) | `saas` |
@@ -85,14 +91,15 @@ identity     -> domain, sqlx
 authz-casbin -> authz (trait), casbin, sqlx, sqlx-adapter
 authz        -> uuid, thiserror, async-trait
 db           -> sqlx, anyhow
-domain       -> serde, uuid, chrono; sqlx (optional, ssr only)
+domain       -> serde, uuid, chrono; sqlx (optional, ssr only);
+                `test-support` feature (test-only AuthUser constructors)
 ```
 
 Forbidden edges:
 
 - `saas` does not depend on Leptos, Axum, `casbin::Enforcer`, JWT, or Argon2. `sha2` is used only for `invitation::hash_token`.
 - `access` does not depend on business tables (`tenants`, `workspaces`, `documents`, `invitations`, `*_members`), HTTP, UI, JWT, or Argon2.
-- `authn` does not depend on `authz`. `sha2` is used only for `refresh_tokens.token_hash`.
+- `authn` does not depend on `authz`. `sha2` is used only for refresh- and email-verification `token_hash`. `lettre` is **not** a dependency of `authn`; SMTP delivery lives in the example.
 - `identity` does not depend on `authn` or `authz`.
 - `authz` does not depend on Casbin, SQL, HTTP, Leptos, or JWT. It does not know about specific roles.
 - `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`, `refresh_tokens`, `roles`, `permissions`). It uses raw SQL only against its own `casbin_rule` table (`has_role`, `count_users_with_role`, `purge_role`).
@@ -154,10 +161,13 @@ Example permissions and demo roles:
 | Database access | SQLx |
 | Authorization | Casbin (via `authz-casbin`) |
 | Authentication | Argon2, JSON Web Tokens (access), opaque tokens (refresh) |
+| Email verification | SHA-256 (`sha2`) over a random raw token; raw token not persisted; 24-hour TTL, single-active per user |
+| Email delivery | `lettre` (async SMTP, tokio1-rustls) in the example; Mailpit for local dev |
+| Rate limiting | In-memory sliding-window (`SimpleRateLimiter` in the example; not distributed) |
 | Invitation tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Refresh tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Styling | Tailwind CSS v4 |
-| Local infrastructure | Docker Compose (v1) |
+| Local infrastructure | Docker Compose (v1) — PostgreSQL + Mailpit |
 | Logging | `tracing` + `tracing-subscriber` (`RUST_LOG` env-filter) |
 | Testing | `cargo test`; `#[sqlx::test]` for per-test isolated databases |
 
@@ -177,14 +187,16 @@ rustup target add wasm32-unknown-unknown
 cargo install --locked cargo-leptos
 ```
 
-### Start PostgreSQL
+### Start PostgreSQL and Mailpit
 
 Run from the repository root:
 
 ```bash
 docker-compose up -d
-docker-compose ps   # STATUS = Up (healthy)
+docker-compose ps   # both services: postgres Up (healthy); mailpit Up
 ```
+
+Mailpit is only needed for the email-verification flow (Stage 3b). Open `http://localhost:8025` to read the inbox. Without Mailpit, the app falls back to `NoopEmailSender`: registration still succeeds, but the UI reports "email delivery not configured", and no verification link is delivered.
 
 ### Configure environment
 
@@ -226,6 +238,12 @@ ACCESS_TOKEN_TTL_MINUTES=15
 REFRESH_TOKEN_TTL_DAYS=30
 BIND_ADDR=127.0.0.1:3395
 
+# Stage 3b: SMTP for verification emails (points at Mailpit by default).
+# When unset, the app uses NoopEmailSender (registration still succeeds).
+SMTP_URL=smtp://localhost:1025
+# SMTP_FROM=noreply@example.test      # optional, defaults to noreply@example.test
+# BASE_URL=http://127.0.0.1:3395      # optional, defaults to http://{BIND_ADDR}
+
 # Read by docker-compose.yml (defaults are used if unset)
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
@@ -241,6 +259,7 @@ Notes:
 - `.env` must be LF, not CRLF.
 - Do not put `LEPTOS_*` variables into `.env`.
 - `DATABASE_URL` is used in three places: by the running application, by `seed`, and by `cargo test`. The user in `DATABASE_URL` must have the `CREATE DATABASE` privilege for `#[sqlx::test]`.
+- `SMTP_URL` is read only by `examples/saas-leptos`. The library (`authn`) does not depend on `lettre`.
 
 ### Apply migrations and seed data
 
@@ -250,7 +269,7 @@ Run from the repository root:
 cargo run -p seed
 ```
 
-Demo users created by seed:
+Demo users created by seed (all **email-verified** — Stage 3b):
 
 | Role | Email | Password |
 |---|---|---|
@@ -259,7 +278,7 @@ Demo users created by seed:
 | Workspace editor (role `editor`) | `editor@acme.test` | `Editor123!` |
 | Workspace viewer (role `viewer`) | `viewer@acme.test` | `Viewer123!` |
 
-The command applies database migrations (including `20261103000001_access_rbac_init.sql`, `20261103000002_saas_members_multi_role.sql`, and `20261104000001_access_members_list_permission.sql`) and creates initial platform, tenant, workspace, user, role, and authorization data. It is idempotent: re-running it re-hashes passwords and re-applies roles/policies without creating duplicate rows.
+The command applies database migrations (including `20261105000001_authn_email_verify.sql` — `users.email_verified_at`, `email_verifications`, `refresh_tokens.revoked_reason`) and creates initial platform, tenant, workspace, user, role, and authorization data. It is idempotent: re-running it re-hashes passwords, re-applies roles/policies, and marks demo accounts verified without moving their original `email_verified_at`.
 
 Seed flow:
 
@@ -267,8 +286,9 @@ Seed flow:
 2. Provisions the tenant via `saas::platform::provision_tenant(..., &RoleKey::parse("owner")?)`.
 3. Creates the workspace via `saas::tenant::create_workspace(..., &RoleKey::parse("owner")?)`.
 4. Creates demo roles `editor`/`viewer` via `saas::access::create_role`, then assigns them via `saas::access::assign_role`.
+5. Marks every demo account verified (`users.email_verified_at = COALESCE(existing, now())`).
 
-**Existing database.** `members_multi_role.sql` changes the primary keys on `tenant_members` and `workspace_members`. If your DB has older rows, re-run seed after `docker-compose down -v` (recommended) or apply a manual data migration.
+**Existing database.** `members_multi_role.sql` changes the primary keys on `tenant_members` and `workspace_members`, and `authn_email_verify.sql` adds new columns and a table. If your DB predates these migrations, `docker-compose down -v` + `cargo run -p seed` is the recommended path.
 
 Seed prints `tenant id:` and `workspace id:`; use them in the UI as shown below.
 
@@ -291,19 +311,25 @@ The live-reload port is `3396` (`[package.metadata.leptos] reload-port` in `exam
 
 Then in the browser:
 
-1. `/register` or `/login` with one of the demo accounts.
-2. `/platform` — as platform owner, create a tenant (the creator becomes its `owner` via `provision_tenant`).
-3. `/tenants` — list of tenants you're a member of; click **Open**.
-4. `/tenants/<tenant_id>` — as tenant owner, create a workspace; the creator becomes its `owner`.
-5. `/tenants/<tenant_id>/members` — as tenant owner, see members; assign or remove roles via member/role selects; "Invite instead" jumps to invitations.
-6. `/tenants/<tenant_id>/roles` — as tenant owner, list, create, edit, and delete custom roles.
-7. `/workspaces` — list of workspaces you're a member of.
-8. `/workspaces/<workspace_id>` — as editor, create documents; click a document title to view it on its dedicated page.
-9. `/workspaces/<workspace_id>/members` — as workspace owner, see members; assign or remove roles via member/role selects; "Invite instead" jumps to invitations.
-10. `/workspaces/<workspace_id>/roles` — as workspace owner, list, create, edit, and delete custom roles.
-11. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace owner, create a workspace invitation.
-12. Paste `/invitations/<64 hex>` into another browser/session (not logged in) — the page stores the URL in the `return_url` cookie; click **Log in** or **Register**, sign in, and you are redirected back to the same invitation page, where you can accept it. Accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`.
-13. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work.
+1. `/register` — create a new account. After submit, the page shows "Account created for …" plus the verification-email outcome:
+   - **Sent** — an email has been delivered to Mailpit; open `http://localhost:8025` to read the link.
+   - **Failed** — SMTP transport error; the page shows a **Resend** button.
+   - **Disabled** — no `SMTP_URL`; the page shows "email delivery is not configured".
+2. Open the verification link from Mailpit in the same or another browser → `/verify/:token` shows "Email verified: …" and a link to `/login`. Re-opening the same link is safe (idempotent).
+3. `/login` with one of the demo accounts (or your freshly-verified one).
+4. `/platform` — as platform owner, create a tenant (the creator becomes its `owner` via `provision_tenant`).
+5. `/tenants` — list of tenants you're a member of; click **Open**.
+6. `/tenants/<tenant_id>` — as tenant owner, create a workspace; the creator becomes its `owner`.
+7. `/tenants/<tenant_id>/members` — as tenant owner, see members; assign or remove roles via member/role selects; "Invite instead" jumps to invitations.
+8. `/tenants/<tenant_id>/roles` — as tenant owner, list, create, edit, and delete custom roles.
+9. `/workspaces` — list of workspaces you're a member of.
+10. `/workspaces/<workspace_id>` — as editor, create documents; click a document title to view it on its dedicated page.
+11. `/workspaces/<workspace_id>/members` — as workspace owner, see members; assign or remove roles via member/role selects; "Invite instead" jumps to invitations.
+12. `/workspaces/<workspace_id>/roles` — as workspace owner, list, create, edit, and delete custom roles.
+13. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace owner, create a workspace invitation.
+14. Paste `/invitations/<64 hex>` into another browser/session (not logged in) — the page stores the URL in the `return_url` cookie; click **Log in** or **Register**, sign in, and you are redirected back to the same invitation page, where you can accept it. Accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`.
+15. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work.
+16. Rate limit: on `RegisterPage` (or after login) press **Resend** four times within an hour — the 4th call returns 429 with "rate limited; try again in Ns".
 
 ### Checking the build
 
@@ -321,7 +347,7 @@ From the repository root:
 cargo test
 ```
 
-76 tests, all green (23 unit + 13 `authn` integration + 23 `saas` integration + 6 `access` integration + 9 `authz-casbin` integration).
+**83 tests, all green** (23 unit + 60 integration: `authn` 12 unit + 22 integration = 34; `saas` 11 unit + 23 integration = 34; `access` 6 integration; `authz-casbin` 9 integration). The count is a plan-level estimate; if the actual run differs slightly (e.g. 82–84), the code is the source of truth.
 
 Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/access`, and `crates/saas`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
@@ -329,6 +355,8 @@ Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/acc
 - No manual `createdb` is required.
 - The user in `DATABASE_URL` must have the `CREATE DATABASE` privilege.
 - Tests can run in parallel; isolation is per-database.
+
+The reference example has a small unit-test module too (`rate_limit.rs`); run it with `cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr rate_limit`.
 
 `accept_invitation`, `*::list_memberships`, and `check_invitation` have no unit tests: they do not call `authz.require` and go straight to SQL, which a lazy `PgPool` cannot serve; they are covered by integration tests.
 
@@ -354,15 +382,29 @@ Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/acc
 │   │       ├── 20261102000001_authn_refresh_tokens.sql
 │   │       ├── 20261103000001_access_rbac_init.sql
 │   │       ├── 20261103000002_saas_members_multi_role.sql
-│   │       └── 20261104000001_access_members_list_permission.sql
+│   │       ├── 20261104000001_access_members_list_permission.sql
+│   │       └── 20261105000001_authn_email_verify.sql
 │   └── seed/
 └── examples/
     └── saas-leptos/
+        ├── Cargo.toml
+        └── src/
+            ├── auth.rs           # register / login / refresh / logout
+            │                     # + set_return_url / take_return_url
+            │                     # + request_email_verification / verify_email
+            ├── email.rs          # EmailResult (hydration-visible);
+            │                     # EmailSender / SmtpEmailSender / NoopEmailSender (ssr)
+            ├── rate_limit.rs     # SimpleRateLimiter (ssr, in-memory)
+            └── ...
 ```
 
 ### domain
 
 Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`, `Invitation`, `Member`), the `InvitationTarget` enum (`Tenant(Uuid) | Workspace(Uuid)`), and authorization domain helpers (`PLATFORM_DOMAIN`, `tenant_domain`, `workspace_domain`). No SQL queries, no logic — just types. `sqlx::FromRow` / `sqlx::Type` derives are gated behind the `ssr` feature.
+
+`AuthUser.email_verified: bool` is a **derived** boolean (`users.email_verified_at IS NOT NULL`), computed in every SELECT by `identity`. The timestamp itself is internal to `identity`/`authn`.
+
+The `test-support` feature exposes `AuthUser::test_verified()` / `AuthUser::test_unverified()`; enabled only from `[dev-dependencies]` of crates with tests, never in production builds.
 
 ### authz
 
@@ -409,13 +451,20 @@ Does not know about `tenants`, `workspaces`, `documents`, `invitations`, `*_memb
 
 ### identity
 
-The sole owner of the `users` table. Provides `AuthUser`, `UserRecord` (including `password_hash`, never leaves this crate's boundary), `validate_email`, `validate_password`, `find_by_id`, `find_by_email`, `create_user`, and idempotent `upsert_user`. Does **not** hash passwords (that is `authn`'s job) and does not know about JWT, cookies, or roles.
+The sole owner of the `users` table. Provides `AuthUser`, `UserRecord` (including `password_hash` and `email_verified_at`; never leaves this crate's boundary), `validate_email`, `validate_password`, `find_by_id`, `find_by_email`, `create_user`, and idempotent `upsert_user`. Every `SELECT` that returns `AuthUser` computes `(email_verified_at IS NOT NULL) AS email_verified`. Does **not** hash passwords (that is `authn`'s job) and does not know about JWT, cookies, or roles.
 
 ### authn
 
-The authentication mechanism on top of `identity`. Provides `Authn::with_ttl`, `register`, `login`, `issue_access_token`, `issue_refresh_token`, `rotate_refresh_token`, `revoke_refresh_token`, `revoke_family`, `verify_token`, and `hash_password`. Uses Argon2, `jsonwebtoken`, and `sha2` for opaque refresh tokens. Does **not** know about HTTP, cookies, Leptos, or `AuthorizationEngine`.
+The authentication mechanism on top of `identity`. Provides `Authn::with_ttl`, `register`, `login`, `issue_access_token`, `issue_refresh_token`, `rotate_refresh_token`, `revoke_refresh_token`, `revoke_family(family_id, reason: Option<&str>)`, `verify_token`, and `hash_password`. Uses Argon2, `jsonwebtoken`, and `sha2` for opaque refresh- and email-verification tokens. Does **not** know about HTTP, cookies, Leptos, `lettre`, or `AuthorizationEngine`.
 
-`rotate_refresh_token` includes a **grace window** (`REFRESH_GRACE_SECONDS = 10`): when an already-used refresh token is presented within the window, rotation returns `RefreshInvalid` and leaves the token family intact. This absorbs the parallel-request race where two requests carry the same cookie (e.g. an SSR page and its subresource fetches, or two tabs). Presenting the same token **after** the window is a genuine reuse signal: `RefreshReused` is returned and the whole family is revoked. The value is a compile-time constant, not an env knob.
+**Claims (Stage 3b).** Access JWTs carry `{ sub, iat, exp }` — no `email`. `verify_token` resolves the `AuthUser` (including the current `email_verified` flag and the current address) from `users` on every call, so verification state and email changes are immediately visible without waiting for the access token to expire.
+
+**Refresh tokens (Stage 2b/2d).** `rotate_refresh_token` includes a **grace window** (`REFRESH_GRACE_SECONDS = 10`): an already-used token presented within the window returns `RefreshInvalid` and leaves the family intact (absorbs the parallel-request race); after the window it returns `RefreshReused` and revokes the family (`revoked_reason = "reuse_detected"`). Logout revokes the family with `revoked_reason = "logout"`. The `RevokeReason` enum (`Logout`, `ReuseDetected`, `PasswordReset`) mirrors the values; `PasswordReset` is reserved for Stage 3d.
+
+**Email verification (Stage 3b).**
+
+- `create_email_verification(user_id) -> Result<String, AuthnError>` — issues a fresh raw token (only `token_hash` is persisted) with `EMAIL_VERIFICATION_TTL_HOURS = 24`. Single-active: any unused token for the same user is deleted under a row lock; a partial unique index (`email_verifications_one_active_idx`) enforces the invariant at the DB level. Returns `AuthnError::AlreadyVerified` if `users.email_verified_at IS NOT NULL`.
+- `verify_email(raw_token) -> Result<AuthUser, AuthnError>` — idempotent. Marks the token used, writes `users.email_verified_at = COALESCE(existing, now())` (preserves the original timestamp if already verified). Does **not** issue tokens or cookies; the caller may prompt the user to sign in.
 
 ### saas
 
@@ -443,7 +492,7 @@ Every service calls `state.authz.require(...)` before touching the database, **e
 - `access::get_role`, `access::get_role_by_id`, `access::delete_role_by_id`, `access::get_permissions_for_role`, `access::create_owner_role`, `access::list_permissions` — helpers, called after `require` in a caller.
 - `saas::access::my_permissions` — read-only UX helper; any authenticated actor may discover their own effective permissions in a domain.
 
-Does not know about Leptos, Axum, HTTP handlers, `casbin::Enforcer`, JWT, Argon2, or the `permissions`/`roles`/`role_permissions` tables (owned by `access`).
+Does not know about Leptos, Axum, HTTP handlers, `casbin::Enforcer`, JWT, Argon2, `lettre`, or the `permissions`/`roles`/`role_permissions` tables (owned by `access`).
 
 ### db
 
@@ -455,6 +504,7 @@ PostgreSQL connection helper and migration runner. Migrations live in `crates/db
 - `20261103000001_access_rbac_init.sql` — `permissions`, `roles`, `role_permissions`; platform `owner` role with all permissions (owner: `access`).
 - `20261103000002_saas_members_multi_role.sql` — `*_members` PK → `(scope_id, user_id, role)`.
 - `20261104000001_access_members_list_permission.sql` — `(members, list)` reference row; top-up `roles.key='owner'` across all domains (owner: `access`).
+- `20261105000001_authn_email_verify.sql` — `users.email_verified_at`; `email_verifications` table + single-active partial unique index; `refresh_tokens.revoked_reason` (owner: `authn`; Stage 3b).
 
 Includes a `build.rs` with `cargo:rerun-if-changed=migrations` (and a `cargo:warning=` listing the migration set each time the build script runs).
 
@@ -465,16 +515,17 @@ Standalone binary for creating initial platform, tenant, workspace, user, role, 
 1. Grants `platform` `owner` to the platform admin via `authz.grant_role` with permissions from `access::get_permissions_for_role`.
 2. Provisions the tenant (`saas::platform::provision_tenant`) and workspace (`saas::tenant::create_workspace`) with `RoleKey::parse("owner")?`.
 3. Creates demo roles `editor`/`viewer` via `saas::access::create_role` and assigns them via `saas::access::assign_role`.
+4. Marks each demo account verified (`users.email_verified_at = COALESCE(existing, now())`) — Stage 3b. Idempotent: the original timestamp is preserved on repeat runs.
 
 Uses a single `PgPool` for `authz-casbin`, `access`, `saas`, and `authn` (`CasbinAuthz::from_pool`).
 
-Idempotent: re-runs re-hash passwords, skip existing tenant/workspace, and re-apply role assignments without duplicates.
+Idempotent: re-runs re-hash passwords, skip existing tenant/workspace, re-apply role assignments without duplicates, and do not move `email_verified_at`.
 
 ### examples/saas-leptos
 
-The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*`, `saas::access::*`, `saas::member::*`, or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn` / `error::access_error_to_server_fn`, which map to HTTP 400/401/403/409/500. `AppState` holds `authn`, `saas` (which contains `access`), and `leptos_options`.
+The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*`, `saas::access::*`, `saas::member::*`, or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn` / `error::access_error_to_server_fn` / `error::rate_limited_error`, which map to HTTP 400/401/403/404/409/429/500. `AppState` holds `authn`, `saas` (which contains `access`), `leptos_options`, `email: Arc<dyn EmailSender>`, and `rate_limit: Arc<SimpleRateLimiter>`.
 
-`src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout. `src/pages/{member,role}.rs` hold tenant/workspace member and role management. This crate is **not** part of the library workspace.
+`src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout; `src/email.rs` holds `EmailResult` (visible in both `ssr` and `hydrate`) and the SMTP transports (`SmtpEmailSender`, `NoopEmailSender` — `ssr` only); `src/rate_limit.rs` holds `SimpleRateLimiter` (in-memory, `ssr` only). `src/pages/{member,role,auth}.rs` hold the tenant/workspace member and role management and the auth + verification pages. This crate is **not** part of the library workspace.
 
 `main.rs` builds two routers and merges them:
 
@@ -483,13 +534,16 @@ The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers
 
 The split avoids running JWT verification, refresh-token rotation, and `Set-Cookie` on static assets.
 
+`main.rs` also constructs the email transport from `SMTP_URL` (falls back to `NoopEmailSender` when unset) and an in-memory `SimpleRateLimiter` (3 per hour per email, enforced in `request_email_verification`). `BASE_URL` and `SMTP_FROM` have sensible defaults (`http://{BIND_ADDR}`, `noreply@example.test`).
+
 Routes:
 
 | Route | Component | Purpose |
 |---|---|---|
 | `/` | `pages::home::HomePage` | landing page, links |
 | `/login` | `pages::auth::LoginPage` | sign in; consumes `return_url` after success (Stage 3a) |
-| `/register` | `pages::auth::RegisterPage` | sign up; consumes `return_url` after success (Stage 3a) |
+| `/register` | `pages::auth::RegisterPage` | sign up; shows `EmailResult` (Sent / Failed+Resend / Disabled); consumes `return_url` |
+| `/verify/:token` | `pages::auth::VerifyEmailPage` | email verification link target (Stage 3b); idempotent, no auto-login |
 | `/platform` | `pages::platform::PlatformPage` | create a tenant (as platform owner) |
 | `/tenants` | `pages::tenant::TenantListPage` | list of my tenants |
 | `/tenants/:tenant_id` | `pages::tenant::TenantPage` | single tenant (create workspace) |
@@ -560,13 +614,17 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Treat UI visibility as convenience, not as a security boundary.
 - **Roles are data, not code.** No built-in role enums; `owner` is a row created by `access::create_owner_role`/the SQL migration; custom roles are created and edited by the domain owner.
 - **Role edit is UI-editable for `name`, `description`, and `permissions`.** `key` is read-only after creation (ADR-0001: rename = delete + create). `protected`/`immutable` roles (`owner`) cannot be edited or deleted.
-- `saas` and `authn` do not know about Leptos, Axum, or Casbin. `saas` does not know about `permissions`/`roles`/`role_permissions` — those belong to `access`.
+- `saas` and `authn` do not know about Leptos, Axum, or Casbin. `saas` does not know about `permissions`/`roles`/`role_permissions` — those belong to `access`. `authn` does not depend on `lettre` — SMTP transport lives in the example.
 - Library crates do not depend on `examples/*`; each example has its own `Cargo.toml` and `Cargo.lock`.
 - Server functions resolve the actor through `extract::CurrentUser`; a missing actor is HTTP 401.
 - Library errors (`CoreError`, `AuthnError`, `IdentityError`, `AccessError`) are mapped to HTTP status codes in the example (`src/error.rs`); keep new variants covered by that mapping.
 - Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored.
 - Refresh raw tokens are returned once from `authn::issue_refresh_token` and are never persisted; only `refresh_tokens.token_hash` (SHA-256) is stored.
-- `accept_invitation` does not compare `actor.email` to `invitation.email` until email verification is implemented.
+- **Email-verification raw tokens (Stage 3b)** are returned once from `authn::create_email_verification` and are never persisted; only `email_verifications.token_hash` (SHA-256) is stored. `NoopEmailSender` logs only the recipient and the fact of a skipped send — **never the token**.
+- **Access JWT claims are `{ sub, iat, exp }` (Stage 3b).** The address and the `email_verified` flag are always resolved from `users` on `verify_token`.
+- `accept_invitation` does not compare `actor.email` to `invitation.email` until Stage 3c. From Stage 3c, addressed invitations will require `actor.email_verified`.
+- **Email delivery failures are not registration failures.** `#[server] register` returns `(AuthUser, EmailResult)`; the account is created and cookies set regardless of the SMTP outcome. `RegisterPage` offers a **Resend** button when `Failed`.
+- **`request_email_verification` is rate limited to 3/hour per email** via the process-local `SimpleRateLimiter`; the 4th call returns 429. Not distributed across instances (Stage 4+).
 - **Post-auth return-URL preservation (Stage 3a):** anonymous visitors on `/invitations/:token` store the path in the `return_url` cookie (`auth::set_return_url`); `pages::auth::{LoginPage, RegisterPage}` call `auth::take_return_url` after successful sign-in and navigate there, falling back to `/` when the cookie is absent or unsafe. `is_safe_return_url` rejects `//`, `:` in the first segment, `;`/`,`/`"`/`\`/whitespace, and prefixes `/login`/`/register`. The cookie is `httpOnly`, `SameSite=Lax`, `Path=/`, session lifetime; `Secure` is deferred to Stage 4 (added to all auth cookies together).
 - `authn::rotate_refresh_token` has a 10-second grace window for parallel refresh requests; a parallel request within the window returns `RefreshInvalid` and does not revoke the token family. Distributed single-flight for multi-instance deployments is not implemented.
 - `saas::member::change_role` performs `assign` before `revoke`. A partial failure leaves the user over-permissioned with both roles (recoverable by retrying `change_role`); under-permissioning on partial failure is not possible.
@@ -587,16 +645,17 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Stage 2e.1 (done): cleanup — page naming convention (`EntityOperationPage`), EN comments, migration set sync, docs counters.
 - Stage 2c (done): tenant and workspace member management, roles UI, UI gating via `saas::access::my_permissions`, Renew-demo removed.
 - Stage 2d (done): casbin cleanup (`purge_role`, `delete_role_by_id`), single `PgPool` (`from_pool`), owner guard, refresh grace window, `.route_layer` split for auto-refresh.
-- **Stage 3.0 (done): ADRs 0002/0003/0004 (auth-scoping, cross-table transactions, audit log) — doc-only.**
-- **Stage 3a (done): UX 2.5 — role edit (`RoleFormPage`, `update_role` UI, read-only `key`), member selects (`<select>` for user and role), "Invite instead" link, return-URL preservation across login/registration (`set_return_url` / `take_return_url` / `is_safe_return_url`).**
-- Stage 3b (next): email verification, claims cleanup (`-email`, `+iat`), Mailpit + `lettre`, rate limiter.
-- Stage 3c: addressed invitations (`accept_invitation` checks `actor.email_verified`).
+- Stage 3.0 (done): ADRs 0002/0003/0004 (auth-scoping, cross-table transactions, audit log) — doc-only.
+- Stage 3a (done): UX 2.5 — role edit (`RoleFormPage`, `update_role` UI, read-only `key`), member selects (`<select>` for user and role), "Invite instead" link, return-URL preservation across login/registration (`set_return_url` / `take_return_url` / `is_safe_return_url`).
+- **Stage 3b (done): email verification + claims cleanup.** `users.email_verified_at`; `email_verifications` (single-active, 24h); `authn::{create_email_verification, verify_email}`; `AuthnError::AlreadyVerified`; `RevokeReason` (`logout`/`reuse_detected`/`password_reset`) + `refresh_tokens.revoked_reason`; claims cleanup (`-email, +iat`); `lettre` + Mailpit in the example; `SimpleRateLimiter` (3/hour per email); `EmailResult` on `RegisterPage`; `/verify/:token` page; demo accounts marked verified by `seed`.
+- Stage 3c (next): addressed invitations (`accept_invitation` requires `actor.email_verified`).
 - Stage 3d: password reset (`password_reset_tokens`, `revoke_all_user_tokens`, `revoked_reason`).
 - Stage 3e: audit log (`audit` + `audit-pg`, 21 events).
 - Stage 3f: platform admin (`list_tenants`, `suspend_tenant`, `activate_tenant`, `resolve_active_tenant`, `ActiveTenant`, `TenantSuspended`); audit view.
 - Stage 3g: `axum-minimal` (portability proof).
 - Stage 3h: infra + minor (`has_policy` pre-check, `pg_advisory_xact_lock`, `my_permissions` cache, `casbin_rule` dedup).
-- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (incl. `/refresh`), optional RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention.
+- **Micro-PR (after 3d):** migrate from `docker-compose` (v1) to `docker compose` (v2 plugin) in README/`.env.example`/handoff; v2 does not emit the spurious `KeyError: 'id'` traceback from `log_printer` on `Ctrl+C` after `docker-compose up` in foreground.
+- Stage 4: Dockerfile, CI (fmt/clippy/test/migration check), observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (incl. `/refresh`), optional RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention, distributed single-flight refresh, distributed rate limiter.
 
 ## License
 

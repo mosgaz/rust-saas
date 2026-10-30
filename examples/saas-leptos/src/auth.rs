@@ -1,5 +1,5 @@
-//! Server functions for registration, login, refresh, logout, and (Stage 3a)
-//! post-auth return-URL preservation.
+//! Server functions for registration, login, refresh, logout, email
+//! verification (Stage 3b), and post-auth return-URL preservation (Stage 3a).
 //!
 //! All delegate to `authn::*`. Cookies are managed by the example, not by
 //! `authn`:
@@ -12,18 +12,33 @@
 //! `Secure` / `SameSite` are Stage 4. Session cookies (no `Max-Age`) — the
 //! browser keeps them until close; persistence is Stage 4.
 //!
-//! Stage 3a adds `set_return_url` / `take_return_url`. Flow: an anonymous
+//! Stage 3a: `set_return_url` / `take_return_url`. Flow: an anonymous
 //! user lands on `/invitations/:token` → `set_return_url` stores the path in
 //! the `return_url` cookie → login or registration → `take_return_url` reads
 //! and removes it → the client navigates there. Both server functions are
 //! deliberately **unauthenticated**: the cookie may be set before login and
 //! consumed immediately after, with no `CurrentUser` yet.
 //!
+//! Stage 3b:
+//! - `register` now returns `(AuthUser, EmailResult)`: the account is
+//!   created and tokens are issued regardless of the email outcome; the
+//!   verification email is best-effort. The UI shows "sent" / "failed, retry?"
+//!   / "disabled (no SMTP)" on `RegisterPage`.
+//! - `request_email_verification` issues a fresh token (single-active;
+//!   replaces any unused one) and sends the link. Rate limited to
+//!   `3 / 1h` per email via `AppState.rate_limit`; the 4th call in the
+//!   window returns HTTP 429.
+//! - `verify_email(token)` is **public** (no `CurrentUser::require`): the
+//!   link is clicked from the email, possibly in an anonymous browser. It is
+//!   idempotent (already-verified → `Ok`) and does **not** log the user in.
+//!
 //! Errors are mapped to HTTP status codes by `crate::error`
-//! (`authn_error_to_server_fn`).
+//! (`authn_error_to_server_fn`, `rate_limited_error`).
 
 use domain::AuthUser;
 use leptos::prelude::*;
+
+use crate::email::EmailResult;
 
 #[cfg(feature = "ssr")]
 use axum::http::HeaderValue;
@@ -96,9 +111,18 @@ fn append_cookie(
 
 // ─── register / login / refresh / logout ────────────────────────────────────
 
-/// Registers a new user, issues access + refresh tokens, and sets both cookies.
+/// Registers a new user, issues access + refresh tokens, sets both cookies,
+/// and attempts to send the verification email (best-effort).
+///
+/// The verification email is sent **after** cookies are set: registration
+/// succeeds even if SMTP is down. `EmailResult` in the return value tells
+/// the UI which of `Sent` / `Failed` / `Disabled` to render on
+/// `RegisterPage`.
 #[server]
-pub async fn register(email: String, password: String) -> Result<AuthUser, ServerFnError> {
+pub async fn register(
+    email: String,
+    password: String,
+) -> Result<(AuthUser, EmailResult), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
 
     let user = state
@@ -121,7 +145,31 @@ pub async fn register(email: String, password: String) -> Result<AuthUser, Serve
     append_cookie(&response, crate::middleware::access_cookie(access))?;
     append_cookie(&response, crate::middleware::refresh_cookie(refresh))?;
 
-    Ok(user)
+    // Best-effort verification email. `AlreadyVerified` here would mean the
+    // user is already verified right after `create_user` (unreachable in
+    // practice — `email_verified_at` is NULL on insert). Log and skip.
+    let email_result = match state.authn.create_email_verification(user.id).await {
+        Ok(token) => state.email.send_verification(&user.email, &token).await,
+        Err(authn::AuthnError::AlreadyVerified) => {
+            tracing::error!(
+                user_id = %user.id,
+                "register: user already verified immediately after creation; skipping verification email"
+            );
+            EmailResult::Disabled
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                user_id = %user.id,
+                "register: create_email_verification failed; verification email not sent"
+            );
+            EmailResult::Failed {
+                reason: e.to_string(),
+            }
+        }
+    };
+
+    Ok((user, email_result))
 }
 
 /// Logs in an existing user, issues access + refresh tokens, sets both cookies.
@@ -166,7 +214,7 @@ pub async fn refresh() -> Result<AuthUser, ServerFnError> {
 /// Clears both cookies and revokes the refresh-token family in the database.
 ///
 /// Access token stays valid until its short `exp`; refresh-token family is
-/// revoked, so the session cannot be extended.
+/// revoked (`revoked_reason = "logout"`), so the session cannot be extended.
 #[server]
 pub async fn logout() -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -194,6 +242,61 @@ pub async fn logout() -> Result<(), ServerFnError> {
     )?;
 
     Ok(())
+}
+
+// ─── Stage 3b: email verification ───────────────────────────────────────────
+
+/// Issues a fresh email-verification token for the current user and sends
+/// the link. Replaces any unused previous token (single-active).
+///
+/// Rate limited to `3 / 1h` per user email
+/// (`AppState.rate_limit::try_acquire`); the 4th request in the window
+/// returns HTTP 429 with the number of seconds until the window frees a
+/// slot.
+///
+/// Returns `EmailResult` (`Sent` / `Failed` / `Disabled`) — transport
+/// failures are not `ServerFnError`s; they surface in the UI so the user
+/// can retry. `authn::AuthnError::AlreadyVerified` (user already verified)
+/// maps to HTTP 409 via `authn_error_to_server_fn`.
+#[server]
+pub async fn request_email_verification() -> Result<EmailResult, ServerFnError> {
+    use std::time::Duration;
+
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+
+    if let Err(retry_after) = state
+        .rate_limit
+        .try_acquire(&user.email, 3, Duration::from_secs(3600))
+    {
+        return Err(crate::error::rate_limited_error(retry_after));
+    }
+
+    let token = state
+        .authn
+        .create_email_verification(user.id)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+
+    Ok(state.email.send_verification(&user.email, &token).await)
+}
+
+/// Verifies an email address by raw token from the `/verify/:token` link.
+///
+/// **Public** (no `CurrentUser::require`): the link is clicked from an
+/// email, possibly in an anonymous browser session. Idempotent — already-
+/// verified users get `Ok(AuthUser)`; the original
+/// `users.email_verified_at` is preserved. Does **not** log the user in;
+/// `VerifyEmailPage` prompts them to sign in afterwards.
+#[server]
+pub async fn verify_email(token: String) -> Result<AuthUser, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = state
+        .authn
+        .verify_email(&token)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+    Ok(user)
 }
 
 // ─── Stage 3a: return-URL preservation ──────────────────────────────────────

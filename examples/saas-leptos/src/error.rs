@@ -7,7 +7,8 @@
 //!   `TokenExpired`, `RefreshInvalid`, `RefreshReused`           -> 401
 //! - `Forbidden`, `Protected`, `Immutable`                       -> 403
 //! - `NotFound`, `RoleNotFound`, `PermissionNotFound`            -> 404
-//! - `DuplicateEmail` (Identity)                                 -> 409
+//! - `DuplicateEmail` (Identity), `AlreadyVerified` (Authn)      -> 409
+//! - `rate_limited_error(...)`                                   -> 429
 //! - `Internal`, `Db`                                            -> 500
 //!
 //! The body of `ServerFnError` is the error's `Display` string. The HTTP
@@ -47,6 +48,7 @@ fn status_for_authn(e: &AuthnError) -> u16 {
         AuthnError::InvalidCredentials => 401,
         AuthnError::TokenInvalid | AuthnError::TokenExpired => 401,
         AuthnError::RefreshInvalid | AuthnError::RefreshReused => 401,
+        AuthnError::AlreadyVerified => 409,
         AuthnError::Internal(_) => 500,
         AuthnError::Identity(inner) => status_for_identity(inner),
         AuthnError::Db(_) => 500,
@@ -93,4 +95,12 @@ pub fn access_error_to_server_fn(e: AccessError) -> ServerFnError {
 pub fn unauthorized_error() -> ServerFnError {
     set_status(401);
     ServerFnError::new("unauthorized")
+}
+
+/// `ServerFnError` with HTTP 429 for "rate limited; retry later".
+pub fn rate_limited_error(retry_after_secs: u64) -> ServerFnError {
+    set_status(429);
+    ServerFnError::new(format!(
+        "rate limited; try again in {retry_after_secs}s"
+    ))
 }

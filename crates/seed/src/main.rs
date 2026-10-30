@@ -15,6 +15,14 @@
 //! The `AuthorizationEngine` shares the same `PgPool` as `saas`/`access`
 //! (`CasbinAuthz::from_pool`), so a single connection pool serves the whole
 //! process (Stage 2d).
+//!
+//! Stage 3b: every demo account created by this binary is marked
+//! email-verified (`users.email_verified_at = COALESCE(existing, now())`).
+//! Rationale: demo accounts are trusted — they are documented in the README
+//! and used by smoke-checklists. Marking them verified keeps the Stage 3b
+//! email-verification banner out of the way and prepares for Stage 3c
+//! (`accept_invitation` requires `actor.email_verified`). Idempotent: an
+//! already-verified account keeps its original timestamp.
 
 use std::sync::Arc;
 
@@ -23,6 +31,7 @@ use authz::AuthorizationEngine;
 use domain::{AuthUser, Tenant, Workspace};
 use saas::{access as saas_access, platform, tenant, workspace, SaasBuilder};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,10 +51,10 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let platform_admin =
-        upsert_user(&pool, "platform-admin@example.test", "PlatformAdmin123!").await?;
-    let tenant_owner = upsert_user(&pool, "owner@acme.test", "Owner123!").await?;
-    let editor_user = upsert_user(&pool, "editor@acme.test", "Editor123!").await?;
-    let viewer_user = upsert_user(&pool, "viewer@acme.test", "Viewer123!").await?;
+        upsert_verified_user(&pool, "platform-admin@example.test", "PlatformAdmin123!").await?;
+    let tenant_owner = upsert_verified_user(&pool, "owner@acme.test", "Owner123!").await?;
+    let editor_user = upsert_verified_user(&pool, "editor@acme.test", "Editor123!").await?;
+    let viewer_user = upsert_verified_user(&pool, "viewer@acme.test", "Viewer123!").await?;
 
     let owner_key = RoleKey::parse("owner")?;
 
@@ -186,8 +195,28 @@ async fn main() -> anyhow::Result<()> {
 /// Creates or updates a user by email; returns its `AuthUser`.
 ///
 /// Idempotent: re-running re-hashes the password and updates the existing row.
-async fn upsert_user(pool: &PgPool, email: &str, password: &str) -> anyhow::Result<AuthUser> {
+/// Stage 3b: also marks the account email-verified (`COALESCE(existing,
+/// now())`) so demo accounts do not show the "verify your email" banner.
+async fn upsert_verified_user(
+    pool: &PgPool,
+    email: &str,
+    password: &str,
+) -> anyhow::Result<AuthUser> {
     let hash = authn::hash_password(password)?;
     let user = identity::upsert_user(pool, email, &hash).await?;
+    mark_verified(pool, user.id).await?;
     Ok(user)
+}
+
+/// Marks a user's email as verified if it is not already. Idempotent:
+/// `COALESCE(email_verified_at, now())` preserves the original timestamp on
+/// repeat runs.
+async fn mark_verified(pool: &PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        "update users set email_verified_at = coalesce(email_verified_at, now()) where id = $1",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

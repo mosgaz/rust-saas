@@ -200,38 +200,23 @@ async fn has_role_reflects_g_rows(pool: PgPool) {
         .unwrap();
 
     assert!(
-        authz
-            .has_role(user_id, domain, "editor")
-            .await
-            .unwrap(),
+        authz.has_role(user_id, domain, "editor").await.unwrap(),
         "has_role must be true after grant"
     );
     assert!(
-        !authz
-            .has_role(user_id, domain, "viewer")
-            .await
-            .unwrap(),
+        !authz.has_role(user_id, domain, "viewer").await.unwrap(),
         "has_role must be false for a role the user does not hold"
     );
 
     let other_user = Uuid::new_v4();
     assert!(
-        !authz
-            .has_role(other_user, domain, "editor")
-            .await
-            .unwrap(),
+        !authz.has_role(other_user, domain, "editor").await.unwrap(),
         "has_role must be per-user"
     );
 
-    authz
-        .revoke_role(user_id, domain, "editor")
-        .await
-        .unwrap();
+    authz.revoke_role(user_id, domain, "editor").await.unwrap();
     assert!(
-        !authz
-            .has_role(user_id, domain, "editor")
-            .await
-            .unwrap(),
+        !authz.has_role(user_id, domain, "editor").await.unwrap(),
         "has_role must be false after revoke"
     );
 }
@@ -253,34 +238,25 @@ async fn count_users_with_role_tracks_holders(pool: PgPool) {
     let u3 = Uuid::new_v4();
 
     authz.grant_role(u1, domain, "owner", &perms).await.unwrap();
-    let c1 = authz
-        .count_users_with_role(domain, "owner")
-        .await
-        .unwrap();
+    let c1 = authz.count_users_with_role(domain, "owner").await.unwrap();
     assert_eq!(c1, 1, "one holder after first grant");
 
     authz.grant_role(u2, domain, "owner", &perms).await.unwrap();
-    let c2 = authz
-        .count_users_with_role(domain, "owner")
-        .await
-        .unwrap();
+    let c2 = authz.count_users_with_role(domain, "owner").await.unwrap();
     assert_eq!(c2, 2, "two distinct holders");
 
-    authz.grant_role(u3, domain, "editor", &perms).await.unwrap();
-    let c_owner = authz
-        .count_users_with_role(domain, "owner")
-        .await
-        .unwrap();
-    assert_eq!(c_owner, 2, "count is per-role, editor does not affect owner");
-
     authz
-        .revoke_role(u2, domain, "owner")
+        .grant_role(u3, domain, "editor", &perms)
         .await
         .unwrap();
-    let c_after = authz
-        .count_users_with_role(domain, "owner")
-        .await
-        .unwrap();
+    let c_owner = authz.count_users_with_role(domain, "owner").await.unwrap();
+    assert_eq!(
+        c_owner, 2,
+        "count is per-role, editor does not affect owner"
+    );
+
+    authz.revoke_role(u2, domain, "owner").await.unwrap();
+    let c_after = authz.count_users_with_role(domain, "owner").await.unwrap();
     assert_eq!(c_after, 1, "count decreases after revoke");
 }
 
@@ -306,29 +282,24 @@ async fn purge_role_removes_g_and_p_rows_and_is_idempotent(pool: PgPool) {
     // present from the first grant. Re-listing permissions here would rely
     // on casbin-rs's `add_policy` deduplicating (role, domain, resource,
     // action) — which it does not guarantee; see handoff §16.
-    authz
-        .grant_role(u2, domain, role_key, &[])
-        .await
-        .unwrap();
+    authz.grant_role(u2, domain, role_key, &[]).await.unwrap();
 
-    let g_rows: i64 = sqlx::query_scalar(
-        "select count(*) from casbin_rule where ptype='g' and v1=$1 and v2=$2",
-    )
-    .bind(role_key)
-    .bind(domain)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let g_rows: i64 =
+        sqlx::query_scalar("select count(*) from casbin_rule where ptype='g' and v1=$1 and v2=$2")
+            .bind(role_key)
+            .bind(domain)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(g_rows, 2, "two g-rows (one per user)");
 
-    let p_rows: i64 = sqlx::query_scalar(
-        "select count(*) from casbin_rule where ptype='p' and v0=$1 and v1=$2",
-    )
-    .bind(role_key)
-    .bind(domain)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let p_rows: i64 =
+        sqlx::query_scalar("select count(*) from casbin_rule where ptype='p' and v0=$1 and v1=$2")
+            .bind(role_key)
+            .bind(domain)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(p_rows, 2, "one p-row per permission");
 
     let deleted = authz
@@ -352,17 +323,11 @@ async fn purge_role_removes_g_and_p_rows_and_is_idempotent(pool: PgPool) {
     assert_eq!(remaining, 0, "no rows must remain after purge");
 
     assert!(
-        !authz
-            .can(u1, domain, "documents", "read")
-            .await
-            .unwrap(),
+        !authz.can(u1, domain, "documents", "read").await.unwrap(),
         "in-memory model must not grant permission after purge"
     );
     assert!(
-        !authz
-            .has_role(u1, domain, role_key)
-            .await
-            .unwrap(),
+        !authz.has_role(u1, domain, role_key).await.unwrap(),
         "has_role must be false after purge"
     );
 
@@ -386,10 +351,7 @@ async fn purge_role_leaves_other_roles_and_domains_intact(pool: PgPool) {
         .grant_role(u, domain_a, "target", &perms)
         .await
         .unwrap();
-    authz
-        .grant_role(u, domain_a, "keep", &perms)
-        .await
-        .unwrap();
+    authz.grant_role(u, domain_a, "keep", &perms).await.unwrap();
     authz
         .grant_role(u, domain_b, "target", &perms)
         .await
@@ -399,24 +361,15 @@ async fn purge_role_leaves_other_roles_and_domains_intact(pool: PgPool) {
     assert_eq!(deleted, 2, "one g-row + one p-row in domain_a");
 
     assert!(
-        authz
-            .can(u, domain_a, "documents", "read")
-            .await
-            .unwrap(),
+        authz.can(u, domain_a, "documents", "read").await.unwrap(),
         "other role 'keep' must still grant permission in domain_a"
     );
     assert!(
-        authz
-            .can(u, domain_b, "documents", "read")
-            .await
-            .unwrap(),
+        authz.can(u, domain_b, "documents", "read").await.unwrap(),
         "same role_key 'target' in domain_b must not be purged"
     );
     assert!(
-        !authz
-            .has_role(u, domain_a, "target")
-            .await
-            .unwrap(),
+        !authz.has_role(u, domain_a, "target").await.unwrap(),
         "target must be gone from domain_a"
     );
 }

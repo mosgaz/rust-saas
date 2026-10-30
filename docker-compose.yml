@@ -22,6 +22,23 @@ services:
     networks:
       - rust_saas_net
 
+  # Stage 3b: Mailpit — local SMTP server + web UI for inspecting emails.
+  # Used by `examples/saas-leptos` (`SmtpEmailSender`) when `SMTP_URL` is set
+  # to `smtp://localhost:1025`. Open http://localhost:8025 to read messages.
+  # No volume: the inbox is dev-only and may be discarded on `down`.
+  mailpit:
+    image: axllent/mailpit:v1.20
+    container_name: rust-saas-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP — lettre (SmtpEmailSender) connects here
+      - "8025:8025"   # Web UI — http://localhost:8025
+    environment:
+      # Dev-only: raise if you hit the default cap during a demo.
+      MP_MAX_MESSAGES: 5000
+    networks:
+      - rust_saas_net
+
 volumes:
   rust_saas_pg_data:
 

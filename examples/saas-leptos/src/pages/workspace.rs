@@ -295,7 +295,7 @@ pub fn WorkspacePage() -> impl IntoView {
 
             <div class="mt-4 flex gap-2 flex-wrap">
                 {move || {
-                    let Some(id) = workspace_id() else { return None };
+                    let id = workspace_id()?;
                     let mut links = Vec::new();
                     if can_invitations.get() {
                         links.push(view! {
@@ -323,7 +323,7 @@ pub fn WorkspacePage() -> impl IntoView {
             </div>
 
             {move || {
-                let Some(id) = workspace_id() else { return None };
+                let id = workspace_id()?;
                 can_write.get().then(|| view! {
                     <DocumentFormPage workspace_id=id on_created=on_created />
                 })
