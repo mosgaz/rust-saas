@@ -7,6 +7,18 @@
 //! **Invariant exception (§5 p.5):** [`accept_invitation`] does **not** call
 //! `authz.require` — it authorizes by the invitation token. All other
 //! services in this module check `authz.require(...)` first.
+//!
+//! Stage 3c: [`accept_invitation`] enforces addressed invitations before
+//! mutating anything:
+//! 1. If `invitation.email IS NULL` (link), no extra checks.
+//! 2. If `invitation.email IS NOT NULL`:
+//!    a. `actor.email_verified == false` → [`CoreError::EmailNotVerified`]
+//!       (verified-first: an unverified address is not proof of ownership).
+//!    b. `!actor.email.eq_ignore_ascii_case(invitation.email)` →
+//!       [`CoreError::Forbidden`] (case-insensitive; see Appendix B §2.32).
+//!
+//! The check runs after the `SELECT ... FOR UPDATE` lookup and before
+//! `used_count` is incremented, so a rejected accept does not consume a use.
 
 use domain::{AuthUser, Invitation, InvitationTarget};
 use sha2::{Digest, Sha256};
@@ -104,6 +116,26 @@ pub async fn check_invitation(
 }
 
 /// Accepts an invitation by raw token.
+///
+/// Order:
+/// 1. `SELECT ... FOR UPDATE` by `token_hash`, filtered by
+///    `revoked_at IS NULL`, `expires_at >= now()`, and remaining uses;
+///    `None` → [`CoreError::NotFound`].
+/// 2. **Stage 3c:** if `invitation.email IS NOT NULL` (addressed):
+///    a. `actor.email_verified == false` → [`CoreError::EmailNotVerified`]
+///       (verified-first, see §«Решения A»).
+///    b. `!actor.email.eq_ignore_ascii_case(inv.email)` →
+///       [`CoreError::Forbidden`] (case-insensitive, §«Решения C»).
+///    Both checks run **before** `used_count` is incremented, so a
+///    rejected accept does not consume a use.
+/// 3. `UPDATE used_count`.
+/// 4. Insert `*_members` (`ON CONFLICT DO NOTHING`; multi-role PK) and
+///    `authz.grant_role`.
+/// 5. `COMMIT`.
+///
+/// Link invitations (`email IS NULL`) skip step 2 entirely; unverified
+/// actors may still accept them (Stage 3c preserves the Stage 2a
+/// behaviour for links).
 pub async fn accept_invitation(
     state: &SaasState,
     user: &AuthUser,
@@ -127,6 +159,18 @@ pub async fn accept_invitation(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(CoreError::NotFound)?;
+
+    // Stage 3c: addressed invitation — verified-first, then case-insensitive
+    // match. Both checks precede any mutation (`used_count`, `*_members`,
+    // `casbin_rule`), so a rejected accept leaves the invitation untouched.
+    if let Some(inv_email) = invitation.email.as_deref() {
+        if !user.email_verified {
+            return Err(CoreError::EmailNotVerified);
+        }
+        if !user.email.eq_ignore_ascii_case(inv_email) {
+            return Err(CoreError::Forbidden);
+        }
+    }
 
     sqlx::query("update invitations set used_count = used_count + 1 where id = $1")
         .bind(invitation.id)

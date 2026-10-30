@@ -5,11 +5,16 @@
 //! - `Validation`, `InvalidRoleKey`                              -> 400
 //! - `Unauthorized`, `InvalidCredentials`, `TokenInvalid`,
 //!   `TokenExpired`, `RefreshInvalid`, `RefreshReused`           -> 401
-//! - `Forbidden`, `Protected`, `Immutable`                       -> 403
+//! - `Forbidden`, `EmailNotVerified`, `Protected`, `Immutable`   -> 403
 //! - `NotFound`, `RoleNotFound`, `PermissionNotFound`            -> 404
 //! - `DuplicateEmail` (Identity), `AlreadyVerified` (Authn)      -> 409
 //! - `rate_limited_error(...)`                                   -> 429
 //! - `Internal`, `Db`                                            -> 500
+//!
+//! Stage 3c: `CoreError::EmailNotVerified` (addressed invitation with an
+//! unverified actor) maps to 403; the message is distinct
+//! (`"email not verified"`) so the UI can offer "resend verification email"
+//! instead of a generic forbidden.
 //!
 //! The body of `ServerFnError` is the error's `Display` string. The HTTP
 //! status is set via `leptos_axum::ResponseOptions` before the `#[server]`
@@ -28,7 +33,7 @@ fn status_for_core(e: &CoreError) -> u16 {
     match e {
         CoreError::Validation(_) => 400,
         CoreError::Unauthorized => 401,
-        CoreError::Forbidden => 403,
+        CoreError::Forbidden | CoreError::EmailNotVerified => 403,
         CoreError::NotFound => 404,
         CoreError::Internal(_) | CoreError::Db(_) => 500,
     }

@@ -1,3 +1,15 @@
+# Шаг 6/10: `README.md`
+
+**Изменения против Stage 3b:**
+- Features: addressed invitations требуют `email_verified` + case-insensitive match; `EmailSender::send_invitation` + `Sent / Failed / Disabled` в UI; новый `CoreError::EmailNotVerified`.
+- Architecture / `saas`: `accept_invitation` — verified-first, match, `*_members` и `casbin_rule` после проверок.
+- Architecture / `saas-leptos`: `who_am_i` возвращает `SessionUser`; `create_invitation → (Invitation, String, Option<EmailResult>)`; `InvitationAcceptPage` — ветки unverified/mismatch/resend.
+- Getting started: шаг про addressed invitation.
+- Running tests: 83 → 90; разбивка обновлена.
+- Development principles: новый bullet про addressed invitations.
+- Roadmap: 3c (done), 3d (next).
+
+```markdown
 # Rust SAAS
 
 **rust-saas** is a Rust library and reference application for building multi-tenant SaaS.
@@ -16,6 +28,7 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **Server-side logout (revokes refresh token family, records `revoked_reason`)**
 - **Access-token claims `{ sub, iat, exp }` (no `email`); user is resolved from `users` on every request**
 - **Email verification: single-active 24-hour token, idempotent verification, `/verify/:token` page, per-email rate limit (3/hour)**
+- **Addressed invitations (Stage 3c): `accept_invitation` requires a verified, matching email (`email_verified` first, then case-insensitive match); the invitation link is delivered via `EmailSender::send_invitation`, and the UI distinguishes `Sent` / `Failed` / `Disabled` (with a copy-link fallback). Link invitations (`email IS NULL`) keep Stage 2a behaviour.**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
@@ -119,7 +132,7 @@ platform
 - A **workspace** represents a working area inside a tenant, such as a team, department, or project.
 - A **user** is a global identity and can participate in multiple tenants or workspaces.
 - A **workspace** contains business resources such as documents.
-- An **invitation** targets exactly one tenant or one workspace (`CHECK ((tenant_id IS NULL) <> (workspace_id IS NULL))`).
+- An **invitation** targets exactly one tenant or one workspace (`CHECK ((tenant_id IS NULL) <> (workspace_id IS NULL))`). `email IS NULL` is a reusable link; `email IS NOT NULL` is an addressed invitation (Stage 3c).
 
 ### Authorization domains
 
@@ -196,7 +209,7 @@ docker-compose up -d
 docker-compose ps   # both services: postgres Up (healthy); mailpit Up
 ```
 
-Mailpit is only needed for the email-verification flow (Stage 3b). Open `http://localhost:8025` to read the inbox. Without Mailpit, the app falls back to `NoopEmailSender`: registration still succeeds, but the UI reports "email delivery not configured", and no verification link is delivered.
+Mailpit is only needed for the email-verification flow (Stage 3b) and addressed invitations (Stage 3c). Open `http://localhost:8025` to read the inbox. Without Mailpit, the app falls back to `NoopEmailSender`: registration still succeeds, but the UI reports "email delivery not configured", and no verification or invitation link is delivered.
 
 ### Configure environment
 
@@ -326,10 +339,14 @@ Then in the browser:
 10. `/workspaces/<workspace_id>` — as editor, create documents; click a document title to view it on its dedicated page.
 11. `/workspaces/<workspace_id>/members` — as workspace owner, see members; assign or remove roles via member/role selects; "Invite instead" jumps to invitations.
 12. `/workspaces/<workspace_id>/roles` — as workspace owner, list, create, edit, and delete custom roles.
-13. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation (link, copied once); `/workspaces/<workspace_id>/invitations` — as workspace owner, create a workspace invitation.
-14. Paste `/invitations/<64 hex>` into another browser/session (not logged in) — the page stores the URL in the `return_url` cookie; click **Log in** or **Register**, sign in, and you are redirected back to the same invitation page, where you can accept it. Accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`.
-15. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work.
-16. Rate limit: on `RegisterPage` (or after login) press **Resend** four times within an hour — the 4th call returns 429 with "rate limited; try again in Ns".
+13. `/tenants/<tenant_id>/invitations` — as tenant owner, create a tenant invitation. **Link invitation** (email empty) — raw token shown once; **addressed invitation** (email set) — the invitation link is sent to that address by email; the UI reports `Sent` / `Failed` (with a copy-link fallback) / `Disabled`. Same on `/workspaces/<workspace_id>/invitations`.
+14. **Link invitation flow.** Paste `/invitations/<64 hex>` into another browser/session (not logged in) — the page stores the URL in the `return_url` cookie; click **Log in** or **Register**, sign in, and you are redirected back to the same invitation page, where you can accept it. Accept-flow writes `tenant_members` / `workspace_members` (multi-role PK) and grants the corresponding role via `authz.grant_role`. Link invitations do not require a verified email.
+15. **Addressed invitation flow (Stage 3c).** As tenant owner, create an invitation with `email = viewer@acme.test` (or any user's address). Open the invitation link from Mailpit as that user. The server enforces:
+    - `invitation.email IS NOT NULL` → `actor.email_verified == false` returns **`email not verified`** (HTTP 403, `CoreError::EmailNotVerified`); the accept page shows "verify your email first" and a **Resend verification email** button.
+    - Verified actor whose address does not match (case-insensitively) returns **`forbidden`** (HTTP 403, `CoreError::Forbidden`); the accept page shows "invitation is for X, you are logged in as Y" and a link to `/login`.
+    - Verified actor whose address matches → accept succeeds; `tenant_members` + `casbin_rule` are updated.
+16. **Wait 15+ minutes** — the auto-refresh middleware transparently rotates the refresh token; UI continues to work.
+17. Rate limit: on `RegisterPage` (or after login) press **Resend** four times within an hour — the 4th call returns 429 with "rate limited; try again in Ns".
 
 ### Checking the build
 
@@ -347,7 +364,7 @@ From the repository root:
 cargo test
 ```
 
-**83 tests, all green** (23 unit + 60 integration: `authn` 12 unit + 22 integration = 34; `saas` 11 unit + 23 integration = 34; `access` 6 integration; `authz-casbin` 9 integration). The count is a plan-level estimate; if the actual run differs slightly (e.g. 82–84), the code is the source of truth.
+**90 tests, all green** (24 unit + 66 integration: `authn` 13 unit + 22 integration = 35; `saas` 11 unit + 29 integration = 40; `access` 0 unit + 6 integration = 6; `authz-casbin` 0 unit + 9 integration = 9). The count is a plan-level estimate; if the actual run differs slightly, the code is the source of truth.
 
 Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/access`, and `crates/saas`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
@@ -393,7 +410,8 @@ The reference example has a small unit-test module too (`rate_limit.rs`); run it
             │                     # + set_return_url / take_return_url
             │                     # + request_email_verification / verify_email
             ├── email.rs          # EmailResult (hydration-visible);
-            │                     # EmailSender / SmtpEmailSender / NoopEmailSender (ssr)
+            │                     # EmailSender / SmtpEmailSender / NoopEmailSender (ssr);
+            │                     # send_verification + send_invitation (Stage 3c)
             ├── rate_limit.rs     # SimpleRateLimiter (ssr, in-memory)
             └── ...
 ```
@@ -478,8 +496,12 @@ Business logic, independent of UI framework. `SaasState { pool, authz, access }`
 - `member::list(actor, MemberScope)`, `member::change_role`, `member::remove_role` — tenant/workspace member management.
   - `change_role` performs `assign(new)` before `revoke(old)`. On a partial failure (revoke fails after assign commits), the user is temporarily over-permissioned with both roles; this is recoverable idempotently by calling `change_role` again.
   - `change_role` and `remove_role` include an **owner guard**: removing the last holder of a `protected` role from a domain returns `Forbidden`. Non-protected roles have no last-holder guard. `assign_role` is never guarded.
-- `invitation::create_invitation` — validates `role` against `access::get_role(domain, &RoleKey)`.
-- `invitation::accept_invitation` — by raw token; writes `*_members` (multi-role PK) and grants the role via `authz.grant_role`.
+- `invitation::create_invitation` — validates `role` against `access::get_role(domain, &RoleKey)`. For addressed invitations (`email IS NOT NULL`) the caller (e.g. `#[server] create_invitation` in the example) is responsible for delivering the link via `EmailSender::send_invitation` — `saas` does not know about SMTP.
+- `invitation::accept_invitation` — by raw token. For **addressed** invitations (`invitation.email IS NOT NULL`):
+  - `actor.email_verified == false` → `CoreError::EmailNotVerified` (verified-first: an unverified address is not proof of ownership).
+  - Verified actor with a mismatched address → `CoreError::Forbidden` (case-insensitive comparison).
+  - Both checks run after the `SELECT ... FOR UPDATE` lookup and before `used_count` is incremented; a rejected accept does not consume a use.
+  - Link invitations (`email IS NULL`) skip both checks (Stage 2a behaviour). Accept writes `*_members` (multi-role PK) and grants the role via `authz.grant_role`.
 - `invitation::revoke_invitation` / `list_invitations`.
 - `saas::access::{create_role, update_role, delete_role, list_roles, list_permissions, assign_role, revoke_role, my_permissions}` — wrappers over `access` + `authz` + `*_members`.
   - `delete_role` performs the full cleanup in six retry-safe steps: `get_role_by_id` → `protected` check → `require` → `purge_role` (g+p) → `DELETE *_members` → `delete_role_by_id`. A partial failure at any step after `require` can be retried by calling `delete_role` again with the same `role_id`.
@@ -525,7 +547,7 @@ Idempotent: re-runs re-hash passwords, skip existing tenant/workspace, re-apply 
 
 The reference consumer application: Leptos UI, Axum server, `#[server]` wrappers, and `AppState`. `#[server]` functions are thin: `extract::CurrentUser::from_request().await?.require()?` resolves the user (HTTP 401 when missing), then the call delegates to `saas::*`, `saas::access::*`, `saas::member::*`, or `authn::*`; errors go through `error::core_error_to_server_fn` / `error::authn_error_to_server_fn` / `error::access_error_to_server_fn` / `error::rate_limited_error`, which map to HTTP 400/401/403/404/409/429/500. `AppState` holds `authn`, `saas` (which contains `access`), `leptos_options`, `email: Arc<dyn EmailSender>`, and `rate_limit: Arc<SimpleRateLimiter>`.
 
-`src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout; `src/email.rs` holds `EmailResult` (visible in both `ssr` and `hydrate`) and the SMTP transports (`SmtpEmailSender`, `NoopEmailSender` — `ssr` only); `src/rate_limit.rs` holds `SimpleRateLimiter` (in-memory, `ssr` only). `src/pages/{member,role,auth}.rs` hold the tenant/workspace member and role management and the auth + verification pages. This crate is **not** part of the library workspace.
+`src/extract.rs` holds `CurrentUser`; `src/error.rs` holds the error mapping; `src/middleware.rs` holds the auto-refresh middleware; `src/layout.rs` holds the global UI layout; `src/email.rs` holds `EmailResult` (visible in both `ssr` and `hydrate`), the SMTP transports (`SmtpEmailSender`, `NoopEmailSender` — `ssr` only), and the `EmailSender` trait with `send_verification` + `send_invitation` (Stage 3c); `src/rate_limit.rs` holds `SimpleRateLimiter` (in-memory, `ssr` only). `src/pages/{member,role,auth,invitation}.rs` hold the tenant/workspace member and role management, the auth + verification pages, and the invitation list / accept pages. This crate is **not** part of the library workspace.
 
 `main.rs` builds two routers and merges them:
 
@@ -547,18 +569,18 @@ Routes:
 | `/platform` | `pages::platform::PlatformPage` | create a tenant (as platform owner) |
 | `/tenants` | `pages::tenant::TenantListPage` | list of my tenants |
 | `/tenants/:tenant_id` | `pages::tenant::TenantPage` | single tenant (create workspace) |
-| `/tenants/:tenant_id/invitations` | `pages::invitation::TenantInvitationListPage` | tenant invitations |
+| `/tenants/:tenant_id/invitations` | `pages::invitation::TenantInvitationListPage` | tenant invitations (link + addressed) |
 | `/tenants/:tenant_id/members` | `pages::member::TenantMemberListPage` | tenant members and role changes (selects, Stage 3a) |
 | `/tenants/:tenant_id/roles` | `pages::role::TenantRoleListPage` | tenant roles (list/create/edit/delete) |
 | `/tenants/:tenant_id/roles/:role_id` | `pages::role::TenantRoleFormPage` | edit tenant role (Stage 3a) |
 | `/workspaces` | `pages::workspace::WorkspaceListPage` | list of my workspaces |
 | `/workspaces/:workspace_id` | `pages::workspace::WorkspacePage` | single workspace (documents) |
 | `/workspaces/:workspace_id/documents/:document_id` | `pages::workspace::DocumentPage` | single document view |
-| `/workspaces/:workspace_id/invitations` | `pages::invitation::WorkspaceInvitationListPage` | workspace invitations |
+| `/workspaces/:workspace_id/invitations` | `pages::invitation::WorkspaceInvitationListPage` | workspace invitations (link + addressed) |
 | `/workspaces/:workspace_id/members` | `pages::member::WorkspaceMemberListPage` | workspace members and role changes (selects, Stage 3a) |
 | `/workspaces/:workspace_id/roles` | `pages::role::WorkspaceRoleListPage` | workspace roles (list/create/edit/delete) |
 | `/workspaces/:workspace_id/roles/:role_id` | `pages::role::WorkspaceRoleFormPage` | edit workspace role (Stage 3a) |
-| `/invitations/:token` | `pages::invitation::InvitationAcceptPage` | accept-flow; sets `return_url` for anonymous visitors (Stage 3a) |
+| `/invitations/:token` | `pages::invitation::InvitationAcceptPage` | accept-flow; sets `return_url` for anonymous visitors (Stage 3a); verified-first + case-insensitive match for addressed invitations (Stage 3c) |
 
 ## Authorization model
 
@@ -601,7 +623,7 @@ m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act
 
 Both `g` (user → role in domain) and `p` (role → resource, action in domain) are required; `grant_role` adds both.
 
-Authorization is always checked on the server before business logic executes. Exceptions: `accept_invitation`/`check_invitation` (by token), `*::list_memberships` (membership queries), and `access` helpers (`get_role`, `get_role_by_id`, `delete_role_by_id`, `get_permissions_for_role`, `list_permissions`, `create_owner_role`, `my_permissions`).
+Authorization is always checked on the server before business logic executes. Exceptions: `accept_invitation`/`check_invitation` (by token — addressed invitations additionally enforce `email_verified` and a case-insensitive email match, Stage 3c), `*::list_memberships` (membership queries), and `access` helpers (`get_role`, `get_role_by_id`, `delete_role_by_id`, `get_permissions_for_role`, `list_permissions`, `create_owner_role`, `my_permissions`).
 
 UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and links; this is a UX convenience, not a security boundary — `authz.require` in `saas::*` remains authoritative.
 
@@ -618,11 +640,11 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Library crates do not depend on `examples/*`; each example has its own `Cargo.toml` and `Cargo.lock`.
 - Server functions resolve the actor through `extract::CurrentUser`; a missing actor is HTTP 401.
 - Library errors (`CoreError`, `AuthnError`, `IdentityError`, `AccessError`) are mapped to HTTP status codes in the example (`src/error.rs`); keep new variants covered by that mapping.
-- Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored.
+- Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored. For **addressed** invitations the example immediately passes the raw token to `EmailSender::send_invitation`; for **link** invitations the raw token is shown once in the UI.
 - Refresh raw tokens are returned once from `authn::issue_refresh_token` and are never persisted; only `refresh_tokens.token_hash` (SHA-256) is stored.
 - **Email-verification raw tokens (Stage 3b)** are returned once from `authn::create_email_verification` and are never persisted; only `email_verifications.token_hash` (SHA-256) is stored. `NoopEmailSender` logs only the recipient and the fact of a skipped send — **never the token**.
 - **Access JWT claims are `{ sub, iat, exp }` (Stage 3b).** The address and the `email_verified` flag are always resolved from `users` on `verify_token`.
-- `accept_invitation` does not compare `actor.email` to `invitation.email` until Stage 3c. From Stage 3c, addressed invitations will require `actor.email_verified`.
+- **Addressed invitations (Stage 3c).** `saas::invitation::accept_invitation` enforces verified-first (`CoreError::EmailNotVerified` if `!actor.email_verified`) then a case-insensitive email match (`CoreError::Forbidden` on mismatch) for `invitation.email IS NOT NULL`; link invitations (`email IS NULL`) skip both checks. Both checks run before any mutation (`used_count`, `*_members`, `casbin_rule`), so a rejected accept does not consume a use. `accept_invitation` is not a public bypass — it still authorizes by the invitation token, not by `authz.require`.
 - **Email delivery failures are not registration failures.** `#[server] register` returns `(AuthUser, EmailResult)`; the account is created and cookies set regardless of the SMTP outcome. `RegisterPage` offers a **Resend** button when `Failed`.
 - **`request_email_verification` is rate limited to 3/hour per email** via the process-local `SimpleRateLimiter`; the 4th call returns 429. Not distributed across instances (Stage 4+).
 - **Post-auth return-URL preservation (Stage 3a):** anonymous visitors on `/invitations/:token` store the path in the `return_url` cookie (`auth::set_return_url`); `pages::auth::{LoginPage, RegisterPage}` call `auth::take_return_url` after successful sign-in and navigate there, falling back to `/` when the cookie is absent or unsafe. `is_safe_return_url` rejects `//`, `:` in the first segment, `;`/`,`/`"`/`\`/whitespace, and prefixes `/login`/`/register`. The cookie is `httpOnly`, `SameSite=Lax`, `Path=/`, session lifetime; `Secure` is deferred to Stage 4 (added to all auth cookies together).
@@ -647,9 +669,9 @@ UI uses `saas::access::my_permissions` (batched per domain) to hide buttons and 
 - Stage 2d (done): casbin cleanup (`purge_role`, `delete_role_by_id`), single `PgPool` (`from_pool`), owner guard, refresh grace window, `.route_layer` split for auto-refresh.
 - Stage 3.0 (done): ADRs 0002/0003/0004 (auth-scoping, cross-table transactions, audit log) — doc-only.
 - Stage 3a (done): UX 2.5 — role edit (`RoleFormPage`, `update_role` UI, read-only `key`), member selects (`<select>` for user and role), "Invite instead" link, return-URL preservation across login/registration (`set_return_url` / `take_return_url` / `is_safe_return_url`).
-- **Stage 3b (done): email verification + claims cleanup.** `users.email_verified_at`; `email_verifications` (single-active, 24h); `authn::{create_email_verification, verify_email}`; `AuthnError::AlreadyVerified`; `RevokeReason` (`logout`/`reuse_detected`/`password_reset`) + `refresh_tokens.revoked_reason`; claims cleanup (`-email, +iat`); `lettre` + Mailpit in the example; `SimpleRateLimiter` (3/hour per email); `EmailResult` on `RegisterPage`; `/verify/:token` page; demo accounts marked verified by `seed`.
-- Stage 3c (next): addressed invitations (`accept_invitation` requires `actor.email_verified`).
-- Stage 3d: password reset (`password_reset_tokens`, `revoke_all_user_tokens`, `revoked_reason`).
+- Stage 3b (done): email verification + claims cleanup. `users.email_verified_at`; `email_verifications` (single-active, 24h); `authn::{create_email_verification, verify_email}`; `AuthnError::AlreadyVerified`; `RevokeReason` (`logout`/`reuse_detected`/`password_reset`) + `refresh_tokens.revoked_reason`; claims cleanup (`-email, +iat`); `lettre` + Mailpit in the example; `SimpleRateLimiter` (3/hour per email); `EmailResult` on `RegisterPage`; `/verify/:token` page; demo accounts marked verified by `seed`.
+- **Stage 3c (done): addressed invitations.** `saas::invitation::accept_invitation` enforces `actor.email_verified` (verified-first, `CoreError::EmailNotVerified`) then a case-insensitive email match (`CoreError::Forbidden`) for `invitation.email IS NOT NULL`; link invitations keep Stage 2a behaviour. `EmailSender::send_invitation` in the example; `who_am_i` returns `SessionUser { email, email_verified }`; `create_invitation` returns `(Invitation, String, Option<EmailResult>)` for addressed; UI branches for unverified (Resend) / mismatch (log in as) / match; `CoreError::EmailNotVerified` mapped to 403; 6 new `saas` integration tests (84 → 90).
+- Stage 3d (next): password reset (`password_reset_tokens`, `users.password_changed_at`, `revoke_all_user_tokens("password_reset")` via `RevokeReason::PasswordReset` — already reserved; rate limit 5/hour per email).
 - Stage 3e: audit log (`audit` + `audit-pg`, 21 events).
 - Stage 3f: platform admin (`list_tenants`, `suspend_tenant`, `activate_tenant`, `resolve_active_tenant`, `ActiveTenant`, `TenantSuspended`); audit view.
 - Stage 3g: `axum-minimal` (portability proof).

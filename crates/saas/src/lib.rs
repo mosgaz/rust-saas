@@ -4,6 +4,12 @@
 //! `casbin::Enforcer`, JWT or Argon2. Authorization is delegated to an
 //! `authz::AuthorizationEngine`; the actor is `domain::AuthUser` (resolved
 //! by `authn` in the consumer).
+//!
+//! Stage 3c adds [`CoreError::EmailNotVerified`] for addressed invitations:
+//! `invitation::accept_invitation` rejects an unverified actor when
+//! `invitation.email IS NOT NULL` before comparing the address
+//! (verified-first), and rejects a verified actor whose email does not match
+//! the invitation address (case-insensitive) with [`CoreError::Forbidden`].
 
 use std::sync::Arc;
 
@@ -23,6 +29,12 @@ pub enum CoreError {
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    /// Addressed invitation requires a verified email, but the actor's
+    /// email is not verified (Stage 3c). Mapped to HTTP 403 in the
+    /// example's `error.rs`, with a distinct message so the UI can offer
+    /// "resend verification email" instead of a generic "forbidden".
+    #[error("email not verified")]
+    EmailNotVerified,
     #[error("not found")]
     NotFound,
     #[error("validation error: {0}")]
