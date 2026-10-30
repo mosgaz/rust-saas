@@ -12,3 +12,7 @@ sqlx = { workspace = true, optional = true }
 
 [features]
 ssr = ["dep:sqlx"]
+# Test-only helpers (`AuthUser::test_verified` / `AuthUser::test_unverified`).
+# Enabled exclusively from `[dev-dependencies]` of crates with tests; never
+# part of a production build.
+test-support = []

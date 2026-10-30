@@ -1218,9 +1218,7 @@ async fn remove_role_last_protected_holder_is_rejected(pool: PgPool) {
 /// - a repeated `change_role` (with the failing engine no longer failing)
 ///   recovers to a consistent state.
 #[sqlx::test(migrations = "../db/migrations")]
-async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers(
-    pool: PgPool,
-) {
+async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers(pool: PgPool) {
     /// Wraps a real `CasbinAuthz` and fails `revoke_role` while the flag is
     /// set. Other methods delegate to the inner engine.
     struct FailingRevokeAuthz {

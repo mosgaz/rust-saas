@@ -196,11 +196,7 @@ impl AuthorizationEngine for CasbinAuthz {
         Ok(exists)
     }
 
-    async fn count_users_with_role(
-        &self,
-        domain: &str,
-        role_key: &str,
-    ) -> Result<i64, AuthzError> {
+    async fn count_users_with_role(&self, domain: &str, role_key: &str) -> Result<i64, AuthzError> {
         let count: i64 = sqlx::query_scalar(
             r#"
             select count(distinct v0) from casbin_rule

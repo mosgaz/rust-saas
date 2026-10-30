@@ -187,7 +187,7 @@ pub fn TenantPage() -> impl IntoView {
 
             <div class="mt-4 flex gap-2 flex-wrap">
                 {move || {
-                    let Some(id) = tenant_id() else { return None };
+                    let id = tenant_id()?;
                     let mut links = Vec::new();
                     if can_invitations.get() {
                         links.push(view! {

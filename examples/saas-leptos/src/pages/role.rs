@@ -228,10 +228,9 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
         let d = domain.get_value();
         if let Some(tid) = d.strip_prefix("tenant:") {
             Some(format!("/tenants/{tid}/roles/{}", r.id))
-        } else if let Some(wid) = d.strip_prefix("workspace:") {
-            Some(format!("/workspaces/{wid}/roles/{}", r.id))
         } else {
-            None
+            d.strip_prefix("workspace:")
+                .map(|wid| format!("/workspaces/{wid}/roles/{}", r.id))
         }
     };
 

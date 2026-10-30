@@ -52,12 +52,46 @@ pub struct Document {
 }
 
 /// A global platform user (no `password_hash`; internal in `identity`).
+///
+/// `email_verified` is a **derived** boolean: `true` iff
+/// `users.email_verified_at IS NOT NULL`. It is populated by SQL
+/// (`email_verified_at IS NOT NULL AS email_verified`) in every `SELECT`
+/// that maps a `users` row to `AuthUser`; see the `identity` crate. There is
+/// no `email_verified_at` field on this DTO — the timestamp is an internal
+/// concern of `identity`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
 pub struct AuthUser {
     pub id: Uuid,
     pub email: String,
+    pub email_verified: bool,
     pub created_at: DateTime<Utc>,
+}
+
+/// Test-only constructors; enabled via the `test-support` feature (added to
+/// `[dev-dependencies]` of the crates that need them). Production builds
+/// must not enable this feature.
+#[cfg(feature = "test-support")]
+impl AuthUser {
+    /// Test-only: an `AuthUser` with `email_verified = true`.
+    pub fn test_verified() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            email: format!("verified-{}@test.local", Uuid::new_v4()),
+            email_verified: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Test-only: an `AuthUser` with `email_verified = false`.
+    pub fn test_unverified() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            email: format!("unverified-{}@test.local", Uuid::new_v4()),
+            email_verified: false,
+            created_at: Utc::now(),
+        }
+    }
 }
 
 /// An invitation row.

@@ -6,7 +6,14 @@
 //! used by `leptos_routes_with_context` (the 4th argument, not `App`), as
 //! required by `leptos_meta`. `hydrate` is the WASM entry point.
 
+// Leptos' `view!` macro expands to deeply nested generic types; the default
+// rustc recursion limit (128) is insufficient once `pages/member.rs` grows
+// (member list → per-member role list → per-role remove button). 256 is the
+// value recommended by the rustc diagnostic; it does not affect runtime.
+#![recursion_limit = "256"]
+
 pub mod auth;
+pub mod email;
 pub mod layout;
 pub mod pages;
 
@@ -16,6 +23,8 @@ pub mod error;
 pub mod extract;
 #[cfg(feature = "ssr")]
 pub mod middleware;
+#[cfg(feature = "ssr")]
+pub mod rate_limit;
 #[cfg(feature = "ssr")]
 pub mod state;
 

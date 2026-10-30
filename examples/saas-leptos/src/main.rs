@@ -83,10 +83,41 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
     );
 
+    // Stage 3b: email transport. `SmtpEmailSender` when `SMTP_URL` is set;
+    // `NoopEmailSender` otherwise (logs a warning, returns Disabled).
+    let base_url = std::env::var("BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("http://{bind_addr}"));
+    let smtp_from = std::env::var("SMTP_FROM")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "noreply@example.test".to_string());
+
+    let email: Arc<dyn saas_leptos::email::EmailSender> =
+        match std::env::var("SMTP_URL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            Some(smtp_url) => Arc::new(
+                saas_leptos::email::SmtpEmailSender::new(&smtp_url, &smtp_from, &base_url)
+                    .map_err(|e| anyhow::anyhow!("failed to build SmtpEmailSender: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "SMTP_URL is not set; using NoopEmailSender (verification emails will not be delivered)"
+                );
+                Arc::new(saas_leptos::email::NoopEmailSender)
+            }
+        };
+
+    let rate_limit = Arc::new(saas_leptos::rate_limit::SimpleRateLimiter::new());
+
     let app_state = saas_leptos::state::AppState {
         authn: authn.clone(),
         saas,
         leptos_options: leptos_options.clone(),
+        email,
+        rate_limit,
     };
 
     let routes = generate_route_list(saas_leptos::App);
@@ -98,12 +129,6 @@ async fn main() -> anyhow::Result<()> {
     // require auth? how are public `#[server]` functions like `login` /
     // `register` handled at this layer? should 404 fail-open or fail-closed?)
     // are deferred to that ADR.
-    //
-    // `protected` covers SSR pages (`leptos_routes_with_context`) and, on the
-    // same router, Leptos server-function handlers (`/_server/*`). Both need
-    // `Extension<Option<AuthUser>>` injected by `auto_refresh`; `#[server]`
-    // functions that require an actor call `CurrentUser::require()` and get
-    // HTTP 401 when the extension is `None`.
     let protected: Router<saas_leptos::state::AppState> = Router::new()
         .leptos_routes_with_context(
             &app_state,
@@ -122,15 +147,9 @@ async fn main() -> anyhow::Result<()> {
             saas_leptos::middleware::auto_refresh,
         ));
 
-    // `public` covers static files served by `file_and_error_handler`
-    // (`/pkg/*`, `/assets/*`, `/favicon.ico`, and any other files under
-    // `public/`) and the 404 fallback. These responses never depended on
-    // cookies; running `auto_refresh` here used to verify JWTs, rotate
-    // refresh tokens, and set `Cache-Control: no-store` on `.wasm` / `.css`
-    // fetches (Stage 2b–2c bug). Stage 2d fixes this at the router structure
-    // level.
-    let public: Router<saas_leptos::state::AppState> = Router::new()
-        .fallback(leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell));
+    let public: Router<saas_leptos::state::AppState> = Router::new().fallback(
+        leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell),
+    );
 
     let router = protected
         .merge(public)

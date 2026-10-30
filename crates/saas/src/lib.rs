@@ -553,6 +553,7 @@ mod tests {
         AuthUser {
             id: Uuid::new_v4(),
             email: "actor@example.test".to_string(),
+            email_verified: true,
             created_at: Utc::now(),
         }
     }

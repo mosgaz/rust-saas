@@ -9,7 +9,7 @@
 //! where the user has the `CREATE DATABASE` privilege (the default postgres
 //! superuser satisfies this).
 
-use authn::{Authn, AuthnError, REFRESH_GRACE_SECONDS};
+use authn::{Authn, AuthnError, EMAIL_VERIFICATION_TTL_HOURS, REFRESH_GRACE_SECONDS};
 use identity::IdentityError;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -34,12 +34,17 @@ async fn register_and_login_roundtrip(pool: PgPool) {
         .await
         .expect("register must succeed");
     assert_eq!(user.email, email);
+    assert!(
+        !user.email_verified,
+        "a freshly registered user must be unverified"
+    );
 
     let logged = authn
         .login(&email, "Password123!")
         .await
         .expect("login must succeed");
     assert_eq!(logged.id, user.id);
+    assert!(!logged.email_verified);
 }
 
 #[sqlx::test(migrations = "../db/migrations")]
@@ -95,6 +100,10 @@ async fn verify_token_returns_some_for_existing_user(pool: PgPool) {
         .expect("user must be found");
     assert_eq!(verified.id, user.id);
     assert_eq!(verified.email, user.email);
+    assert!(
+        !verified.email_verified,
+        "unverified user must remain unverified across verify_token"
+    );
 }
 
 #[sqlx::test(migrations = "../db/migrations")]
@@ -120,7 +129,7 @@ async fn verify_token_returns_none_for_deleted_user(pool: PgPool) {
 // ─── Refresh tokens (Stage 2b/2d) ───────────────────────────────────────────
 
 /// `issue_refresh_token` persists exactly one row: `used_at` and `revoked_at`
-/// NULL, `expires_at` in the future.
+/// NULL (and `revoked_reason` NULL), `expires_at` in the future.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn issue_refresh_token_persists_row(pool: PgPool) {
     let authn = fresh(pool.clone());
@@ -133,10 +142,11 @@ async fn issue_refresh_token_persists_row(pool: PgPool) {
         .expect("issue_refresh_token");
     assert_eq!(raw.len(), 64, "2 × uuid simple hex");
 
-    let rows: Vec<(bool, bool, bool)> = sqlx::query_as(
+    let rows: Vec<(bool, bool, bool, bool)> = sqlx::query_as(
         r#"
         select used_at is not null,
                revoked_at is not null,
+               revoked_reason is not null,
                expires_at > now()
         from refresh_tokens
         where user_id = $1
@@ -147,9 +157,10 @@ async fn issue_refresh_token_persists_row(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(rows.len(), 1);
-    let (used, revoked, live) = rows[0];
+    let (used, revoked, reason_set, live) = rows[0];
     assert!(!used, "fresh token must not be used");
     assert!(!revoked, "fresh token must not be revoked");
+    assert!(!reason_set, "fresh token must not have a revocation reason");
     assert!(live, "expires_at must be in the future");
 }
 
@@ -204,22 +215,18 @@ async fn rotate_refresh_token_success(pool: PgPool) {
 }
 
 /// Reusing an already-used refresh token **after** the grace window revokes
-/// the whole family and returns `RefreshReused`.
-///
-/// Stage 2d: `used_at` is forced to be older than
-/// [`REFRESH_GRACE_SECONDS`] before the second rotation attempt, so the
-/// second call is treated as a genuine reuse (not as a parallel-request
-/// race).
+/// the whole family, records `revoked_reason = 'reuse_detected'`, and
+/// returns `RefreshReused`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn rotate_refresh_token_reuse_revokes_family(pool: PgPool) {
     let authn = fresh(pool.clone());
     let email = unique_email("refresh-reuse");
     let user = authn.register(&email, "Password123!").await.unwrap();
     let r1 = authn.issue_refresh_token(&user).await.unwrap();
-	let _r2 = authn
-		.rotate_refresh_token(&r1)
-		.await
-		.expect("first rotate must succeed");
+    let _r2 = authn
+        .rotate_refresh_token(&r1)
+        .await
+        .expect("first rotate must succeed");
 
     // Push the used_at well past the grace window.
     sqlx::query(
@@ -258,6 +265,19 @@ async fn rotate_refresh_token_reuse_revokes_family(pool: PgPool) {
         total >= 2,
         "family must have at least two rows after rotate"
     );
+
+    let reasons: Vec<Option<String>> =
+        sqlx::query_scalar("select revoked_reason from refresh_tokens where user_id = $1")
+            .bind(user.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        reasons
+            .iter()
+            .all(|r| r.as_deref() == Some("reuse_detected")),
+        "every revoked row must record reuse_detected, got {reasons:?}"
+    );
 }
 
 /// Stage 2d: presenting an already-used token **within** the grace window is
@@ -269,10 +289,10 @@ async fn rotate_refresh_token_within_grace_returns_invalid(pool: PgPool) {
     let email = unique_email("refresh-grace");
     let user = authn.register(&email, "Password123!").await.unwrap();
     let r1 = authn.issue_refresh_token(&user).await.unwrap();
-	let (r2, _) = authn
-		.rotate_refresh_token(&r1)
-		.await
-		.expect("first rotate must succeed");
+    let (r2, _) = authn
+        .rotate_refresh_token(&r1)
+        .await
+        .expect("first rotate must succeed");
 
     // Immediately present the same r1 again — within the default grace window.
     let err = authn
@@ -295,17 +315,10 @@ async fn rotate_refresh_token_within_grace_returns_invalid(pool: PgPool) {
     assert_eq!(revoked, 0, "grace-window race must not revoke the family");
 
     // The new token (r2) is still usable.
-    let family_id: Uuid =
-        sqlx::query_scalar("select family_id from refresh_tokens where user_id = $1 limit 1")
-            .bind(user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let _ = family_id;
-	let _r3 = authn
-		.rotate_refresh_token(&r2)
-		.await
-		.expect("the new token from the first rotate must still be usable");
+    let _r3 = authn
+        .rotate_refresh_token(&r2)
+        .await
+        .expect("the new token from the first rotate must still be usable");
 }
 
 /// Stage 2d: a genuine reuse **after** the grace window still revokes the
@@ -352,8 +365,8 @@ async fn rotate_refresh_token_old_reuse_revokes_family(pool: PgPool) {
     assert_eq!(revoked, total, "past grace, reuse must revoke the family");
 }
 
-/// `revoke_refresh_token` (logout) sets `revoked_at`; a subsequent rotate
-/// returns `RefreshInvalid`.
+/// `revoke_refresh_token` (logout) sets `revoked_at` and records
+/// `revoked_reason = 'logout'`; a subsequent rotate returns `RefreshInvalid`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn revoke_refresh_token_revokes_family(pool: PgPool) {
     let authn = fresh(pool.clone());
@@ -374,6 +387,14 @@ async fn revoke_refresh_token_revokes_family(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(revoked, 1, "logout must revoke the family");
+
+    let reason: Option<String> =
+        sqlx::query_scalar("select revoked_reason from refresh_tokens where user_id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reason.as_deref(), Some("logout"));
 
     let err = authn
         .rotate_refresh_token(&r1)
@@ -425,4 +446,234 @@ async fn revoke_refresh_token_unknown_is_noop(pool: PgPool) {
         .revoke_refresh_token("unknown-token")
         .await
         .expect("idempotent");
+}
+
+// ─── Email verification (Stage 3b) ──────────────────────────────────────────
+
+/// `create_email_verification` persists one unused row with a 24-hour TTL
+/// and returns the raw token (64-char hex; only `token_hash` is stored).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_email_verification_persists_row(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("ev-create");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+
+    let raw = authn
+        .create_email_verification(user.id)
+        .await
+        .expect("create_email_verification");
+    assert_eq!(raw.len(), 64, "2 × uuid simple hex");
+
+    let rows: Vec<(bool, bool)> = sqlx::query_as(
+        r#"
+        select used_at is not null,
+               expires_at between now() + interval '23 hours'
+                              and now() + interval '25 hours'
+        from email_verifications
+        where user_id = $1
+        "#,
+    )
+    .bind(user.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    let (used, ttl_ok) = rows[0];
+    assert!(!used, "fresh verification token must not be used");
+    assert!(
+        ttl_ok,
+        "expires_at must be ~{EMAIL_VERIFICATION_TTL_HOURS}h in the future"
+    );
+
+    let stored_hash: String =
+        sqlx::query_scalar("select token_hash from email_verifications where user_id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_hash.len(), 64, "sha-256 hex");
+    assert_ne!(stored_hash, raw, "raw token must not be persisted");
+}
+
+/// Single-active invariant: a second `create_email_verification` replaces
+/// the previous unused token — only the latest one remains valid.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_email_verification_replaces_previous(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("ev-single-active");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+
+    let raw1 = authn.create_email_verification(user.id).await.unwrap();
+    let raw2 = authn.create_email_verification(user.id).await.unwrap();
+    assert_ne!(raw1, raw2, "second call must produce a new raw token");
+
+    let unused: i64 = sqlx::query_scalar(
+        "select count(*) from email_verifications where user_id = $1 and used_at is null",
+    )
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unused, 1,
+        "single-active invariant: at most one unused token per user"
+    );
+
+    // The old raw token is gone: verify_email must reject it.
+    let err = authn
+        .verify_email(&raw1)
+        .await
+        .expect_err("replaced token must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+
+    // The new one works.
+    let verified = authn
+        .verify_email(&raw2)
+        .await
+        .expect("new token must verify");
+    assert!(verified.email_verified);
+}
+
+/// `create_email_verification` on an already-verified user returns
+/// `AlreadyVerified` and does not create a row.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_email_verification_on_verified_user_returns_already_verified(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("ev-already");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn.create_email_verification(user.id).await.unwrap();
+    authn.verify_email(&raw).await.expect("first verify");
+
+    let err = authn
+        .create_email_verification(user.id)
+        .await
+        .expect_err("verified user must be rejected");
+    assert!(matches!(err, AuthnError::AlreadyVerified), "got {err:?}");
+
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from email_verifications where user_id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 1,
+        "rejected call must not create another verification row"
+    );
+}
+
+/// `verify_email` writes `users.email_verified_at`, marks the token used, and
+/// returns the now-verified `AuthUser`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_email_marks_user_verified_and_token_used(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("ev-verify");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    assert!(!user.email_verified);
+
+    let raw = authn.create_email_verification(user.id).await.unwrap();
+    let verified = authn.verify_email(&raw).await.expect("verify_email");
+    assert!(verified.email_verified);
+    assert_eq!(verified.id, user.id);
+
+    let verified_at_set: bool =
+        sqlx::query_scalar("select email_verified_at is not null from users where id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(verified_at_set, "users.email_verified_at must be set");
+
+    let used_at_set: bool = sqlx::query_scalar(
+        "select used_at is not null from email_verifications where user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(used_at_set, "verification token must be marked used");
+}
+
+/// `verify_email` is idempotent: re-presenting the same raw token after a
+/// successful verification still returns `Ok(user)` and does not move
+/// `users.email_verified_at`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_email_is_idempotent(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("ev-idempotent");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn.create_email_verification(user.id).await.unwrap();
+
+    let first = authn.verify_email(&raw).await.expect("first verify");
+    assert!(first.email_verified);
+    let first_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select email_verified_at from users where id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let second = authn
+        .verify_email(&raw)
+        .await
+        .expect("second verify must be Ok");
+    assert!(second.email_verified);
+
+    let second_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select email_verified_at from users where id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        first_at, second_at,
+        "already-verified timestamp must not be overwritten"
+    );
+}
+
+/// `verify_email` rejects an expired token.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_email_expired_token_returns_invalid(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("ev-expired");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn.create_email_verification(user.id).await.unwrap();
+
+    sqlx::query(
+        "update email_verifications set expires_at = now() - interval '1 hour' where user_id = $1",
+    )
+    .bind(user.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = authn
+        .verify_email(&raw)
+        .await
+        .expect_err("expired token must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+
+    let verified_at_set: bool =
+        sqlx::query_scalar("select email_verified_at is not null from users where id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !verified_at_set,
+        "expired token must not mark the user verified"
+    );
+}
+
+/// `verify_email` rejects an unknown token.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_email_invalid_token_returns_invalid(pool: PgPool) {
+    let authn = fresh(pool);
+    let err = authn
+        .verify_email("not-a-real-token")
+        .await
+        .expect_err("unknown token must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
 }

@@ -90,11 +90,7 @@ pub trait AuthorizationEngine: Send + Sync {
     /// authorization, handoff §5 p.4), not `*_members`. Non-transactional;
     /// used by `saas::member` owner-guarding. Returns `0` if the role has no
     /// holders.
-    async fn count_users_with_role(
-        &self,
-        domain: &str,
-        role_key: &str,
-    ) -> Result<i64, AuthzError>;
+    async fn count_users_with_role(&self, domain: &str, role_key: &str) -> Result<i64, AuthzError>;
 
     /// Deletes every `g`-row and `p`-row for `(domain, role_key)` and
     /// returns the number of deleted rows.
