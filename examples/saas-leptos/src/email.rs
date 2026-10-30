@@ -1,5 +1,5 @@
-//! Email delivery for verification links (Stage 3b) and invitation links
-//! (Stage 3c).
+//! Email delivery for verification links (Stage 3b), invitation links
+//! (Stage 3c), and password-reset links (Stage 3d).
 //!
 //! [`EmailResult`] is compiled under both `ssr` and `hydrate` (the UI shows
 //! it after registration and after creating an addressed invitation) and has
@@ -26,15 +26,26 @@
 //! per-call parameter; `AppState` does not need to know it).
 //! `NoopEmailSender` never logs the token or the URL, only the recipient
 //! and the fact of a skipped send.
+//!
+//! Stage 3d adds [`EmailSender::send_password_reset`] for the forgot-password
+//! flow: `{BASE_URL}/reset-password/{token}`, subject "Reset your password".
+//! The SMTP transport is built with a 10-second `.timeout(...)` so a slow
+//! provider cannot stall a `#[server]` call; the timeout covers the whole
+//! send attempt (see `SmtpEmailSender::new`). Like the other two, a failed
+//! send does not fail the business operation — `request_password_reset`
+//! returns `Ok(())` regardless, and the UI shows a generic "if the address
+//! exists, we sent a link" message.
 
 use serde::{Deserialize, Serialize};
 
-/// Outcome of an outbound email (verification or invitation).
+/// Outcome of an outbound email (verification, invitation, or password
+/// reset).
 ///
-/// Returned by `#[server] register` (Stage 3b) and by
-/// `#[server] create_invitation` (Stage 3c, addressed invitations) so the
-/// UI can render "sent", "failed, retry?", or "disabled (no SMTP)" without
-/// treating a transport failure as a business error.
+/// Returned by `#[server] register` (Stage 3b), by `#[server]
+/// create_invitation` (Stage 3c, addressed invitations), and by
+/// `#[server] request_password_reset` (Stage 3d) so the UI can render
+/// "sent", "failed, retry?", or "disabled (no SMTP)" without treating a
+/// transport failure as a business error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EmailResult {
     /// Handed off to the SMTP transport without error.
@@ -51,6 +62,8 @@ pub enum EmailResult {
 #[cfg(feature = "ssr")]
 mod ssr {
     //! Server-only transport implementations (lettre).
+
+    use std::time::Duration;
 
     use lettre::message::Mailbox;
     use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -82,6 +95,21 @@ mod ssr {
         /// [`EmailResult::Failed`] (the invitation row is already inserted
         /// and the caller shows the failure in the UI).
         async fn send_invitation(&self, to: &str, token: &str) -> EmailResult;
+
+        /// Sends a password-reset link to `to` (Stage 3d), containing
+        /// `{base_url}/reset-password/{token}`.
+        ///
+        /// `token` is the raw password-reset token returned by
+        /// `authn::request_password_reset`; only its hash is persisted in
+        /// the database. Transports must not log the raw token or the URL
+        /// (`NoopEmailSender` logs only `to` and the skip reason).
+        ///
+        /// Never panics; transport errors are returned as
+        /// [`EmailResult::Failed`] (the reset token is already stored;
+        /// `request_password_reset` returns `Ok(())` regardless so the
+        /// caller cannot use the SMTP outcome as an email-enumeration
+        /// signal).
+        async fn send_password_reset(&self, to: &str, token: &str) -> EmailResult;
     }
 
     /// Real SMTP sender (lettre async transport with `rustls`).
@@ -97,13 +125,20 @@ mod ssr {
         ///   `smtps://user:pass@host:465`;
         /// - `from` — sender address (`noreply@example.test`);
         /// - `base_url` — public origin of the app, used to construct the
-        ///   verify and invitation links (`http://127.0.0.1:3395`).
+        ///   verify, invitation, and password-reset links
+        ///   (`http://127.0.0.1:3395`).
+        ///
+        /// The transport is built with a 10-second `.timeout(...)` so a
+        /// slow or unreachable provider cannot stall a `#[server]` call
+        /// (§IV.20). The timeout covers the whole `send` attempt (connect
+        /// + greeting + message + QUIT).
         ///
         /// Returns `Err(String)` on invalid configuration so `main.rs` can
         /// fail fast at startup.
         pub fn new(smtp_url: &str, from: &str, base_url: &str) -> Result<Self, String> {
             let transport = AsyncSmtpTransport::<Tokio1Executor>::from_url(smtp_url)
                 .map_err(|e| format!("invalid SMTP_URL: {e}"))?
+                .timeout(Some(Duration::from_secs(10)))
                 .build();
             let from: Mailbox = from
                 .parse()
@@ -189,13 +224,50 @@ mod ssr {
                 },
             }
         }
+
+        async fn send_password_reset(&self, to: &str, token: &str) -> EmailResult {
+            let to_mailbox: Mailbox = match to.parse() {
+                Ok(m) => m,
+                Err(e) => {
+                    return EmailResult::Failed {
+                        reason: format!("invalid recipient {to}: {e}"),
+                    };
+                }
+            };
+            let reset_url = format!("{}/reset-password/{}", self.base_url, token);
+            let body = format!(
+                "We received a request to reset the password for your Rust SAAS account.\n\n\
+                 Set a new password by opening:\n\n    {reset_url}\n\n\
+                 The link expires in 1 hour and can be used once. \
+                 If you did not request a password reset, you can ignore this email.\n"
+            );
+            let message = match Message::builder()
+                .from(self.from.clone())
+                .to(to_mailbox)
+                .subject("Reset your password")
+                .body(body)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    return EmailResult::Failed {
+                        reason: format!("failed to build message: {e}"),
+                    };
+                }
+            };
+            match self.transport.send(message).await {
+                Ok(_) => EmailResult::Sent,
+                Err(e) => EmailResult::Failed {
+                    reason: e.to_string(),
+                },
+            }
+        }
     }
 
     /// No-op sender: logs a warning and reports [`EmailResult::Disabled`].
-    /// Does **not** log the token (verification or invitation) — only the
-    /// recipient and the fact of a skipped send. Defense against
-    /// accidentally enabling this in production. For dev, configure Mailpit
-    /// and `SMTP_URL`.
+    /// Does **not** log the token (verification, invitation, or password
+    /// reset) — only the recipient and the fact of a skipped send. Defense
+    /// against accidentally enabling this in production. For dev, configure
+    /// Mailpit and `SMTP_URL`.
     pub struct NoopEmailSender;
 
     #[async_trait::async_trait]
@@ -212,6 +284,14 @@ mod ssr {
             tracing::warn!(
                 to = %to,
                 "email delivery disabled (NoopEmailSender): SMTP_URL not configured; invitation link not sent"
+            );
+            EmailResult::Disabled
+        }
+
+        async fn send_password_reset(&self, to: &str, _token: &str) -> EmailResult {
+            tracing::warn!(
+                to = %to,
+                "email delivery disabled (NoopEmailSender): SMTP_URL not configured; password-reset link not sent"
             );
             EmailResult::Disabled
         }

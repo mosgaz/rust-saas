@@ -1,5 +1,6 @@
 //! Server functions for registration, login, refresh, logout, email
-//! verification (Stage 3b), and post-auth return-URL preservation (Stage 3a).
+//! verification (Stage 3b), password reset (Stage 3d), and post-auth
+//! return-URL preservation (Stage 3a).
 //!
 //! All delegate to `authn::*`. Cookies are managed by the example, not by
 //! `authn`:
@@ -31,6 +32,26 @@
 //! - `verify_email(token)` is **public** (no `CurrentUser::require`): the
 //!   link is clicked from the email, possibly in an anonymous browser. It is
 //!   idempotent (already-verified → `Ok`) and does **not** log the user in.
+//!
+//! Stage 3d:
+//! - `request_password_reset(email)` is **public** (no `require`):
+//!   forgot-password flow starts before the user has a session. It is
+//!   **silent** — unknown emails return `Ok(())` and no token is created;
+//!   the response cannot be used as an enumeration oracle. Rate limited to
+//!   `5 / 1h` per email via `AppState.rate_limit`. If the address is
+//!   registered, `authn::request_password_reset` issues a single-active
+//!   1-hour token and `EmailSender::send_password_reset` delivers the link;
+//!   SMTP outcome is intentionally discarded (a failure here would also be
+//!   an enumeration oracle and `EmailResult` is not surfaced to the UI on
+//!   this path — the page shows a generic confirmation regardless).
+//! - `reset_password(token, password)` is **public** (no `require`): the
+//!   link is opened from the email, possibly in an anonymous browser. It
+//!   delegates to `authn::reset_password`, which is **one-shot** (a
+//!   replayed token returns `TokenInvalid`) and, in one transaction,
+//!   rewrites `password_hash` + `password_changed_at`, expires every
+//!   outstanding reset token for the user, and revokes every refresh-token
+//!   family (`revoked_reason = "password_reset"`). Does **not** log the
+//!   user in; the page redirects to `/login`.
 //!
 //! Errors are mapped to HTTP status codes by `crate::error`
 //! (`authn_error_to_server_fn`, `rate_limited_error`).
@@ -294,6 +315,104 @@ pub async fn verify_email(token: String) -> Result<AuthUser, ServerFnError> {
     let user = state
         .authn
         .verify_email(&token)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+    Ok(user)
+}
+
+// ─── Stage 3d: password reset ───────────────────────────────────────────────
+
+/// Starts the password-reset flow for `email`.
+///
+/// **Public** (no `CurrentUser::require`): the user has no session yet.
+///
+/// **Silent** — always returns `Ok(())` when the request is accepted:
+/// - Unknown email → no token created, no email sent, `Ok(())`. The
+///   response cannot be used as an enumeration oracle.
+/// - Known email → `authn::request_password_reset` issues a single-active
+///   1-hour token; `EmailSender::send_password_reset` delivers the link.
+///   SMTP outcome is intentionally discarded: surfacing "failed" vs "sent"
+///   would distinguish registered from unregistered addresses (assuming a
+///   well-behaved transport) and would confuse the user, who cannot act on
+///   the failure without another email attempt. The UI shows the same
+///   generic confirmation regardless.
+///
+/// Rate limited to `5 / 1h` per email via `AppState.rate_limit`; the 6th
+/// request in the window returns HTTP 429 with `retry_after_secs`. The
+/// rate-limit key is the **raw submitted address** (not the resolved
+/// user id): an attacker probing unknown addresses is still throttled per
+/// address.
+#[server]
+pub async fn request_password_reset(email: String) -> Result<(), ServerFnError> {
+    use std::time::Duration;
+
+    let state = expect_context::<crate::state::AppState>();
+
+    if let Err(retry_after) = state
+        .rate_limit
+        .try_acquire(&email, 5, Duration::from_secs(3600))
+    {
+        return Err(crate::error::rate_limited_error(retry_after));
+    }
+
+    // Silent on unknown email; `Some(raw)` only when a row was created.
+    let token = state
+        .authn
+        .request_password_reset(&email)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+
+    if let Some(raw) = token {
+        // SMTP outcome discarded on purpose (see doc comment). Logged as a
+        // warning without the token or the URL so operators can diagnose
+        // transport problems without leaking the reset link.
+        match state.email.send_password_reset(&email, &raw).await {
+            EmailResult::Sent => {}
+            EmailResult::Failed { reason } => {
+                tracing::warn!(
+                    to = %email,
+                    error = %reason,
+                    "request_password_reset: SMTP send failed; reset link not delivered"
+                );
+            }
+            EmailResult::Disabled => {
+                tracing::warn!(
+                    to = %email,
+                    "request_password_reset: email delivery disabled; reset link not sent"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Completes the password-reset flow by setting a new password from a raw
+/// reset token.
+///
+/// **Public** (no `CurrentUser::require`): the link is clicked from the
+/// email, possibly in an anonymous browser.
+///
+/// Delegates to `authn::reset_password`, which is **one-shot** (a replayed
+/// token returns `TokenInvalid`). In a single transaction it:
+/// - rewrites `users.password_hash` and `users.password_changed_at`,
+/// - expires every outstanding reset token for the user (including the
+///   consumed one),
+/// - revokes every refresh-token family with
+///   `revoked_reason = "password_reset"`.
+///
+/// Access JWTs already issued remain valid until their short `exp`
+/// (iat-vs-`password_changed_at` enforcement is Stage 4). Does **not** set
+/// cookies or log the user in — the caller navigates to `/login`. Errors
+/// are mapped via `authn_error_to_server_fn`
+/// (`TokenInvalid` → 401, `TokenExpired` → 401,
+/// `IdentityError::Validation` → 400).
+#[server]
+pub async fn reset_password(token: String, password: String) -> Result<AuthUser, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = state
+        .authn
+        .reset_password(&token, &password)
         .await
         .map_err(crate::error::authn_error_to_server_fn)?;
     Ok(user)

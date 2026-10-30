@@ -9,7 +9,10 @@
 //! where the user has the `CREATE DATABASE` privilege (the default postgres
 //! superuser satisfies this).
 
-use authn::{Authn, AuthnError, EMAIL_VERIFICATION_TTL_HOURS, REFRESH_GRACE_SECONDS};
+use authn::{
+    Authn, AuthnError, EMAIL_VERIFICATION_TTL_HOURS, PASSWORD_RESET_TTL_HOURS,
+    REFRESH_GRACE_SECONDS,
+};
 use identity::IdentityError;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -676,4 +679,410 @@ async fn verify_email_invalid_token_returns_invalid(pool: PgPool) {
         .await
         .expect_err("unknown token must be rejected");
     assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+}
+
+// ─── Password reset (Stage 3d) ──────────────────────────────────────────────
+
+/// `request_password_reset` persists exactly one unused row per user with a
+/// 1-hour TTL; only `token_hash` is stored (raw token never persisted).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn request_password_reset_persists_row(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-create");
+    authn.register(&email, "Password123!").await.unwrap();
+
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .expect("request_password_reset must succeed")
+        .expect("known email must yield Some(raw)");
+    assert_eq!(raw.len(), 64, "2 × uuid simple hex");
+
+    let rows: Vec<(bool, bool)> = sqlx::query_as(
+        r#"
+        select used_at is not null,
+               expires_at between now() + interval '55 minutes'
+                              and now() + interval '65 minutes'
+        from password_reset_tokens
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    let (used, ttl_ok) = rows[0];
+    assert!(!used, "fresh reset token must not be used");
+    assert!(
+        ttl_ok,
+        "expires_at must be ~{PASSWORD_RESET_TTL_HOURS}h in the future"
+    );
+
+    let stored_hash: String =
+        sqlx::query_scalar("select token_hash from password_reset_tokens")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_hash.len(), 64, "sha-256 hex");
+    assert_ne!(stored_hash, raw, "raw token must not be persisted");
+}
+
+/// Single-active: a second `request_password_reset` replaces the previous
+/// unused token — only the latest raw works.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn request_password_reset_replaces_previous(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-single-active");
+    authn.register(&email, "Password123!").await.unwrap();
+
+    let raw1 = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("first request");
+    let raw2 = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("second request");
+    assert_ne!(raw1, raw2, "second call must produce a new raw token");
+
+    let unused: i64 =
+        sqlx::query_scalar("select count(*) from password_reset_tokens where used_at is null")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        unused, 1,
+        "single-active invariant: at most one unused reset token per user"
+    );
+
+    // The old raw token is gone.
+    let err = authn
+        .reset_password(&raw1, "BrandNew123!")
+        .await
+        .expect_err("replaced token must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+
+    // The new one works.
+    authn
+        .reset_password(&raw2, "BrandNew123!")
+        .await
+        .expect("new token must reset the password");
+}
+
+/// Unknown email is silent (`Ok(None)`) and creates no row.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn request_password_reset_unknown_email_returns_none(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let res = authn
+        .request_password_reset(&unique_email("pr-unknown"))
+        .await
+        .expect("must not error");
+    assert!(res.is_none(), "unknown email must yield Ok(None)");
+
+    let count: i64 = sqlx::query_scalar("select count(*) from password_reset_tokens")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no row must be created for unknown email");
+}
+
+/// `reset_password` changes the password, bumps `password_changed_at`, marks
+/// the token used, and returns the `AuthUser`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn reset_password_marks_token_used_and_changes_password(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-reset");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+
+    let before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select password_changed_at from users where id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let updated = authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("reset_password must succeed");
+    assert_eq!(updated.id, user.id);
+
+    let used_at_set: bool =
+        sqlx::query_scalar("select used_at is not null from password_reset_tokens")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(used_at_set, "reset token must be marked used");
+
+    let after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select password_changed_at from users where id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        after > before,
+        "password_changed_at must be bumped by reset_password"
+    );
+
+    authn
+        .login(&email, "BrandNew123!")
+        .await
+        .expect("login with new password must succeed");
+}
+
+/// One-shot: replaying the same raw reset token returns `TokenInvalid` and
+/// does not change the password again.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn reset_password_is_one_shot(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-one-shot");
+    authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+
+    authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("first reset must succeed");
+
+    let err = authn
+        .reset_password(&raw, "OtherNew123!")
+        .await
+        .expect_err("replayed reset token must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+
+    // Password is still the one set by the first reset.
+    authn
+        .login(&email, "BrandNew123!")
+        .await
+        .expect("first reset password must still work");
+    let bad = authn
+        .login(&email, "OtherNew123!")
+        .await
+        .expect_err("replayed password must not be set");
+    assert!(matches!(bad, AuthnError::InvalidCredentials), "got {bad:?}");
+}
+
+/// Expired reset token → `TokenExpired`; the user's password is untouched.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn reset_password_expired_token_returns_token_expired(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-expired");
+    authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+
+    sqlx::query("update password_reset_tokens set expires_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect_err("expired token must be rejected");
+    assert!(matches!(err, AuthnError::TokenExpired), "got {err:?}");
+
+    authn
+        .login(&email, "Password123!")
+        .await
+        .expect("original password must still work after expired-token rejection");
+}
+
+/// Unknown raw token → `TokenInvalid`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn reset_password_invalid_token_returns_token_invalid(pool: PgPool) {
+    let authn = fresh(pool);
+    let err = authn
+        .reset_password("not-a-real-token", "BrandNew123!")
+        .await
+        .expect_err("unknown token must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+}
+
+/// Short password → `IdentityError::Validation` via `AuthnError::Identity`,
+/// **before** the token is consumed.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn reset_password_short_password_returns_validation(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-short");
+    authn.register(&email, "Password123!").await.unwrap();
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+
+    let err = authn
+        .reset_password(&raw, "short")
+        .await
+        .expect_err("short password must be rejected");
+    assert!(
+        matches!(
+            err,
+            AuthnError::Identity(IdentityError::Validation(_))
+        ),
+        "got {err:?}"
+    );
+
+    // Token is still usable: validation failed before the transaction.
+    authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("valid password after validation failure must succeed");
+}
+
+/// `reset_password` revokes every refresh-token family of the user and
+/// records `revoked_reason = 'password_reset'`. Two logins in parallel
+/// (two families) are both invalidated.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn reset_password_revokes_all_refresh_tokens(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-revoke");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+
+    let r1 = authn.issue_refresh_token(&user).await.unwrap();
+    let r2 = authn.issue_refresh_token(&user).await.unwrap();
+    assert_ne!(r1, r2, "two issue calls must yield different tokens");
+
+    let families_before: i64 = sqlx::query_scalar(
+        "select count(distinct family_id) from refresh_tokens where user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(families_before, 2, "two distinct families before reset");
+
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+    authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("reset must succeed");
+
+    let revoked: i64 = sqlx::query_scalar(
+        "select count(*) from refresh_tokens where user_id = $1 and revoked_at is not null",
+    )
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let total: i64 =
+        sqlx::query_scalar("select count(*) from refresh_tokens where user_id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        revoked, total,
+        "reset_password must revoke every refresh-token row of the user"
+    );
+    assert!(total >= 2, "two rows must be present");
+
+    let reasons: Vec<Option<String>> =
+        sqlx::query_scalar("select revoked_reason from refresh_tokens where user_id = $1")
+            .bind(user.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        reasons
+            .iter()
+            .all(|r| r.as_deref() == Some("password_reset")),
+        "every revoked row must record password_reset, got {reasons:?}"
+    );
+
+    // Old refresh tokens are no longer usable.
+    let err = authn
+        .rotate_refresh_token(&r1)
+        .await
+        .expect_err("old refresh token must be rejected after reset");
+    assert!(matches!(err, AuthnError::RefreshInvalid), "got {err:?}");
+}
+
+/// `revoke_all_user_tokens` is a public helper (Stage 3d): revokes every
+/// not-yet-revoked refresh token of `user_id` with the given `reason`, and
+/// does not touch other users' rows.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn revoke_all_user_tokens_revokes_every_family_of_user(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("pr-revoke-all");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let other = authn
+        .register(&unique_email("pr-revoke-all-other"), "Password123!")
+        .await
+        .unwrap();
+
+    let _u1 = authn.issue_refresh_token(&user).await.unwrap();
+    let _u2 = authn.issue_refresh_token(&user).await.unwrap();
+    let _o1 = authn.issue_refresh_token(&other).await.unwrap();
+
+    let affected = authn
+        .revoke_all_user_tokens(user.id, Some("password_reset"))
+        .await
+        .expect("revoke_all_user_tokens must succeed");
+    assert_eq!(affected, 2, "two rows of the target user revoked");
+
+    let user_revoked: i64 = sqlx::query_scalar(
+        "select count(*) from refresh_tokens where user_id = $1 and revoked_at is not null",
+    )
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let user_total: i64 =
+        sqlx::query_scalar("select count(*) from refresh_tokens where user_id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(user_revoked, user_total, "every row of the target user revoked");
+
+    let other_revoked: i64 = sqlx::query_scalar(
+        "select count(*) from refresh_tokens where user_id = $1 and revoked_at is not null",
+    )
+    .bind(other.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(other_revoked, 0, "other users' tokens must not be touched");
+
+    let user_reasons: Vec<Option<String>> =
+        sqlx::query_scalar("select revoked_reason from refresh_tokens where user_id = $1")
+            .bind(user.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        user_reasons
+            .iter()
+            .all(|r| r.as_deref() == Some("password_reset")),
+        "every revoked row must record the supplied reason"
+    );
+
+    // Idempotent: second call revokes nothing.
+    let again = authn
+        .revoke_all_user_tokens(user.id, Some("password_reset"))
+        .await
+        .expect("second call must succeed");
+    assert_eq!(again, 0, "already-revoked rows must be a no-op");
 }

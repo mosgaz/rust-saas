@@ -2,9 +2,9 @@
 //! tokens with rotation and family revocation.
 //!
 //! Uses `identity` for the `users` table, but owns password hashing, JWT
-//! issuing/verification, and the `refresh_tokens` and `email_verifications`
-//! tables. Cookies, HTTP, Leptos, and Casbin are not part of this crate —
-//! that is the consumer's responsibility.
+//! issuing/verification, and the `refresh_tokens`, `email_verifications`,
+//! and `password_reset_tokens` tables. Cookies, HTTP, Leptos, and Casbin
+//! are not part of this crate — that is the consumer's responsibility.
 //!
 //! Stage 2d: rotation includes a grace window
 //! ([`REFRESH_GRACE_SECONDS`]). A refresh token presented within the window
@@ -21,6 +21,19 @@
 //! [`Authn::create_email_verification`] (single-active, 24-hour TTL) and
 //! [`Authn::verify_email`] (idempotent, no auto-login). Revocation reasons
 //! are recorded in `refresh_tokens.revoked_reason` ([`RevokeReason`]).
+//!
+//! Stage 3d: password reset. [`Authn::request_password_reset`] issues a
+//! single-active reset token (1-hour TTL; only `token_hash` persisted) and
+//! returns `Ok(None)` for unknown emails (no enumeration signal).
+//! [`Authn::reset_password`] is **one-shot** — unlike `verify_email`, a
+//! replay of the same raw token returns [`AuthnError::TokenInvalid`], so a
+//! reset URL that leaks via browser history or `Referer` cannot overwrite
+//! the freshly rotated password. In a single transaction it rewrites
+//! `users.password_hash` and `users.password_changed_at = now()` (via
+//! `identity::update_password_tx`), expires every outstanding reset token
+//! for the user, and revokes every refresh-token family
+//! ([`RevokeReason::PasswordReset`]). Access JWTs remain valid until their
+//! short `exp`; iat-vs-`password_changed_at` enforcement is Stage 4.
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
@@ -61,6 +74,9 @@ pub const REFRESH_GRACE_SECONDS: i64 = 10;
 /// Email-verification token lifetime (Stage 3b): 24 hours.
 pub const EMAIL_VERIFICATION_TTL_HOURS: i64 = 24;
 
+/// Password-reset token lifetime (Stage 3d): 1 hour.
+pub const PASSWORD_RESET_TTL_HOURS: i64 = 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthnError {
     #[error("invalid credentials")]
@@ -92,15 +108,17 @@ pub enum AuthnError {
 /// is free-form `text`; new reasons can be added without a migration as long
 /// as [`RevokeReason::as_str`] is extended.
 ///
-/// `PasswordReset` is reserved for Stage 3d and is not written by any code
-/// path in Stage 3b.
+/// `PasswordReset` is written by [`Authn::reset_password`] (Stage 3d): the
+/// method revokes every refresh-token family of the user in the same
+/// transaction as the password change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeReason {
     /// Explicit user logout (`revoke_refresh_token`).
     Logout,
     /// Genuine reuse detected on rotation (`rotate_refresh_token`).
     ReuseDetected,
-    /// Password reset invalidated the session family (Stage 3d, reserved).
+    /// Password reset invalidated every session family of the user
+    /// (Stage 3d, `Authn::reset_password`).
     PasswordReset,
 }
 
@@ -139,6 +157,13 @@ struct RefreshTokenRecord {
 #[derive(Debug, sqlx::FromRow)]
 struct VerificationRecord {
     id: Uuid,
+    user_id: Uuid,
+    expires_at: DateTime<Utc>,
+    used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ResetTokenRecord {
     user_id: Uuid,
     expires_at: DateTime<Utc>,
     used_at: Option<DateTime<Utc>>,
@@ -376,6 +401,34 @@ impl Authn {
         Ok(())
     }
 
+    /// Revokes **every** not-yet-revoked refresh token of `user_id`
+    /// (Stage 3d). Returns the number of rows affected.
+    ///
+    /// Used to invalidate all sessions of a user (e.g. after a password
+    /// change). `revoke_family` handles one family; this method handles
+    /// the user across families. Idempotent: rows already revoked are not
+    /// touched. `reset_password` performs the equivalent `UPDATE` inline
+    /// (inside its transaction); this public method is available for
+    /// external callers that do not hold a transaction.
+    pub async fn revoke_all_user_tokens(
+        &self,
+        user_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<u64, AuthnError> {
+        let result = sqlx::query(
+            r#"
+            update refresh_tokens
+            set revoked_at = now(), revoked_reason = $2
+            where user_id = $1 and revoked_at is null
+            "#,
+        )
+        .bind(user_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Creates (or replaces) an email-verification token for `user_id`.
     ///
     /// Order:
@@ -528,6 +581,170 @@ impl Authn {
         Ok(user)
     }
 
+    /// Issues a password-reset token for `email` (Stage 3d).
+    ///
+    /// Order:
+    /// 1. Look up the user by email. **Not found** → `Ok(None)` (silent —
+    ///    do not leak which addresses are registered).
+    /// 2. In a transaction: `DELETE` any unused reset token for the user
+    ///    (single-active; also enforced by
+    ///    `password_reset_tokens_one_active_idx`).
+    /// 3. `INSERT` a new row (`token_hash = SHA-256(raw)`,
+    ///    `expires_at = now() + PASSWORD_RESET_TTL_HOURS`).
+    /// 4. Commit; return `Ok(Some(raw))` — the only time the raw token is
+    ///    visible. Delivery (email) is the caller's responsibility.
+    ///
+    /// Does **not** validate the target's password; does **not** touch
+    /// `email_verified_at` (reset ≠ verification).
+    pub async fn request_password_reset(
+        &self,
+        email: &str,
+    ) -> Result<Option<String>, AuthnError> {
+        let Some(record) = identity::find_by_email(&self.pool, email).await? else {
+            return Ok(None);
+        };
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("delete from password_reset_tokens where user_id = $1 and used_at is null")
+            .bind(record.id)
+            .execute(&mut *tx)
+            .await?;
+
+        let raw = generate_opaque_token();
+        let token_hash = hash_token(&raw);
+        let expires_at = Utc::now() + Duration::hours(PASSWORD_RESET_TTL_HOURS);
+
+        sqlx::query(
+            r#"
+            insert into password_reset_tokens (user_id, token_hash, expires_at)
+            values ($1, $2, $3)
+            "#,
+        )
+        .bind(record.id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(Some(raw))
+    }
+
+    /// Resets the password using a raw reset token (Stage 3d).
+    ///
+    /// **One-shot.** Unlike `verify_email`, replaying the same raw token
+    /// returns [`AuthnError::TokenInvalid`]; this protects against a reset
+    /// URL leaking via browser history or `Referer`.
+    ///
+    /// Order (single transaction):
+    /// 1. Validate `new_password` ([`identity::validate_password`] — ≥ 8
+    ///    chars) and hash it with Argon2. Done **before** opening the
+    ///    transaction: invalid input must not lock rows.
+    /// 2. `SELECT ... FOR UPDATE` the reset-token row by `token_hash`;
+    ///    not found → [`AuthnError::TokenInvalid`].
+    /// 3. `used_at IS NOT NULL` → [`AuthnError::TokenInvalid`] (one-shot).
+    /// 4. `expires_at <= now` → [`AuthnError::TokenExpired`].
+    /// 5. `SELECT id FROM users ... FOR UPDATE` — row-lock the user,
+    ///    serializing with concurrent reset attempts.
+    /// 6. `identity::update_password_tx` — `password_hash = $1`,
+    ///    `password_changed_at = now()`.
+    /// 7. `UPDATE password_reset_tokens SET used_at = now() WHERE user_id
+    ///    = $1 AND used_at IS NULL` — expire the consumed token **and**
+    ///    every other outstanding reset token of the user.
+    /// 8. `UPDATE refresh_tokens SET revoked_at = now(), revoked_reason =
+    ///    'password_reset' WHERE user_id = $1 AND revoked_at IS NULL` —
+    ///    invalidate all sessions.
+    /// 9. `COMMIT`; fetch and return the current `AuthUser`.
+    ///
+    /// Access JWTs remain valid until their short `exp` (iat-vs-
+    /// `password_changed_at` enforcement is Stage 4). Does **not** issue
+    /// cookies or log the user in; the UI redirects to `/login`.
+    pub async fn reset_password(
+        &self,
+        raw: &str,
+        new_password: &str,
+    ) -> Result<AuthUser, AuthnError> {
+        // 1. Validate + hash before opening the transaction.
+        identity::validate_password(new_password)?;
+        let new_hash = hash_password(new_password)?;
+
+        let token_hash = hash_token(raw);
+        let mut tx = self.pool.begin().await?;
+
+        // 2. Load the token row and lock it.
+        let row: Option<ResetTokenRecord> = sqlx::query_as(
+            r#"
+            select user_id, expires_at, used_at
+            from password_reset_tokens
+            where token_hash = $1
+            for update
+            "#,
+        )
+        .bind(&token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(AuthnError::TokenInvalid);
+        };
+
+        // 3. One-shot: a previously used token is rejected.
+        if row.used_at.is_some() {
+            return Err(AuthnError::TokenInvalid);
+        }
+
+        // 4. Expired token.
+        if row.expires_at <= Utc::now() {
+            return Err(AuthnError::TokenExpired);
+        }
+
+        // 5. Lock the user row.
+        let _locked: Option<Uuid> =
+            sqlx::query_scalar("select id from users where id = $1 for update")
+                .bind(row.user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        // 6. Rewrite password + password_changed_at.
+        identity::update_password_tx(&mut tx, row.user_id, &new_hash).await?;
+
+        // 7. Expire the consumed token and every other outstanding one for
+        //    this user (single-active invariant is preserved by design).
+        sqlx::query(
+            r#"
+            update password_reset_tokens
+            set used_at = now()
+            where user_id = $1 and used_at is null
+            "#,
+        )
+        .bind(row.user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 8. Revoke every refresh-token family of the user.
+        sqlx::query(
+            r#"
+            update refresh_tokens
+            set revoked_at = now(), revoked_reason = $2
+            where user_id = $1 and revoked_at is null
+            "#,
+        )
+        .bind(row.user_id)
+        .bind(RevokeReason::PasswordReset.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        // 9. Commit and return the updated user.
+        tx.commit().await?;
+
+        let user = identity::find_by_id(&self.pool, row.user_id)
+            .await?
+            .ok_or(AuthnError::TokenInvalid)?;
+        Ok(user)
+    }
+
     /// Verifies an access JWT and resolves the current `AuthUser` from
     /// `users`.
     ///
@@ -574,7 +791,7 @@ pub fn hash_password(password: &str) -> Result<String, AuthnError> {
 }
 
 /// Generates a 64-char hex opaque token (2 × UUID v4 simple hex). Used for
-/// refresh tokens and email-verification tokens.
+/// refresh tokens, email-verification tokens, and password-reset tokens.
 fn generate_opaque_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }

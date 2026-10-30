@@ -1,4 +1,5 @@
-//! Login, registration, and (Stage 3b) email verification pages.
+//! Login, registration, email verification (Stage 3b), and password reset
+//! (Stage 3d) pages.
 //!
 //! Stage 3a: after a successful `login` / `register`, the page consumes the
 //! `return_url` cookie (set by `pages::invitation::InvitationAcceptPage` for
@@ -14,9 +15,29 @@
 //!   `crate::auth::verify_email` on mount. Idempotent on the server side;
 //!   shows a generic "verified" or "invalid/expired" message and links to
 //!   `/login`. Does not log the user in.
+//!
+//! Stage 3d:
+//! - `LoginPage`: a "Forgot password?" link next to the sign-in button.
+//! - `ForgotPasswordPage` (`/forgot-password`): submits the address to the
+//!   **public** `crate::auth::request_password_reset`. The server is silent
+//!   on unknown emails and the page shows a **generic** confirmation —
+//!   "If an account with that email exists, we've sent a reset link" — for
+//!   both existing and unknown addresses. Only a `429` (rate limited) is
+//!   surfaced as an error; other server-side outcomes are swallowed by the
+//!   silent path.
+//! - `ResetPasswordPage` (`/reset-password/:token`): a "new password" +
+//!   "confirm password" form. Client-side checks (min 8 chars, match) run
+//!   before the `#[server]` call; the server validates again via
+//!   `identity::validate_password`. On success shows "Password updated" and
+//!   a link to `/login`. `TokenInvalid` / `TokenExpired` are shown as a
+//!   banner. The server is **one-shot**: a replayed token returns
+//!   `TokenInvalid`. Does **not** auto-login — cookies from before the reset
+//!   are revoked server-side (all refresh-token families are revoked with
+//!   `revoked_reason = "password_reset"`); the user signs in again.
 
 use crate::auth::{
-    login, register, request_email_verification, take_return_url, verify_email,
+    login, register, request_email_verification, request_password_reset, reset_password,
+    take_return_url, verify_email,
 };
 use crate::email::EmailResult;
 use domain::AuthUser;
@@ -61,6 +82,12 @@ pub fn LoginPage() -> impl IntoView {
                 <input class="input" placeholder="Email" bind:value=email />
                 <input class="input" type="password" placeholder="Password" bind:value=password />
                 <button class="btn" on:click=submit>"Sign in"</button>
+
+                <p class="text-sm text-neutral-400">
+                    <a class="text-blue-400 hover:underline" href="/forgot-password">
+                        "Forgot password?"
+                    </a>
+                </p>
 
                 {move || error.get().map(|e| view! { <p class="text-red-400">{e}</p> })}
                 {move || user.get().map(|u| view! { <p class="text-green-400">{u.email}</p> })}
@@ -271,6 +298,172 @@ pub fn VerifyEmailPage() -> impl IntoView {
                     </div>
                 }.into_any(),
             }}
+        </main>
+    }
+}
+
+// ─── Forgot password (Stage 3d, `/forgot-password`) ─────────────────────────
+
+/// Requests a password-reset email for the entered address.
+///
+/// Silent: the server returns `Ok(())` for unknown emails, and the page
+/// shows the same generic confirmation regardless of whether the address is
+/// registered. Only rate-limit errors (`429`) are surfaced as such — the
+/// rate limiter is keyed by the raw submitted address, not by the resolved
+/// user id, so the shape of the response does not depend on whether the
+/// address exists.
+#[component]
+pub fn ForgotPasswordPage() -> impl IntoView {
+    let email = RwSignal::new(String::new());
+    let submitted = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let submitting = RwSignal::new(false);
+
+    let submit = move |_| {
+        if submitting.get_untracked() {
+            return;
+        }
+        let addr = email.get().trim().to_string();
+        if addr.is_empty() {
+            error.set(Some("email is required".into()));
+            return;
+        }
+        submitting.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match request_password_reset(addr).await {
+                Ok(()) => {
+                    submitted.set(true);
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            submitting.set(false);
+        });
+    };
+
+    view! {
+        <main class="mx-auto max-w-sm p-8">
+            <h1 class="text-2xl font-bold">"Forgot password"</h1>
+            <p class="mt-2 text-sm text-neutral-400">
+                "Enter the email address on your account and we will send you a reset link."
+            </p>
+
+            {move || {
+                if submitted.get() {
+                    view! {
+                        <div class="mt-6 space-y-4">
+                            <p class="text-green-400">
+                                "If an account with that email exists, we've sent a reset link."
+                            </p>
+                            <p class="text-sm text-neutral-400">
+                                "Check your inbox (and spam folder). The link expires in 1 hour."
+                            </p>
+                            <a class="btn inline-block" href="/login">"Back to login"</a>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {
+                        <div class="mt-6 space-y-4">
+                            <input class="input" placeholder="Email" bind:value=email />
+                            <button class="btn" on:click=submit>"Send reset link"</button>
+                        </div>
+                    }.into_any()
+                }
+            }}
+
+            {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
+        </main>
+    }
+}
+
+// ─── Reset password (Stage 3d, `/reset-password/:token`) ────────────────────
+
+#[derive(Params, PartialEq)]
+struct ResetTokenParams {
+    token: String,
+}
+
+#[component]
+pub fn ResetPasswordPage() -> impl IntoView {
+    let params = use_params::<ResetTokenParams>();
+    let token = move || params.with(|r| r.as_ref().ok().map(|p| p.token.clone()));
+
+    let password = RwSignal::new(String::new());
+    let confirm = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+    let done = RwSignal::new(false);
+    let submitting = RwSignal::new(false);
+
+    let submit = move |_| {
+        if submitting.get_untracked() {
+            return;
+        }
+        let Some(tok) = token() else {
+            error.set(Some("invalid reset link".into()));
+            return;
+        };
+        let pw = password.get();
+        let cf = confirm.get();
+        if pw.len() < 8 {
+            error.set(Some("password must be at least 8 characters".into()));
+            return;
+        }
+        if pw != cf {
+            error.set(Some("passwords do not match".into()));
+            return;
+        }
+        submitting.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match reset_password(tok, pw).await {
+                Ok(_) => {
+                    done.set(true);
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            submitting.set(false);
+        });
+    };
+
+    view! {
+        <main class="mx-auto max-w-sm p-8">
+            <h1 class="text-2xl font-bold">"Set a new password"</h1>
+
+            {move || {
+                if done.get() {
+                    view! {
+                        <div class="mt-6 space-y-4">
+                            <p class="text-green-400">"Password updated."</p>
+                            <p class="text-sm text-neutral-400">
+                                "You have been signed out of all sessions. Sign in with your new password."
+                            </p>
+                            <a class="btn inline-block" href="/login">"Go to login"</a>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {
+                        <div class="mt-6 space-y-4">
+                            <input
+                                class="input"
+                                type="password"
+                                placeholder="New password (min 8 characters)"
+                                bind:value=password
+                            />
+                            <input
+                                class="input"
+                                type="password"
+                                placeholder="Confirm new password"
+                                bind:value=confirm
+                            />
+                            <button class="btn" on:click=submit>"Update password"</button>
+                        </div>
+                    }.into_any()
+                }
+            }}
+
+            {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
         </main>
     }
 }

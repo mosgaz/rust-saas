@@ -5,6 +5,12 @@
 //! `shell` builds the `<html><head>…</head><body>…</body></html>` skeleton
 //! used by `leptos_routes_with_context` (the 4th argument, not `App`), as
 //! required by `leptos_meta`. `hydrate` is the WASM entry point.
+//!
+//! Stage 3d adds two auth routes: `/forgot-password`
+//! ([`pages::auth::ForgotPasswordPage`]) and `/reset-password/:token`
+//! ([`pages::auth::ResetPasswordPage`]). Both are public — no `CurrentUser`
+//! is required; the reset flow ends with a manual redirect to `/login`
+//! (no auto-login).
 
 // Leptos' `view!` macro expands to deeply nested generic types; the default
 // rustc recursion limit (128) is insufficient once `pages/member.rs` grows
@@ -45,6 +51,15 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/") view=pages::home::HomePage />
                     <Route path=path!("/login") view=pages::auth::LoginPage />
                     <Route path=path!("/register") view=pages::auth::RegisterPage />
+                    <Route path=path!("/verify/:token") view=pages::auth::VerifyEmailPage />
+                    <Route
+                        path=path!("/forgot-password")
+                        view=pages::auth::ForgotPasswordPage
+                    />
+                    <Route
+                        path=path!("/reset-password/:token")
+                        view=pages::auth::ResetPasswordPage
+                    />
                     <Route path=path!("/platform") view=pages::platform::PlatformPage />
 
                     <Route path=path!("/tenants") view=pages::tenant::TenantListPage />
@@ -124,7 +139,15 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 }
 
 /// WASM entry point: hydrates the SSR-rendered `App`.
-#[cfg(feature = "hydrate")]
+///
+/// Compiled only for `target_arch = "wasm32"`: `console_error_panic_hook`
+/// is a wasm32-only dependency (see `Cargo.toml`,
+/// `[target.'cfg(target_arch = "wasm32")'.dependencies]`), so including
+/// this function on the host (e.g. `cargo check --features hydrate`)
+/// would fail with a missing-crate error. Host `cargo check --features
+/// hydrate` now verifies the type-level API on the host; the actual wasm
+/// build is `cargo leptos watch`.
+#[cfg(all(feature = "hydrate", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
     console_error_panic_hook::set_once();

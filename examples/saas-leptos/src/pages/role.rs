@@ -8,6 +8,11 @@
 //! delete + create). `protected`/`immutable` roles are rejected client-side
 //! (`navigate(back_url)` on direct entry) and server-side
 //! (`AccessError::Protected`/`Immutable` → `CoreError::Forbidden` → 403).
+//!
+//! Permissions are picked via checkboxes grouped by `resource` (shared
+//! `PermissionCheckboxes`), both in the create form (`RoleListPage`) and in
+//! the edit form (`RoleFormPage`); the wire format to the server stays
+//! `Vec<"resource:action">`.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -183,24 +188,92 @@ fn parse_permission_pairs(raw: &[String]) -> Result<Vec<(String, String)>, Serve
         .collect()
 }
 
+// ─── Shared permission checkboxes ───────────────────────────────────────────
+
+/// Renders the `permissions` reference table as checkbox groups (one group
+/// per `resource`), toggling entries in `selected`.
+///
+/// Used by both `RoleListPage` (create form) and `RoleFormPage` (edit form).
+/// Pairs present in `selected` but missing from `reference` are not rendered
+/// (an anomaly — the FK prevents such rows from being written); they are
+/// preserved in `selected` and would fail `PermissionNotFound` on the
+/// server if the form is submitted unchanged, which should not happen.
+#[component]
+fn PermissionCheckboxes(
+    reference: RwSignal<Vec<(String, String, String)>>,
+    selected: RwSignal<HashSet<(String, String)>>,
+) -> impl IntoView {
+    view! {
+        {move || {
+            let current = selected.get();
+            let mut groups: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+            for (r, a, d) in reference.get() {
+                groups.entry(r.clone()).or_default().push((r, a, d));
+            }
+            if groups.is_empty() {
+                view! {
+                    <p class="mt-2 text-neutral-500">"No permissions reference loaded."</p>
+                }.into_any()
+            } else {
+                groups.into_iter().map(|(resource, items)| {
+                    view! {
+                        <div class="mt-3">
+                            <h4 class="text-xs font-semibold text-neutral-400 uppercase tracking-wide">
+                                {resource.clone()}
+                            </h4>
+                            <div class="mt-2 space-y-1">
+                                {items.into_iter().map(|(r, a, d)| {
+                                    let key = (r.clone(), a.clone());
+                                    let checked = current.contains(&key);
+                                    let r_for = r.clone();
+                                    let a_for = a.clone();
+                                    view! {
+                                        <label class="flex items-start gap-2 text-sm">
+                                            <input
+                                                type="checkbox"
+                                                prop:checked=checked
+                                                on:change=move |_| {
+                                                    selected.update(|s| {
+                                                        let k = (r_for.clone(), a_for.clone());
+                                                        if s.contains(&k) { s.remove(&k); } else { s.insert(k); }
+                                                    });
+                                                }
+                                            />
+                                            <span>
+                                                <span class="font-medium">{a.clone()}</span>
+                                                <span class="text-neutral-500 ml-2">{d.clone()}</span>
+                                            </span>
+                                        </label>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        </div>
+                    }
+                }).collect_view().into_any()
+            }
+        }}
+    }
+}
+
 // ─── Shared list panel ──────────────────────────────────────────────────────
 
 /// Inline roles panel. Lists roles in `domain`, offers an Edit button per
 /// non-protected/non-immutable role (if `(roles, manage)`), a Delete button
 /// per non-protected role (if `(roles, delete)`), and an inline create form
-/// (if `(roles, create)`).
+/// (if `(roles, create)`) with permission checkboxes.
 #[component]
 pub fn RoleListPage(domain: String) -> impl IntoView {
     let domain = StoredValue::new(domain);
     let roles = RwSignal::new(Vec::<RoleView>::new());
     let perms = RwSignal::new(HashSet::<(String, String)>::new());
+    let reference = RwSignal::new(Vec::<(String, String, String)>::new());
     let error = RwSignal::new(None::<String>);
     let refresh = RwSignal::new(0u32);
 
     let new_key = RwSignal::new(String::new());
     let new_name = RwSignal::new(String::new());
     let new_description = RwSignal::new(String::new());
-    let new_permissions = RwSignal::new(String::new());
+    let new_selected = RwSignal::new(HashSet::<(String, String)>::new());
 
     Effect::new(move |_| {
         let _ = refresh.get();
@@ -215,6 +288,10 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
             }
             match my_permissions(d).await {
                 Ok(p) => perms.set(p.into_iter().collect()),
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            match list_permissions().await {
+                Ok(p) => reference.set(p),
                 Err(e) => error.set(Some(e.to_string())),
             }
         });
@@ -239,11 +316,10 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
         let key = new_key.get().trim().to_string();
         let name = new_name.get();
         let description = new_description.get();
-        let raw_perms = new_permissions.get();
-        let perms_vec: Vec<String> = raw_perms
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        let perms_vec: Vec<String> = new_selected
+            .get()
+            .into_iter()
+            .map(|(r, a)| format!("{r}:{a}"))
             .collect();
         if key.is_empty() || name.is_empty() {
             error.set(Some("key and name are required".into()));
@@ -255,7 +331,7 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
                     new_key.set(String::new());
                     new_name.set(String::new());
                     new_description.set(String::new());
-                    new_permissions.set(String::new());
+                    new_selected.set(HashSet::new());
                     error.set(None);
                     refresh.update(|n| *n += 1);
                 }
@@ -379,11 +455,10 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
                             placeholder="description"
                             bind:value=new_description
                         />
-                        <input
-                            class="input mt-2"
-                            placeholder="permissions, comma-separated (e.g. documents:read, documents:write)"
-                            bind:value=new_permissions
-                        />
+
+                        <h4 class="mt-6 text-sm font-semibold">"Permissions"</h4>
+                        <PermissionCheckboxes reference=reference selected=new_selected />
+
                         <button class="btn mt-3" on:click=submit_create>"Create"</button>
                     </div>
                 })
@@ -503,54 +578,7 @@ pub fn RoleFormPage(domain: String, role_id: Uuid, back_url: String) -> impl Int
                     <input class="input mt-2" placeholder="description" bind:value=description />
 
                     <h3 class="mt-6 text-sm font-semibold">"Permissions"</h3>
-                    {move || {
-                        let current = selected.get();
-                        let mut groups: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
-                        for (r, a, d) in reference.get() {
-                            groups.entry(r.clone()).or_default().push((r, a, d));
-                        }
-                        if groups.is_empty() {
-                            view! {
-                                <p class="mt-2 text-neutral-500">"No permissions reference loaded."</p>
-                            }.into_any()
-                        } else {
-                            groups.into_iter().map(|(resource, items)| {
-                                view! {
-                                    <div class="mt-3">
-                                        <h4 class="text-xs font-semibold text-neutral-400 uppercase tracking-wide">
-                                            {resource.clone()}
-                                        </h4>
-                                        <div class="mt-2 space-y-1">
-                                            {items.into_iter().map(|(r, a, d)| {
-                                                let key = (r.clone(), a.clone());
-                                                let checked = current.contains(&key);
-                                                let r_for = r.clone();
-                                                let a_for = a.clone();
-                                                view! {
-                                                    <label class="flex items-start gap-2 text-sm">
-                                                        <input
-                                                            type="checkbox"
-                                                            prop:checked=checked
-                                                            on:change=move |_| {
-                                                                selected.update(|s| {
-                                                                    let k = (r_for.clone(), a_for.clone());
-                                                                    if s.contains(&k) { s.remove(&k); } else { s.insert(k); }
-                                                                });
-                                                            }
-                                                        />
-                                                        <span>
-                                                            <span class="font-medium">{a.clone()}</span>
-                                                            <span class="text-neutral-500 ml-2">{d.clone()}</span>
-                                                        </span>
-                                                    </label>
-                                                }
-                                            }).collect_view()}
-                                        </div>
-                                    </div>
-                                }
-                            }).collect_view().into_any()
-                        }
-                    }}
+                    <PermissionCheckboxes reference=reference selected=selected />
                 </div>
             })}
 

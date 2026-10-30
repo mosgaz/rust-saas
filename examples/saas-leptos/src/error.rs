@@ -16,6 +16,15 @@
 //! (`"email not verified"`) so the UI can offer "resend verification email"
 //! instead of a generic forbidden.
 //!
+//! Stage 3d: no new variants were introduced. The password-reset flow is
+//! covered by the existing arms:
+//! - `reset_password` → `AuthnError::TokenInvalid` (401, unknown or replayed
+//!   token), `AuthnError::TokenExpired` (401, expired token),
+//!   `AuthnError::Identity(IdentityError::Validation(_))` (400, password
+//!   too short — validation runs before the token is consumed).
+//! - `request_password_reset` is silent (`Ok(())` for unknown emails) and is
+//!   only surfaced through `rate_limited_error(...)` → 429.
+//!
 //! The body of `ServerFnError` is the error's `Display` string. The HTTP
 //! status is set via `leptos_axum::ResponseOptions` before the `#[server]`
 //! function returns. If the `ResponseOptions` context is unavailable (unit
