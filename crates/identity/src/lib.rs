@@ -11,9 +11,16 @@
 //! every `SELECT` that maps a `users` row into `AuthUser`. The timestamp
 //! itself is internal to this crate (`UserRecord`); it is not exposed on
 //! `AuthUser`.
+//!
+//! Stage 3d: `users.password_changed_at` is the source of truth for "when
+//! was the password last set". `UserRecord` carries it; `update_password_tx`
+//! is the only writer that mutates `password_hash`, and it updates
+//! `password_changed_at = now()` in the same statement. Stage 4 will use it
+//! to invalidate access tokens issued before a password change (iat-vs-
+//! `password_changed_at`); Stage 3d only maintains it.
 
 use domain::AuthUser;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +35,8 @@ pub enum IdentityError {
     Db(#[from] sqlx::Error),
 }
 
-/// Full `users` row, including `password_hash` and `email_verified_at`.
+/// Full `users` row, including `password_hash`, `email_verified_at`, and
+/// `password_changed_at`.
 ///
 /// Internal to `identity`/`authn`: `UserRecord` never crosses the crate
 /// boundary (`AuthUser` is the public DTO; `From<UserRecord>` is the only
@@ -39,6 +47,10 @@ pub struct UserRecord {
     pub email: String,
     pub password_hash: String,
     pub email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the password was last changed (Stage 3d). Source of truth for
+    /// the iat-vs-`password_changed_at` check in Stage 4; this stage only
+    /// maintains it.
+    pub password_changed_at: chrono::DateTime<chrono::Utc>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -90,7 +102,7 @@ pub async fn find_by_email(
 ) -> Result<Option<UserRecord>, IdentityError> {
     let user = sqlx::query_as::<_, UserRecord>(
         r#"
-        select id, email, password_hash, email_verified_at, created_at
+        select id, email, password_hash, email_verified_at, password_changed_at, created_at
         from users
         where email = $1
         "#,
@@ -102,7 +114,9 @@ pub async fn find_by_email(
 }
 
 /// Creates a user. `password_hash` must already be computed (Argon2 is in
-/// `authn`). The new user is unverified (`email_verified_at IS NULL`).
+/// `authn`). The new user is unverified (`email_verified_at IS NULL`);
+/// `password_changed_at` defaults to `now()` via the column default from
+/// migration `20261106000001_authn_password_reset.sql`.
 pub async fn create_user(
     pool: &PgPool,
     email: &str,
@@ -133,9 +147,14 @@ pub async fn create_user(
 /// Idempotent upsert: if a user with this email exists, update
 /// `password_hash`; otherwise create. Used by `seed`.
 ///
-/// Does **not** touch `email_verified_at`: seed uses `upsert_user` followed
-/// by an explicit `UPDATE` to set `email_verified_at = COALESCE(...)` for
-/// demo accounts (see `crates/seed/src/main.rs`).
+/// Does **not** touch `email_verified_at` or `password_changed_at`: seed
+/// uses `upsert_user` followed by an explicit `UPDATE` to set
+/// `email_verified_at = COALESCE(...)` for demo accounts (see
+/// `crates/seed/src/main.rs`). Not updating `password_changed_at` here is
+/// intentional — a seed re-run is not treated as a security-relevant
+/// password change (Stage 4's iat-vs-`password_changed_at` check would
+/// otherwise invalidate freshly-issued demo access tokens after every
+/// seed run).
 pub async fn upsert_user(
     pool: &PgPool,
     email: &str,
@@ -158,4 +177,41 @@ pub async fn upsert_user(
     .await?;
 
     Ok(user)
+}
+
+/// Updates a user's password inside a caller-supplied transaction (Stage 3d).
+///
+/// Sets `password_hash = $1` and `password_changed_at = now()` in a single
+/// `UPDATE`. The caller (`authn::reset_password`) is responsible for
+/// revoking refresh tokens and expiring outstanding reset tokens in the
+/// same transaction; this function writes only the `users` row, preserving
+/// the §2.9 single-writer invariant (`identity` writes `users`; `authn`
+/// orchestrates the transaction via this helper — the same pattern as
+/// `verify_email` writing `email_verified_at`).
+///
+/// Returns [`IdentityError::NotFound`] if no row matches `user_id`; in
+/// `authn::reset_password` the user id comes from a reset token that was
+/// just read under `FOR UPDATE`, so a miss is treated as an internal error
+/// (the user cannot normally disappear between those two statements).
+pub async fn update_password_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    new_hash: &str,
+) -> Result<(), IdentityError> {
+    let updated = sqlx::query(
+        r#"
+        update users
+        set password_hash = $1, password_changed_at = now()
+        where id = $2
+        "#,
+    )
+    .bind(new_hash)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        return Err(IdentityError::NotFound);
+    }
+    Ok(())
 }
