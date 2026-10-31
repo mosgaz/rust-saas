@@ -65,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(authn::DEFAULT_REFRESH_TTL_DAYS);
 
+    let cookie_cfg = Arc::new(saas_leptos::cookie::CookieConfig::from_env(&bind_addr));
+
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
@@ -132,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
         leptos_options: leptos_options.clone(),
         email,
         rate_limit,
+        cookie: cookie_cfg.clone(),
     };
 
     let routes = generate_route_list(saas_leptos::App);
@@ -152,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
             },
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            authn,
+            (authn, cookie_cfg),
             saas_leptos::middleware::auto_refresh,
         ));
 

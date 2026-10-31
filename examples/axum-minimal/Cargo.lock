@@ -262,6 +262,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "chrono",
+ "cookie",
  "db",
  "domain",
  "dotenvy",

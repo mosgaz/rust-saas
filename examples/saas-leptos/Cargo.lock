@@ -2781,6 +2781,7 @@ dependencies = [
  "axum-extra",
  "chrono",
  "console_error_panic_hook",
+ "cookie",
  "db",
  "domain",
  "dotenvy",

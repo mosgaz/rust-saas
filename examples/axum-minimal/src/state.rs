@@ -25,6 +25,7 @@ use std::sync::Arc;
 use authn::Authn;
 use saas::SaasState;
 
+use crate::cookie::CookieConfig;
 use crate::email::EmailSender;
 use crate::rate_limit::SimpleRateLimiter;
 
@@ -54,6 +55,11 @@ pub struct AppState {
     /// (3 / 1 h per email). Process-local; not distributed (see
     /// `rate_limit.rs`).
     pub rate_limit: Arc<SimpleRateLimiter>,
+
+    /// Cookie policy (Secure/SameSite/Max-Age) resolved from env at startup
+    /// (Stage 4.1b). Shared with `middleware::auto_refresh` and the auth
+    /// handlers in `src/auth.rs`.
+    pub cookie: Arc<CookieConfig>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Authn> {

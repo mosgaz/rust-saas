@@ -63,6 +63,7 @@ use tower_http::trace::TraceLayer;
 
 mod audit;
 mod auth;
+mod cookie;
 mod email;
 mod error;
 mod extract;
@@ -152,12 +153,18 @@ async fn main() -> anyhow::Result<()> {
     let email: Arc<dyn email::EmailSender> = Arc::new(NoopEmailSender);
     let rate_limit = Arc::new(SimpleRateLimiter::new());
 
-    let app_state = AppState {
+    // Stage 4.1b: cookie policy (Secure/SameSite/Max-Age).
+    let cookie_cfg = std::sync::Arc::new(
+        cookie::CookieConfig::from_env(&bind_addr),
+    );
+
+    let app_state = Arc::new(AppState {
         authn: authn.clone(),
         saas,
         email,
         rate_limit,
-    };
+        cookie: cookie_cfg.clone(),
+    });
 
     // ── Router: public vs protected ────────────────────────────────────────
     //
@@ -180,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
             get(workspace::list_documents).post(workspace::create_document),
         )
         .route("/audit", get(audit::list_audit))
-        .route_layer(from_fn_with_state(authn, middleware::auto_refresh));
+        .route_layer(from_fn_with_state(app_state.clone(), middleware::auto_refresh));
 
     let public: Router<Arc<AppState>> = Router::new()
         .route("/auth/register", post(auth::register))
@@ -190,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
     let router = protected
         .merge(public)
         .layer(TraceLayer::new_for_http())
-        .with_state(Arc::new(app_state));
+        .with_state(app_state);
 
     // ── Serve ──────────────────────────────────────────────────────────────
     let listener = tokio::net::TcpListener::bind(bind_addr)

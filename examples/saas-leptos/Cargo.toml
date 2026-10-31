@@ -26,6 +26,8 @@ leptos_axum = { version = "0.8", optional = true }
 
 axum = { version = "0.8", optional = true }
 axum-extra = { version = "0.10", features = ["cookie"], optional = true }
+# Stage 4.1b: `cookie::time::Duration` for `Cookie::max_age`.
+cookie = { version = "0.18", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"], optional = true }
 tower-http = { version = "0.6", features = ["fs", "trace"], optional = true }
@@ -74,6 +76,7 @@ ssr = [
     "dep:audit-pg",
     "dep:axum",
     "dep:axum-extra",
+    "dep:cookie",
     "dep:tokio",
     "dep:sqlx",
     "dep:leptos_axum",

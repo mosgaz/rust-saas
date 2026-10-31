@@ -31,8 +31,11 @@ use axum::http::header::{CACHE_CONTROL, SET_COOKIE};
 use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
-use axum_extra::extract::cookie::{Cookie, CookieJar};
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use cookie::time::Duration as CookieDuration;
 use domain::AuthUser;
+
+use crate::cookie::CookieConfig;
 
 /// Access-cookie name (access JWT, short-lived).
 pub const ACCESS_COOKIE: &str = "access_token";
@@ -40,39 +43,54 @@ pub const ACCESS_COOKIE: &str = "access_token";
 /// Refresh-cookie name (opaque, long-lived, rotation with family revocation).
 pub const REFRESH_COOKIE: &str = "refresh_token";
 
-/// Builds an `access_token` cookie (httpOnly, path `/`, session lifetime).
-pub fn access_cookie(token: String) -> Cookie<'static> {
+/// Builds an `access_token` cookie.
+///
+/// Attributes (Stage 4.1b):
+/// - `HttpOnly` — not readable by JS.
+/// - `Secure` — from `CookieConfig::secure`.
+/// - `SameSite=Lax` — sent on top-level navigation only.
+/// - `Path=/`.
+/// - `Max-Age` = `CookieConfig::access_max_age()`. Persistent, so the
+///   browser keeps it across restarts until the JWT itself expires.
+pub fn access_cookie(token: String, cfg: &CookieConfig) -> Cookie<'static> {
     Cookie::build((ACCESS_COOKIE, token))
         .path("/")
         .http_only(true)
+        .secure(cfg.secure)
+        .same_site(SameSite::Lax)
+        .max_age(CookieDuration::seconds(cfg.access_max_age().as_secs() as i64))
         .build()
 }
 
-/// Builds a `refresh_token` cookie (httpOnly, path `/`, session lifetime).
-pub fn refresh_cookie(token: String) -> Cookie<'static> {
+/// Builds a `refresh_token` cookie. Same attributes as
+/// [`access_cookie`]; `Max-Age` = `CookieConfig::refresh_max_age()`.
+pub fn refresh_cookie(token: String, cfg: &CookieConfig) -> Cookie<'static> {
     Cookie::build((REFRESH_COOKIE, token))
         .path("/")
         .http_only(true)
+        .secure(cfg.secure)
+        .same_site(SameSite::Lax)
+        .max_age(CookieDuration::seconds(cfg.refresh_max_age().as_secs() as i64))
         .build()
 }
 
-/// Builds a removal cookie (`Max-Age=0`, `Expires` in the past).
-///
-/// `Cookie::make_removal` in `cookie 0.18` is a `&mut self` method; build the
-/// empty cookie first, then apply removal, then restore `Path` / `HttpOnly`
-/// (they are not affected by `make_removal` but are set here explicitly for
-/// symmetry with the set-side cookies).
-pub fn removal_cookie(name: &'static str) -> Cookie<'static> {
+/// Builds a removal cookie (`Max-Age=0`, `Expires` in the past). The
+/// `Secure` / `SameSite` attributes are carried through so that a browser
+/// which stored the original cookie with `Secure` will also accept the
+/// deletion.
+pub fn removal_cookie(name: &'static str, cfg: &CookieConfig) -> Cookie<'static> {
     let mut c = Cookie::new(name, String::new());
     c.make_removal();
     c.set_path("/");
     c.set_http_only(true);
+    c.set_secure(cfg.secure);
+    c.set_same_site(SameSite::Lax);
     c
 }
 
 /// Auto-refresh layer. See module docs.
 pub async fn auto_refresh(
-    State(authn): State<Arc<Authn>>,
+    State((authn, cookie_cfg)): State<(Arc<Authn>, Arc<CookieConfig>)>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -87,11 +105,11 @@ pub async fn auto_refresh(
             Ok(Some(u)) => Some(u),
             Ok(None) => None,
             Err(AuthnError::TokenExpired) => {
-                try_refresh(&authn, refresh.as_deref(), &mut issued).await
+                try_refresh(&authn, refresh.as_deref(), &mut issued, &cookie_cfg).await
             }
             Err(_) => None,
         },
-        None => try_refresh(&authn, refresh.as_deref(), &mut issued).await,
+        None => try_refresh(&authn, refresh.as_deref(), &mut issued, &cookie_cfg).await,
     };
 
     req.extensions_mut().insert::<Option<AuthUser>>(user);
@@ -120,12 +138,13 @@ async fn try_refresh(
     authn: &Authn,
     refresh: Option<&str>,
     issued: &mut Vec<Cookie<'static>>,
+    cfg: &CookieConfig,
 ) -> Option<AuthUser> {
     let raw = refresh?;
     let (new_refresh, user) = authn.rotate_refresh_token(raw).await.ok()?;
     let new_access = authn.issue_access_token(&user).ok()?;
-    issued.push(access_cookie(new_access));
-    issued.push(refresh_cookie(new_refresh));
+    issued.push(access_cookie(new_access, cfg));
+    issued.push(refresh_cookie(new_refresh, cfg));
     Some(user)
 }
 

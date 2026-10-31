@@ -163,8 +163,8 @@ pub async fn register(
         .map_err(crate::error::authn_error_to_server_fn)?;
 
     let response = expect_context::<leptos_axum::ResponseOptions>();
-    append_cookie(&response, crate::middleware::access_cookie(access))?;
-    append_cookie(&response, crate::middleware::refresh_cookie(refresh))?;
+    append_cookie(&response, crate::middleware::access_cookie(access, &state.cookie))?;
+    append_cookie(&response, crate::middleware::refresh_cookie(refresh, &state.cookie))?;
 
     // Best-effort verification email. `AlreadyVerified` here would mean the
     // user is already verified right after `create_user` (unreachable in
@@ -215,8 +215,8 @@ pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFn
         .map_err(crate::error::authn_error_to_server_fn)?;
 
     let response = expect_context::<leptos_axum::ResponseOptions>();
-    append_cookie(&response, crate::middleware::access_cookie(access))?;
-    append_cookie(&response, crate::middleware::refresh_cookie(refresh))?;
+    append_cookie(&response, crate::middleware::access_cookie(access, &state.cookie))?;
+    append_cookie(&response, crate::middleware::refresh_cookie(refresh, &state.cookie))?;
 
     Ok(user)
 }
@@ -255,11 +255,11 @@ pub async fn logout() -> Result<(), ServerFnError> {
     let response = expect_context::<leptos_axum::ResponseOptions>();
     append_cookie(
         &response,
-        crate::middleware::removal_cookie(crate::middleware::ACCESS_COOKIE),
+        crate::middleware::removal_cookie(crate::middleware::ACCESS_COOKIE, &state.cookie),
     )?;
     append_cookie(
         &response,
-        crate::middleware::removal_cookie(crate::middleware::REFRESH_COOKIE),
+        crate::middleware::removal_cookie(crate::middleware::REFRESH_COOKIE, &state.cookie),
     )?;
 
     Ok(())
@@ -446,13 +446,14 @@ pub async fn set_return_url(url: String) -> Result<(), ServerFnError> {
 /// login / registration, and the cookie may have been set while anonymous.
 #[server]
 pub async fn take_return_url() -> Result<Option<String>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
     let jar = leptos_axum::extract::<CookieJar>().await?;
     let raw = jar.get(RETURN_URL_COOKIE).map(|c| c.value().to_string());
 
     if let Some(response) = use_context::<leptos_axum::ResponseOptions>() {
         append_cookie(
             &response,
-            crate::middleware::removal_cookie(RETURN_URL_COOKIE),
+            crate::middleware::removal_cookie(RETURN_URL_COOKIE, &state.cookie),
         )?;
     }
 

@@ -122,8 +122,8 @@ pub async fn register(
 
     // 4. Cookies.
     let jar = CookieJar::new()
-        .add(access_cookie(access))
-        .add(refresh_cookie(refresh));
+        .add(access_cookie(access, &state.cookie))
+        .add(refresh_cookie(refresh, &state.cookie));
 
     // 5. Best-effort verification email. Same handling as `saas-leptos`:
     //    `AlreadyVerified` is logged and degraded to `Disabled`;
@@ -171,8 +171,8 @@ pub async fn login(
     let refresh = state.authn.issue_refresh_token(&user).await?;
 
     let jar = CookieJar::new()
-        .add(access_cookie(access))
-        .add(refresh_cookie(refresh));
+        .add(access_cookie(access, &state.cookie))
+        .add(refresh_cookie(refresh, &state.cookie));
 
     Ok((jar, Json(user)))
 }
@@ -196,8 +196,8 @@ pub async fn logout(
     }
 
     let out = CookieJar::new()
-        .add(removal_cookie(ACCESS_COOKIE))
-        .add(removal_cookie(REFRESH_COOKIE));
+        .add(removal_cookie(ACCESS_COOKIE, &state.cookie))
+        .add(removal_cookie(REFRESH_COOKIE, &state.cookie));
 
     Ok((out, StatusCode::NO_CONTENT))
 }

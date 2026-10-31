@@ -1,7 +1,7 @@
 //! Auto-refresh middleware (Stage 3g, ported from `saas-leptos`).
 //!
-//! Runs on every request of the **protected** router before the handlers
-//! (plan §4 п.6). Responsibilities:
+//! Runs on every request of the **protected** router before the handlers.
+//! Responsibilities:
 //!
 //! 1. Read `access_token` (access JWT) and `refresh_token` (opaque) cookies.
 //! 2. If `access_token` verifies — insert `Option<AuthUser>::Some(user)` into
@@ -16,23 +16,13 @@
 //! handlers on protected routes call `CurrentUser::require()` to turn an
 //! anonymous request into HTTP 401.
 //!
-//! **Serialization.** Refresh happens **at most once per HTTP request** —
-//! same rationale as `saas-leptos`: two concurrent calls in the same
-//! request would race the rotation and the loser would be treated as
-//! `RefreshReused`, revoking the family and logging the user out.
-//!
-//! **Coexistence with `POST /auth/{register,login,logout}`.** If a handler
-//! already set a cookie with the same name (`access_token` or
-//! `refresh_token`), the middleware's `Set-Cookie` for that name is
-//! skipped — logout (`Max-Age=0`) is not overwritten by a concurrent
-//! rotation.
-//!
-//! `Cache-Control: no-store` is added whenever cookies are (re)issued, so
-//! browsers and proxies do not cache a response carrying `Set-Cookie`.
-//!
-//! **Cookie attributes** in 3g: `path = "/"`, `http_only = true`, session
-//! lifetime (no `Max-Age`). `Secure` / `SameSite` are Stage 4 — same as
-//! `saas-leptos`.
+//! **Stage 4.1b:** cookies are built via [`CookieConfig`] — `Secure` (env
+//! `COOKIE_SECURE`, default = non-loopback bind address), `SameSite=Lax`,
+//! `Max-Age` = access / refresh TTL. `auto_refresh` takes the full
+//! [`AppState`] via `State` (not a tuple) — `State<T>` requires
+//! `T: FromRef<RouterState>`, and `AppState` already provides
+//! `FromRef<AppState> for Arc<Authn>` / `Arc<CookieConfig>`, so extracting
+//! both pieces out of one `Arc<AppState>` is a plain clone.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -43,8 +33,12 @@ use axum::http::header::{CACHE_CONTROL, SET_COOKIE};
 use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
-use axum_extra::extract::cookie::{Cookie, CookieJar};
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use cookie::time::Duration as CookieDuration;
 use domain::AuthUser;
+
+use crate::cookie::CookieConfig;
+use crate::state::AppState;
 
 /// Access-cookie name (access JWT, short-lived).
 pub const ACCESS_COOKIE: &str = "access_token";
@@ -52,47 +46,63 @@ pub const ACCESS_COOKIE: &str = "access_token";
 /// Refresh-cookie name (opaque, long-lived, rotation with family revocation).
 pub const REFRESH_COOKIE: &str = "refresh_token";
 
-/// Builds an `access_token` cookie (httpOnly, path `/`, session lifetime).
-pub fn access_cookie(token: String) -> Cookie<'static> {
+/// Builds an `access_token` cookie.
+///
+/// Attributes (Stage 4.1b):
+/// - `HttpOnly` — not readable by JS.
+/// - `Secure` — from `CookieConfig::secure`.
+/// - `SameSite=Lax` — sent on top-level navigation only.
+/// - `Path=/`.
+/// - `Max-Age` = `CookieConfig::access_max_age()`.
+pub fn access_cookie(token: String, cfg: &CookieConfig) -> Cookie<'static> {
     Cookie::build((ACCESS_COOKIE, token))
         .path("/")
         .http_only(true)
+        .secure(cfg.secure)
+        .same_site(SameSite::Lax)
+        .max_age(CookieDuration::seconds(cfg.access_max_age().as_secs() as i64))
         .build()
 }
 
-/// Builds a `refresh_token` cookie (httpOnly, path `/`, session lifetime).
-pub fn refresh_cookie(token: String) -> Cookie<'static> {
+/// Builds a `refresh_token` cookie. Same attributes as [`access_cookie`];
+/// `Max-Age` = `CookieConfig::refresh_max_age()`.
+pub fn refresh_cookie(token: String, cfg: &CookieConfig) -> Cookie<'static> {
     Cookie::build((REFRESH_COOKIE, token))
         .path("/")
         .http_only(true)
+        .secure(cfg.secure)
+        .same_site(SameSite::Lax)
+        .max_age(CookieDuration::seconds(cfg.refresh_max_age().as_secs() as i64))
         .build()
 }
 
-/// Builds a removal cookie (`Max-Age=0`, `Expires` in the past).
-///
-/// `Cookie::make_removal` in `cookie 0.18` is a `&mut self` method; build the
-/// empty cookie first, then apply removal, then restore `Path` / `HttpOnly`
-/// (they are not affected by `make_removal` but are set here explicitly for
-/// symmetry with the set-side cookies).
-pub fn removal_cookie(name: &'static str) -> Cookie<'static> {
+/// Builds a removal cookie (`Max-Age=0`, `Expires` in the past) carrying
+/// `Secure` / `SameSite` from the config.
+pub fn removal_cookie(name: &'static str, cfg: &CookieConfig) -> Cookie<'static> {
     let mut c = Cookie::new(name, String::new());
     c.make_removal();
     c.set_path("/");
     c.set_http_only(true);
+    c.set_secure(cfg.secure);
+    c.set_same_site(SameSite::Lax);
     c
 }
 
 /// Auto-refresh layer. See module docs.
 ///
-/// `State<Arc<Authn>>` — the same `Authn` instance the handlers use through
-/// `AppState.authn`; `main.rs` passes it explicitly via
-/// `from_fn_with_state(authn, auto_refresh)` so the middleware does not need
-/// the full `AppState` (and can be unit-tested in isolation).
+/// `State<Arc<AppState>>` — the router state; `Authn` and `CookieConfig` are
+/// cloned out of `app_state` once per request. This avoids a tuple
+/// `State<(Arc<Authn>, Arc<CookieConfig>)>` (which would need extra
+/// `FromRef` impls) while keeping the middleware unit-testable via
+/// `AppState`.
 pub async fn auto_refresh(
-    State(authn): State<Arc<Authn>>,
+    State(app_state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
+    let authn = app_state.authn.clone();
+    let cookie_cfg = app_state.cookie.clone();
+
     let jar = CookieJar::from_headers(req.headers());
     let access = jar.get(ACCESS_COOKIE).map(|c| c.value().to_string());
     let refresh = jar.get(REFRESH_COOKIE).map(|c| c.value().to_string());
@@ -104,11 +114,11 @@ pub async fn auto_refresh(
             Ok(Some(u)) => Some(u),
             Ok(None) => None,
             Err(AuthnError::TokenExpired) => {
-                try_refresh(&authn, refresh.as_deref(), &mut issued).await
+                try_refresh(&authn, refresh.as_deref(), &mut issued, &cookie_cfg).await
             }
             Err(_) => None,
         },
-        None => try_refresh(&authn, refresh.as_deref(), &mut issued).await,
+        None => try_refresh(&authn, refresh.as_deref(), &mut issued, &cookie_cfg).await,
     };
 
     req.extensions_mut().insert::<Option<AuthUser>>(user);
@@ -137,12 +147,13 @@ async fn try_refresh(
     authn: &Authn,
     refresh: Option<&str>,
     issued: &mut Vec<Cookie<'static>>,
+    cfg: &CookieConfig,
 ) -> Option<AuthUser> {
     let raw = refresh?;
     let (new_refresh, user) = authn.rotate_refresh_token(raw).await.ok()?;
     let new_access = authn.issue_access_token(&user).ok()?;
-    issued.push(access_cookie(new_access));
-    issued.push(refresh_cookie(new_refresh));
+    issued.push(access_cookie(new_access, cfg));
+    issued.push(refresh_cookie(new_refresh, cfg));
     Some(user)
 }
 
