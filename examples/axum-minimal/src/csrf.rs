@@ -169,6 +169,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Test-only surface for other modules that need to cross-check the
+/// public-auth path list against their own (see `auth_layer::tests`).
+/// Enabled only under `cfg(test)`; never compiled into the binary.
+#[cfg(test)]
+pub mod tests_support {
+    /// The same list `csrf_guard` uses to exempt public auth endpoints.
+    /// `auth_layer` keeps an identical copy — if the two ever drift, that
+    /// is a security bug (one layer would let through what the other
+    /// blocks), so a unit test asserts equality.
+    pub fn public_auth_paths() -> &'static [&'static str] {
+        super::PUBLIC_AUTH_PATHS
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

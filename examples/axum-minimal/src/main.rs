@@ -62,6 +62,7 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 mod audit;
+mod auth_layer;
 mod auth;
 mod cookie;
 mod csrf;
@@ -188,7 +189,20 @@ async fn main() -> anyhow::Result<()> {
             get(workspace::list_documents).post(workspace::create_document),
         )
         .route("/audit", get(audit::list_audit))
+        // Axum note: the *last* `.route_layer` is the outermost. So the
+        // calls below are in reverse execution order — the request runs
+        // them top-to-bottom of this list.
+        //
+        // Stage 4.1d: server-side AuthLayer (innermost of the three — must
+        // run *after* auto_refresh has populated Extension<Option<AuthUser>>).
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_layer::auth_layer,
+        ))
+        // Stage 3g: auto_refresh (verify access / rotate refresh).
         .route_layer(from_fn_with_state(app_state.clone(), middleware::auto_refresh))
+        // Stage 4.1c: CSRF guard (outermost — reject cross-origin before
+        // doing any auth work).
         .route_layer(axum::middleware::from_fn(csrf::csrf_guard));
 
     let public: Router<Arc<AppState>> = Router::new()
