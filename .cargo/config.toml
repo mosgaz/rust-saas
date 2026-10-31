@@ -1,3 +1,5 @@
 [alias]
 # cargo client — leptos watch для examples/saas-leptos
 client = ["leptos", "--manifest-path", "examples/saas-leptos/Cargo.toml", "watch"]
+# seed = ["leptos", "--manifest-path", "examples/saas-leptos/Cargo.toml", "watch"]
+# docker compose down -v && docker compose up -d && cargo run -p seed

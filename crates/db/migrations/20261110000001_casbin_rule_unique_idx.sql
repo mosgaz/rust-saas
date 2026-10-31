@@ -15,17 +15,17 @@
 -- database with duplicates.
 
 -- 1. Deduplicate existing rows (both `p` and `g`).
-delete from casbin_rule a
-using casbin_rule b
-where a.id > b.id
-  and a.ptype = b.ptype
-  and a.v0 = b.v0
-  and a.v1 = b.v1
-  and a.v2 = b.v2
-  and a.v3 = b.v3
-  and a.v4 = b.v4
-  and a.v5 = b.v5;
+DELETE FROM casbin_rule a
+USING casbin_rule b
+WHERE a.id > b.id
+  AND a.ptype = b.ptype
+  AND a.v0 = b.v0
+  AND a.v1 = b.v1
+  AND a.v2 = b.v2
+  AND a.v3 = b.v3
+  AND a.v4 = b.v4
+  AND a.v5 = b.v5;
 
 -- 2. Unique index for `ON CONFLICT` / adapter safety.
-create unique index casbin_rule_unique_idx
-on casbin_rule (ptype, v0, v1, v2, v3, v4, v5);
+CREATE UNIQUE INDEX casbin_rule_unique_idx
+ON casbin_rule (ptype, v0, v1, v2, v3, v4, v5);

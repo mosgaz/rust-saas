@@ -23,6 +23,11 @@
 //! `list_members` and `my_permissions` are read-only and stay outside the
 //! resolution path (a suspended tenant must still allow reading its
 //! history — see the `pages::tenant` module doc).
+//!
+//! **Stage 3h (PermsCache):** `my_permissions` is read through the shared
+//! [`crate::perms_cache::PermsCache`] provided at the root `App`. The cache
+//! is invalidated after `assign_member_role` and `remove_member_role`, so
+//! the next render sees fresh permissions.
 
 use std::collections::HashSet;
 
@@ -34,6 +39,7 @@ use leptos_router::params::Params;
 use uuid::Uuid;
 
 use crate::pages::role::{list_roles, RoleView};
+use crate::perms_cache::PermsCache;
 
 #[cfg(feature = "ssr")]
 use access::RoleKey;
@@ -178,13 +184,21 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
     let perms = RwSignal::new(HashSet::<(String, String)>::new());
     let error = RwSignal::new(None::<String>);
     let refresh = RwSignal::new(0u32);
+    let cache = use_context::<PermsCache>().expect("PermsCache in context");
 
     let new_user = RwSignal::new(String::new());
     let new_role = RwSignal::new(String::new());
 
+    // `PermsCache` is `Clone` but not `Copy`. Each `move`-closure below needs
+    // its own owned handle so that one closure's `move` does not rob the
+    // others of the value. Clone **before** each closure boundary; clone
+    // again **inside** each closure body per invocation so that `FnMut`
+    // closures can be called more than once.
+    let cache_effect = cache.clone();
     Effect::new(move |_| {
         let _ = refresh.get();
         let d = domain.get_value();
+        let cache = cache_effect.clone();
         spawn_local(async move {
             match list_members(d.clone()).await {
                 Ok(list) => {
@@ -193,10 +207,14 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                 }
                 Err(e) => error.set(Some(e.to_string())),
             }
-            match my_permissions(d.clone()).await {
-                Ok(p) => perms.set(p.into_iter().collect()),
-                Err(e) => error.set(Some(e.to_string())),
-            }
+
+            let perms_vec = cache
+                .get_or_fetch(d.clone(), |domain| async move {
+                    my_permissions(domain).await.unwrap_or_default()
+                })
+                .await;
+            perms.set(perms_vec.into_iter().collect());
+
             match list_roles(d).await {
                 Ok(rs) => {
                     if new_role.get_untracked().is_empty() {
@@ -215,7 +233,11 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
         perms.with(|p| p.contains(&("members".to_string(), "manage".to_string())))
     };
 
+    let cache_submit = cache.clone();
     let submit_assign = move |_| {
+        // Fresh clone per invocation: `submit_assign` is `FnMut` (clicked
+        // repeatedly) and the async block consumes its clone.
+        let cache = cache_submit.clone();
         let d = domain.get_value();
         let uid = new_user.get();
         let role = new_role.get();
@@ -231,10 +253,11 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
             }
         };
         spawn_local(async move {
-            match assign_member_role(d, uid, role).await {
+            match assign_member_role(d.clone(), uid, role).await {
                 Ok(()) => {
                     new_user.set(String::new());
                     error.set(None);
+                    cache.invalidate(&d);
                     refresh.update(|n| *n += 1);
                 }
                 Err(e) => error.set(Some(e.to_string())),
@@ -242,6 +265,7 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
         });
     };
 
+    let cache_view = cache.clone();
     view! {
         <div class="card mt-6">
             <h2 class="text-lg font-semibold">"Members"</h2>
@@ -250,6 +274,11 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
             <ul class="mt-4 divide-y divide-neutral-800">
                 {move || {
                     let list = members.get();
+                    // Per-render clone; the per-row / per-role / per-click
+                    // closures below each get their own derived clone so none
+                    // of them tries to move this binding out of a sibling
+                    // closure.
+                    let cache = cache_view.clone();
                     if list.is_empty() {
                         view! { <li class="py-2 text-neutral-500">"No members."</li> }.into_any()
                     } else {
@@ -260,6 +289,9 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                                 let email = m.email.clone();
                                 let roles = m.roles.clone();
                                 let d = d.clone();
+                                // Per-row clone: each row's `move ||` takes
+                                // ownership of its own handle.
+                                let cache = cache.clone();
                                 view! {
                                     <li class="py-3">
                                         <p class="font-medium">{email}</p>
@@ -273,22 +305,31 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                                                     let d = d.clone();
                                                     let role_label = r.clone();
                                                     let role_for_remove = r.clone();
+                                                    // Per-role clone.
+                                                    let cache = cache.clone();
                                                     view! {
                                                         <span class="inline-flex items-center gap-1 px-2 py-1 rounded bg-neutral-800 text-sm">
                                                             {role_label}
                                                             {move || if can_manage() {
                                                                 let d = d.clone();
                                                                 let role = role_for_remove.clone();
+                                                                // Per-render clone for the
+                                                                // button's click handler.
+                                                                let cache = cache.clone();
                                                                 Some(view! {
                                                                     <button
                                                                         class="ml-1 text-red-400"
                                                                         on:click=move |_| {
+                                                                            // Per-click clone: the
+                                                                            // handler stays `FnMut`.
+                                                                            let cache = cache.clone();
                                                                             let d = d.clone();
                                                                             let role = role.clone();
                                                                             spawn_local(async move {
-                                                                                match remove_member_role(d, uid, role).await {
+                                                                                match remove_member_role(d.clone(), uid, role).await {
                                                                                     Ok(()) => {
                                                                                         error.set(None);
+                                                                                        cache.invalidate(&d);
                                                                                         refresh.update(|n| *n += 1);
                                                                                     }
                                                                                     Err(e) => error.set(Some(e.to_string())),
@@ -320,6 +361,9 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                 let member_opts = members.get();
                 let role_opts = roles.get();
                 let invite_href = scope_url.get_value();
+                // `submit_assign` is `FnMut + Clone`; clone per render so this
+                // outer closure does not move it out of its own capture.
+                let submit_assign = submit_assign.clone();
                 Some(view! {
                     <div class="mt-6 border-t border-neutral-800 pt-4">
                         <h3 class="text-sm font-semibold">"Assign role"</h3>
