@@ -5,7 +5,8 @@
 //! - `Validation`, `InvalidRoleKey`                              -> 400
 //! - `Unauthorized`, `InvalidCredentials`, `TokenInvalid`,
 //!   `TokenExpired`, `RefreshInvalid`, `RefreshReused`           -> 401
-//! - `Forbidden`, `EmailNotVerified`, `Protected`, `Immutable`   -> 403
+//! - `Forbidden`, `EmailNotVerified`, `TenantSuspended`,
+//!   `Protected`, `Immutable`                                    -> 403
 //! - `NotFound`, `RoleNotFound`, `PermissionNotFound`            -> 404
 //! - `DuplicateEmail` (Identity), `AlreadyVerified` (Authn)      -> 409
 //! - `rate_limited_error(...)`                                   -> 429
@@ -25,6 +26,12 @@
 //! - `request_password_reset` is silent (`Ok(())` for unknown emails) and is
 //!   only surfaced through `rate_limited_error(...)` → 429.
 //!
+//! Stage 3f: `CoreError::TenantSuspended` (ADR-0002 rev.2; returned by
+//! `saas::platform::resolve_active_tenant` and the invitation services when
+//! the tenant's `status != 'active'`) maps to 403. The message
+//! (`"tenant is suspended"`) is distinct from `Forbidden` so the UI can
+//! show a dedicated banner instead of a generic permission-denied message.
+//!
 //! The body of `ServerFnError` is the error's `Display` string. The HTTP
 //! status is set via `leptos_axum::ResponseOptions` before the `#[server]`
 //! function returns. If the `ResponseOptions` context is unavailable (unit
@@ -42,7 +49,7 @@ fn status_for_core(e: &CoreError) -> u16 {
     match e {
         CoreError::Validation(_) => 400,
         CoreError::Unauthorized => 401,
-        CoreError::Forbidden | CoreError::EmailNotVerified => 403,
+        CoreError::Forbidden | CoreError::EmailNotVerified | CoreError::TenantSuspended => 403,
         CoreError::NotFound => 404,
         CoreError::Internal(_) | CoreError::Db(_) => 500,
     }

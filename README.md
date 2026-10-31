@@ -18,7 +18,9 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **Email verification: single-active 24-hour token, idempotent verification, `/verify/:token` page, per-email rate limit (3/hour)**
 - **Password reset (Stage 3d): single-active 1-hour token, `authn::request_password_reset` returns `Ok(None)` for unknown emails (no enumeration signal), `authn::reset_password` is **one-shot** (a replayed token returns `TokenInvalid`). In one transaction it rewrites `password_hash` + bumps `password_changed_at`, expires every outstanding reset token for the user, and revokes **every** refresh-token family with `revoked_reason = "password_reset"`. `/forgot-password` (5/hour per email) and `/reset-password/:token` pages; no auto-login after reset.**
 - **Addressed invitations (Stage 3c): `accept_invitation` requires a verified, matching email (`email_verified` first, then case-insensitive match); the invitation link is delivered via `EmailSender::send_invitation`, and the UI distinguishes `Sent` / `Failed` / `Disabled` (with a copy-link fallback). Link invitations (`email IS NULL`) keep Stage 2a behaviour.**
-- **Audit log (Stage 3e): `audit` trait-крейт + `audit-pg` (`PgAuditLogger`); `Authn`/`AccessState`/`SaasState` inject `Arc<dyn AuditLogger>` via `with_audit`; 21 event types (`tenant.suspended` / `tenant.activated` — Stage 3f); sync after `COMMIT` in a separate transaction; `NoopAuditLogger` fallback for dev / tests / seed; failures are `tracing::warn!` and never fail the business operation.**
+- **Audit log (Stage 3e): `audit` trait crate + `audit-pg` (`PgAuditLogger`); `Authn`/`AccessState`/`SaasState` inject `Arc<dyn AuditLogger>` via `with_audit`; 21 event types; sync after `COMMIT` in a separate transaction; `NoopAuditLogger` fallback for dev / tests / seed; failures are `tracing::warn!` and never fail the business operation.**
+- **Platform admin (Stage 3f): `saas::platform::{list_tenants, suspend_tenant, activate_tenant}` gated by `(tenants, list)` / `(tenants, manage)` in `PLATFORM_DOMAIN`; `/platform` page creates tenants and toggles suspend/activate; `/platform/audit` renders the most recent `audit_log` rows (`(audit, read)`).**
+- **Tenant suspension (Stage 3f): `saas::platform::resolve_active_tenant` + `ActiveTenant` + `CoreError::TenantSuspended`. Mutating `#[server]` calls (`create_workspace`, `create_document`, `create_role`, `update_role`, `delete_role`, `assign_member_role`, `remove_member_role`, `create_invitation`) resolve the tenant first; reads and cleanup (`list_*`, `get_*`, `my_permissions`, `revoke_invitation`) stay available on a suspended tenant. `suspend_tenant` / `activate_tenant` are idempotent and emit `tenant.suspended` / `tenant.activated` only on a transition.**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
@@ -44,7 +46,8 @@ The repository is split into two layers:
 crates/                  (library — the Cargo workspace)
 ├── domain/             Shared DTOs (Tenant, Workspace, Document, AuthUser, Invitation, Member),
 │                       InvitationTarget, domain helpers, PLATFORM_DOMAIN;
-│                       AuthUser.email_verified (derived from users.email_verified_at)
+│                       AuthUser.email_verified (derived from users.email_verified_at);
+│                       TenantStatus (Active / Suspended)
 ├── authz/              AuthorizationEngine trait
 │                       (can / require / grant_role / revoke_role / has_role /
 │                        count_users_with_role / purge_role) + AuthzError
@@ -64,8 +67,9 @@ crates/                  (library — the Cargo workspace)
 │                       password reset (single-active, 1h, one-shot, revoke all families);
 │                       RevokeReason (logout / reuse_detected / password_reset);
 │                       audit emission (8 events)
-├── saas/               Business logic: platform, tenant, workspace, invitation, member,
-│                       access (wrappers, incl. my_permissions); audit emission
+├── saas/               Business logic: platform (incl. suspend/activate + resolve_active_tenant),
+│                       tenant, workspace, invitation, member, access (wrappers, incl.
+│                       my_permissions); audit emission
 ├── db/                 PostgreSQL connection and migrations
 └── seed/               Bootstrap data and demo accounts (all email-verified)
 
@@ -73,6 +77,7 @@ examples/                (reference consumers — outside the workspace)
 └── saas-leptos/        Leptos SSR + Axum + #[server] + middleware + cookies
                         + SMTP transport (lettre, 10s timeout) + in-memory rate limiter
                         + forgot-password / reset-password pages
+                        + /platform + /platform/audit (platform admin)
                         + PgAuditLogger wired through Authn / AccessState / SaasBuilder
 ```
 
@@ -126,7 +131,7 @@ Forbidden edges:
 - `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`, `refresh_tokens`, `password_reset_tokens`, `roles`, `permissions`). It uses raw SQL only against its own `casbin_rule` table (`has_role`, `count_users_with_role`, `purge_role`).
 - **`audit` does not depend on `sqlx`, `SaasState`, `Authn`, `AccessState`, `identity`, or any business crate.** Trait-only, symmetric to `authz`. Only `serde`, `uuid`, `thiserror`, `async-trait`, `chrono`, `serde_json`.
 - **`audit-pg` depends on `audit` and owns the `audit_log` table.** The only writer. Symmetric to `authz-casbin` / `casbin_rule`.
-- The example (`examples/saas-leptos`) does not call `casbin_rule` or `audit_log` directly and does not call `authz.require` — only `saas::*`, `saas::access::*`, `saas::member::*`, and `authn::*`.
+- The example (`examples/saas-leptos`) does not call `casbin_rule` or `audit_log` directly and does not call `authz.require` — only `saas::*`, `saas::access::*`, `saas::member::*`, and `authn::*`. The `/platform/audit` read-only helper does not go through `saas::*` for historical reasons (the `AuditLogger` trait is a single-method write interface; `PgAuditLogger::list` is a per-implementation read helper), but it does enforce `(audit, read)` via `saas::access::my_permissions`.
 - Library crates do not depend on `examples/*`.
 
 ### Multi-tenancy model
@@ -138,11 +143,12 @@ platform
     └── workspace
 ```
 
-- A **tenant** represents a customer organization.
+- A **tenant** represents a customer organization. It has a `status` (`active` or `suspended`).
 - A **workspace** represents a working area inside a tenant, such as a team, department, or project.
 - A **user** is a global identity and can participate in multiple tenants or workspaces.
 - A **workspace** contains business resources such as documents.
 - An **invitation** targets exactly one tenant or one workspace (`CHECK ((tenant_id IS NULL) <> (workspace_id IS NULL))`). `email IS NULL` is a reusable link; `email IS NOT NULL` is an addressed invitation (Stage 3c).
+- **Suspended tenants** (Stage 3f): mutating `#[server]` calls that go through `saas::platform::resolve_active_tenant` return `TenantSuspended` (HTTP 403); reads and cleanup (`list_*`, `get_*`, `my_permissions`, `revoke_invitation`) keep working. See the *Tenant lifecycle* section below.
 
 ### Authorization domains
 
@@ -150,7 +156,7 @@ Casbin policies are scoped by domain:
 
 | Domain | Purpose |
 |---|---|
-| `platform` | Platform-level administration |
+| `platform` | Platform-level administration (list tenants, suspend/activate, read audit) |
 | `tenant:{tenant_id}` | Tenant-level operations |
 | `workspace:{workspace_id}` | Workspace-level operations |
 
@@ -162,8 +168,21 @@ Casbin policies are scoped by domain:
 - The owner of a domain creates custom roles and assigns them to users of that domain (`saas::access::create_role` / `assign_role` / `update_role`). Roles can be edited (`name`, `description`, `permissions`) and deleted; `key` is immutable (`update_role` never changes it; rename = delete + create, ADR-0001).
 - Users can hold **multiple roles** in the same domain. `tenant_members` and `workspace_members` use `PRIMARY KEY (scope_id, user_id, role)`.
 - The **owner guard** prevents removing the last holder of a `protected` role from a domain (`saas::member::{change_role, remove_role}` return `Forbidden`). Non-protected roles have no last-holder guard. The guard reads `casbin_rule` (the source of truth for authorization), not `*_members`.
+- **Platform admin** (Stage 3f) is a user holding `platform` `owner` (or any role that grants the platform-scoped permissions). It is **not** a superuser inside tenants/workspaces: it can list/suspend/activate tenants and read the platform audit log, but it does not gain any role in a target tenant.
 
 Example permissions and demo roles:
+
+| Permission `(resource, action)` | Domain | Used by |
+|---|---|---|
+| `(tenants, create)` | `platform` | `saas::platform::{create_tenant, provision_tenant}` |
+| `(tenants, list)` | `platform` | `saas::platform::list_tenants` (Stage 3f) |
+| `(tenants, manage)` | `platform` | `saas::platform::{suspend_tenant, activate_tenant}` (Stage 3f) |
+| `(audit, read)` | `platform` | `/platform/audit` view (Stage 3f) |
+| `(workspaces, create)` | `tenant:{id}` | `saas::tenant::create_workspace` |
+| `(documents, read/write)` | `workspace:{id}` | `saas::workspace::*` |
+| `(members, list/manage)` | `tenant:{id}`, `workspace:{id}` | `saas::member::*` |
+| `(invitations, create/revoke/list)` | `tenant:{id}`, `workspace:{id}` | `saas::invitation::*` |
+| `(roles, create/manage/delete/list/grant)` | `tenant:{id}`, `workspace:{id}` | `saas::access::*` |
 
 | Role | Domain | Permissions |
 |---|---|---|
@@ -172,6 +191,14 @@ Example permissions and demo roles:
 | `owner` | `workspace:{id}` | all from `permissions` |
 | `editor` | `workspace:{id}` | `documents:read/write` (demo, created by seed) |
 | `viewer` | `workspace:{id}` | `documents:read` (demo, created by seed) |
+
+### Tenant lifecycle
+
+- `tenants.status` is `active` (default) or `suspended`.
+- **Suspend/activate** are admin actions: `saas::platform::{suspend_tenant, activate_tenant}` require `(tenants, manage)` in `PLATFORM_DOMAIN`. Both are **idempotent**: `UPDATE … WHERE status = <expected> RETURNING *` emits `tenant.suspended` / `tenant.activated` only when the update actually matched a row. A second call returns the row unchanged with no audit emission.
+- **Resolution.** `saas::platform::resolve_active_tenant(state, actor, tenant_id)` returns `ActiveTenant` only when (1) the actor is a member of the tenant (`EXISTS tenant_members`) and (2) `status = 'active'`. Non-member → `Forbidden`; suspended → `TenantSuspended`; missing → `NotFound`.
+- **Mutation paths.** The example's `#[server]` mutation functions call `resolve_active_tenant` **explicitly** before delegating to `saas::*` (`create_workspace`, `create_document`, `create_role`, `update_role`, `delete_role`, `assign_member_role`, `remove_member_role`, `create_invitation`). `saas::invitation::{create_invitation, accept_invitation}` also check the tenant status inside the service (defense in depth). Reads and cleanup (`list_*`, `get_*`, `my_permissions`, `revoke_invitation`, `check_invitation`) do **not** resolve.
+- **Platform admin is not a bypass.** A platform admin who is not a member of the target tenant cannot resolve it — `resolve_active_tenant` returns `Forbidden`. An escape hatch (`_or_platform_admin`) is deliberately deferred to Stage 4.
 
 ## Technology stack
 
@@ -303,7 +330,7 @@ Demo users created by seed (all **email-verified** — Stage 3b):
 | Workspace editor (role `editor`) | `editor@acme.test` | `Editor123!` |
 | Workspace viewer (role `viewer`) | `viewer@acme.test` | `Viewer123!` |
 
-The command applies database migrations (including `20261107000001_audit_log.sql`) and creates initial platform, tenant, workspace, user, role, authorization, and audit data. It is idempotent: re-running it re-hashes passwords, re-applies roles/policies, and marks demo accounts verified without moving their original `email_verified_at`. Seed does not touch `password_changed_at`.
+The command applies database migrations (including `20261107000001_audit_log.sql` and `20261108000001_platform_admin_permissions.sql`) and creates initial platform, tenant, workspace, user, role, authorization, and audit data. It is idempotent: re-running it re-hashes passwords, re-applies roles/policies, and marks demo accounts verified without moving their original `email_verified_at`. Seed does not touch `password_changed_at`.
 
 Seed flow:
 
@@ -315,7 +342,7 @@ Seed flow:
 
 Bootstrap audit events (visible in `audit_log` after seed): `tenant.created`, `workspace.created`, `role.created` × 2, `member.role_assigned` × 2.
 
-**Existing database.** `20261107000001_audit_log.sql` adds a new table (`audit_log`) — no backfill needed. If your DB predates the earlier migrations, `docker compose down -v` + `cargo run -p seed` is the recommended path.
+**Existing database.** `20261107000001_audit_log.sql` adds a new table (`audit_log`), `20261108000001_platform_admin_permissions.sql` adds new `(resource, action)` rows and top-ups the platform owner — no backfill. If your DB predates the earlier migrations, `docker compose down -v` + `cargo run -p seed` is the recommended path.
 
 ### Run the reference application
 
@@ -339,23 +366,29 @@ Then in the browser:
 1. `/register` — create a new account. After submit, the page shows "Account created for …" plus the verification-email outcome.
 2. Open the verification link from Mailpit → `/verify/:token` shows "Email verified: …". Re-opening the same link is safe (idempotent).
 3. `/login` with one of the demo accounts (or your freshly-verified one).
-4. `/platform` — as platform owner, create a tenant.
-5. `/tenants` — list of tenants you're a member of.
-6. `/tenants/<tenant_id>` — as tenant owner, create a workspace.
-7. `/tenants/<tenant_id>/members` — see members; assign/remove roles via selects.
-8. `/tenants/<tenant_id>/roles` — list, create, edit, delete custom roles.
-9. `/workspaces` — list of workspaces you're a member of.
-10. `/workspaces/<workspace_id>` — as editor, create documents.
-11. `/workspaces/<workspace_id>/members` — workspace member list.
-12. `/workspaces/<workspace_id>/roles` — workspace roles.
-13. `/tenants/<tenant_id>/invitations` — create a tenant invitation (link or addressed).
-14. Link invitation flow: paste `/invitations/<64 hex>` in another session → `return_url` cookie → login → accept.
-15. Addressed invitation flow (Stage 3c): verified-first + case-insensitive match; `EmailNotVerified` / `Forbidden`.
-16. **Forgot password (Stage 3d).** `/login` → "Forgot password?" → `/forgot-password`. Generic confirmation for known/unknown emails; rate-limited 5/hour.
-17. **Reset password (Stage 3d).** `/reset-password/:token` → new password. All existing refresh tokens are revoked; one-shot (replay → `invalid or expired`).
-18. **Audit log (Stage 3e).** After any of the flows above (register, login, logout, verify, password reset, invite, accept, role change, tenant/workspace provisioning), the corresponding `audit_log` rows are visible via `psql ... -c "select event_type, actor_email, target_type from audit_log order by occurred_at"`. There is no UI yet (Stage 3f adds `/platform/audit`).
-19. **Wait 15+ minutes** — auto-refresh rotates the refresh token.
-20. Rate limits: `request_email_verification` — 3/hour per email; `request_password_reset` — 5/hour per email.
+4. `/platform` — as platform owner, create a tenant and see the list of every tenant.
+5. **Platform admin + tenant suspension (Stage 3f).**
+   - As `platform-admin@example.test`, on `/platform` click **Suspend** next to Acme.
+   - **In a second browser profile / incognito window** sign in as `owner@acme.test`. `/tenants` still lists Acme (with `status: Suspended`); `/tenants/<acme_id>` renders, but "Create workspace" (and any other mutation) returns HTTP 403 `tenant is suspended`. Same for `/tenants/<id>/roles`, `/tenants/<id>/members`, `/workspaces/<id>` (create document), and `/tenants/<id>/invitations` (create invitation). **Reads keep working.**
+   - Back as platform admin, click **Activate** on `/platform`. `owner@acme.test` can mutate again.
+   - Inspect `audit_log` (`psql … -c "select event_type, actor_email from audit_log where target_type = 'tenant' order by occurred_at"`) — you should see exactly one `tenant.suspended` and one `tenant.activated` per toggle (no duplicates on a re-click of an already-suspended / already-active tenant).
+6. `/platform/audit` — as platform admin, lists the most recent audit rows (default limit 100, clamped server-side to 200). Non-platform-admins get HTTP 403.
+7. `/tenants` — list of tenants you're a member of.
+8. `/tenants/<tenant_id>` — as tenant owner, create a workspace.
+9. `/tenants/<tenant_id>/members` — see members; assign/remove roles via selects.
+10. `/tenants/<tenant_id>/roles` — list, create, edit, delete custom roles.
+11. `/workspaces` — list of workspaces you're a member of.
+12. `/workspaces/<workspace_id>` — as editor, create documents.
+13. `/workspaces/<workspace_id>/members` — workspace member list.
+14. `/workspaces/<workspace_id>/roles` — workspace roles.
+15. `/tenants/<tenant_id>/invitations` — create a tenant invitation (link or addressed).
+16. Link invitation flow: paste `/invitations/<64 hex>` in another session → `return_url` cookie → login → accept.
+17. Addressed invitation flow (Stage 3c): verified-first + case-insensitive match; `EmailNotVerified` / `Forbidden`.
+18. **Forgot password (Stage 3d).** `/login` → "Forgot password?" → `/forgot-password`. Generic confirmation for known/unknown emails; rate-limited 5/hour.
+19. **Reset password (Stage 3d).** `/reset-password/:token` → new password. All existing refresh tokens are revoked; one-shot (replay → `invalid or expired`).
+20. **Audit log.** After any of the flows above (register, login, logout, verify, password reset, invite, accept, role change, tenant/workspace provisioning, tenant suspend/activate), the corresponding `audit_log` rows are visible via `psql ... -c "select event_type, actor_email, target_type from audit_log order by occurred_at"` or via `/platform/audit`.
+21. **Wait 15+ minutes** — auto-refresh rotates the refresh token.
+22. Rate limits: `request_email_verification` — 3/hour per email; `request_password_reset` — 5/hour per email.
 
 ### Checking the build
 
@@ -373,7 +406,7 @@ From the repository root:
 cargo test
 ```
 
-**116 tests, all green** (27 unit + 89 integration: `authn` 13+37 = 50; `saas` 11+33 = 44; `access` 0+6 = 6; `authz-casbin` 0+9 = 9; `audit` 3+0 = 3; `audit-pg` 0+4 = 4). The count is a plan-level estimate; if the actual run differs slightly, the code is the source of truth.
+**124 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+41 = 52; `access` 0+6 = 6; `authz-casbin` 0+9 = 9; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3f added 8 integration tests in `saas::tests::integration` (resolve_active_tenant × 3, list_tenants, suspend_tenant, activate_tenant, accept_invitation_on_suspended, create_invitation_on_suspended).
 
 Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/access`, `crates/saas`, and `crates/audit`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
@@ -403,6 +436,15 @@ The reference example has a small unit-test module too (`rate_limit.rs`); run it
 │   ├── identity/
 │   ├── authn/
 │   ├── saas/
+│   │   ├── src/
+│   │   │   ├── lib.rs           # CoreError, SaasState, SaasBuilder, tenant / workspace modules
+│   │   │   ├── platform.rs      # Stage 3f: create_tenant, provision_tenant,
+│   │   │   │                    # list_tenants, suspend_tenant, activate_tenant,
+│   │   │   │                    # resolve_active_tenant, ActiveTenant
+│   │   │   ├── access.rs
+│   │   │   ├── invitation.rs
+│   │   │   └── member.rs
+│   │   └── tests/integration.rs
 │   ├── db/
 │   │   └── migrations/
 │   │       ├── 20261026000001_init.sql
@@ -413,7 +455,8 @@ The reference example has a small unit-test module too (`rate_limit.rs`); run it
 │   │       ├── 20261104000001_access_members_list_permission.sql
 │   │       ├── 20261105000001_authn_email_verify.sql
 │   │       ├── 20261106000001_authn_password_reset.sql
-│   │       └── 20261107000001_audit_log.sql
+│   │       ├── 20261107000001_audit_log.sql
+│   │       └── 20261108000001_platform_admin_permissions.sql
 │   └── seed/
 └── examples/
     └── saas-leptos/
@@ -427,12 +470,16 @@ The reference example has a small unit-test module too (`rate_limit.rs`); run it
             │                     # EmailSender / SmtpEmailSender / NoopEmailSender (ssr);
             │                     # send_verification + send_invitation + send_password_reset
             ├── rate_limit.rs     # SimpleRateLimiter (ssr, in-memory)
+            ├── pages/
+            │   ├── platform.rs   # PlatformTenantListPage (`/platform`),
+            │   │                 # PlatformAuditListPage (`/platform/audit`) — Stage 3f
+            │   └── ...
             └── ...
 ```
 
 ### domain
 
-Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`, `Invitation`, `Member`), the `InvitationTarget` enum (`Tenant(Uuid) | Workspace(Uuid)`), and authorization domain helpers (`PLATFORM_DOMAIN`, `tenant_domain`, `workspace_domain`). No SQL queries, no logic — just types. `sqlx::FromRow` / `sqlx::Type` derives are gated behind the `ssr` feature.
+Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`, `Invitation`, `Member`), the `InvitationTarget` enum (`Tenant(Uuid) | Workspace(Uuid)`), the `TenantStatus` enum (`Active | Suspended`, Stage 3f), and authorization domain helpers (`PLATFORM_DOMAIN`, `tenant_domain`, `workspace_domain`). No SQL queries, no logic — just types. `sqlx::FromRow` / `sqlx::Type` derives are gated behind the `ssr` feature.
 
 `AuthUser.email_verified: bool` is a **derived** boolean (`users.email_verified_at IS NOT NULL`), computed in every SELECT by `identity`. The timestamp itself is internal to `identity`/`authn`.
 
@@ -453,13 +500,15 @@ Trait-only `AuditLogger` (ADR-0004 §2.1) — symmetric to `authz`:
 - `AuditEvent { event_type, actor_id, actor_email, target_type, target_id, metadata }` — `occurred_at` and `id` are DB-generated (`audit-pg`).
 - `AuditLogger::log(&AuditEvent) -> Result<(), AuditError>`.
 - `NoopAuditLogger` — always available (no feature flag); used as the default in `Authn::new` / `AccessState::new` / `SaasBuilder::build`.
-- `events` module — 21 constants (`user.registered`, `tenant.created`, `workspace.created`, `member.role_assigned`, `role.created`, …). `tenant.suspended` / `tenant.activated` are declared but emitted only in Stage 3f.
+- `events` module — 21 constants (`user.registered`, `tenant.created`, `tenant.suspended`, `tenant.activated`, `workspace.created`, `member.role_assigned`, `role.created`, …). All 21 are emitted by Stage 3f.
 
 Does not depend on `sqlx`, `SaasState`, `Authn`, `AccessState`, or any business crate.
 
 ### audit-pg (Stage 3e)
 
 `PgAuditLogger::from_pool(PgPool) -> Self`. Implements `AuditLogger` with a single `INSERT INTO audit_log (...)` per call. Owns the `audit_log` table (sole writer). No attempt to make the audit write transactional with the caller's mutation (ADR-0004 §2.4 — that would extend ADR-0003's A-lite to audit).
+
+**Stage 3f** adds `PgAuditLogger::list(&self, limit: i64) -> Result<Vec<AuditRow>, AuditError>` and the `AuditRow` struct (DB-generated `id` / `occurred_at` + the DTO fields), used by the `/platform/audit` view. `list` is a read-only helper — it is not part of the `AuditLogger` trait (the trait is a single-method write interface; reads are implementation-specific).
 
 ### access
 
@@ -488,14 +537,18 @@ Authentication mechanism on top of `identity`.
 
 Business logic, independent of UI framework.
 
-- `SaasState { pool, authz, access, audit }`, `SaasBuilder` (`with_authz`, `with_access`, `with_audit`), `CoreError`, and services.
+- `SaasState { pool, authz, access, audit }`, `SaasBuilder` (`with_authz`, `with_access`, `with_audit`), `CoreError` (including `EmailNotVerified` and `TenantSuspended`), and services.
 - `with_audit` — optional; without it `NoopAuditLogger` is used.
-- Emits: `tenant.created` (in `platform::create_tenant` and `platform::provision_tenant`), `workspace.created` (in `tenant::create_workspace`), `invitation.created` / `.accepted` / `.revoked`, `member.role_assigned` / `.revoked` (from `saas::access::{assign_role, revoke_role}`), `role.deleted` (from `saas::access::delete_role`), `member.role_changed` (from `member::change_role`; in addition to the two events from its inner `assign_role` / `revoke_role`).
-- `tenant.suspended` / `tenant.activated` — constants only, emitted in Stage 3f.
+- `platform` (Stage 3f; extracted into `platform.rs`; re-exported at the crate root as `saas::{resolve_active_tenant, ActiveTenant}`):
+  - `create_tenant` / `provision_tenant` — container and explicit-owner variants (unchanged from Stage 1.1).
+  - `list_tenants` — platform admin tenant listing (`(tenants, list)`).
+  - `suspend_tenant` / `activate_tenant` — idempotent status toggles (`(tenants, manage)`); emit `tenant.suspended` / `tenant.activated` only on a transition.
+  - `resolve_active_tenant` — `ActiveTenant` or `Forbidden` / `TenantSuspended` / `NotFound`. Membership via `EXISTS tenant_members`; `#[server]` mutation functions call it explicitly.
+- Emits: `tenant.created` (in `platform::create_tenant` and `platform::provision_tenant`), `tenant.suspended` / `tenant.activated` (Stage 3f; transition only), `workspace.created` (in `tenant::create_workspace`), `invitation.created` / `.accepted` / `.revoked`, `member.role_assigned` / `.revoked` (from `saas::access::{assign_role, revoke_role}`), `role.deleted` (from `saas::access::delete_role`), `member.role_changed` (from `member::change_role`; in addition to the two events from its inner `assign_role` / `revoke_role`).
 
 ### db
 
-PostgreSQL connection helper and migration runner. Migrations include `20261107000001_audit_log.sql` (Stage 3e): `audit_log` + 4 indexes (`occurred_at`, `(actor_id, occurred_at)`, `(event_type, occurred_at)`, `(target_type, target_id, occurred_at)`). `actor_id` is `ON DELETE SET NULL`; `actor_email` is denormalized so audit survives `users` deletion.
+PostgreSQL connection helper and migration runner. Migrations include `20261107000001_audit_log.sql` (Stage 3e: `audit_log` + 4 indexes; `actor_id ON DELETE SET NULL`; `actor_email` denormalized) and `20261108000001_platform_admin_permissions.sql` (Stage 3f: `(tenants, list)`, `(tenants, manage)`, `(audit, read)` added to the reference table and to the existing `platform` owner role).
 
 ### seed
 
@@ -503,7 +556,7 @@ Standalone binary for creating initial platform, tenant, workspace, user, role, 
 
 ### examples/saas-leptos
 
-Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `AccessState::with_audit`, `Authn::with_audit`, and `SaasBuilder::with_audit`. Routes: `/tenants`, `/workspaces`, `/invitations/:token`, `/verify/:token`, `/forgot-password`, `/reset-password/:token`, plus tenant/workspace member and role pages. `error.rs` maps errors to HTTP 400/401/403/404/409/429/500. `error.rs` does not map audit errors — audit never propagates to `ServerFnError`.
+Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `AccessState::with_audit`, `Authn::with_audit`, and `SaasBuilder::with_audit`. Routes: `/tenants`, `/workspaces`, `/invitations/:token`, `/verify/:token`, `/forgot-password`, `/reset-password/:token`, `/platform`, `/platform/audit` (Stage 3f), plus tenant/workspace member and role pages. `error.rs` maps errors to HTTP 400/401/403/404/409/429/500. `error.rs` does not map audit errors — audit never propagates to `ServerFnError`. `error.rs` maps `CoreError::TenantSuspended` to 403 with a distinct message (`"tenant is suspended"`) so the UI can show a dedicated banner.
 
 ## Development principles
 
@@ -515,6 +568,8 @@ Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `Ac
 - Treat UI visibility as convenience, not as a security boundary.
 - **Roles are data, not code.** No built-in role enums; `owner` is a row created by `access::create_owner_role` / the SQL migration; custom roles are created and edited by the domain owner.
 - **`roles.key` is immutable**; `update_role` never changes it (rename = delete + create, ADR-0001).
+- **Tenant suspension is enforced explicitly, not by middleware** (ADR-0002 rev.2). Mutating `#[server]` functions call `saas::platform::resolve_active_tenant`; reads and cleanup stay available on a suspended tenant. `saas::invitation::{create, accept}_invitation` re-check the tenant status inside the service (defense in depth). Platform admin is not a superuser: a platform admin who is not a member of the target tenant gets `Forbidden` from `resolve_active_tenant`.
+- **`suspend_tenant` / `activate_tenant` are idempotent.** `UPDATE … WHERE status = <expected> RETURNING *` emits `tenant.suspended` / `tenant.activated` only when a row was actually updated; a second call returns the row unchanged with no audit emission.
 - `saas` and `authn` do not know about Leptos, Axum, or Casbin. `saas` does not know about `permissions`/`roles`/`role_permissions` — those belong to `access`. `authn` does not depend on `lettre` — SMTP transport lives in the example.
 - **`audit` (trait) does not depend on `sqlx`.** Symmetric to `authz`. `audit-pg` owns `audit_log` (sole writer). `NoopAuditLogger` is always available — not a feature flag.
 - Library crates do not depend on `examples/*`; each example has its own `Cargo.toml` and `Cargo.lock`.
@@ -543,11 +598,11 @@ Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `Ac
 - Stage 3c (done): addressed invitations.
 - Stage 3d (done): password reset.
 - Micro-PR (done): Docker Compose v1 → v2.
-- **Stage 3e (done): Audit log.** `audit` (trait) + `audit-pg` (`PgAuditLogger`); migration `20261107000001_audit_log.sql` (`audit_log` + 4 indexes, `actor_id ON DELETE SET NULL`). `Authn::with_audit`, `AccessState::with_audit`, `SaasBuilder::with_audit` — builder-style, additive (default `NoopAuditLogger`). 19 of 21 events emitted (all except `tenant.suspended` / `tenant.activated` — Stage 3f). Emissions: `authn` 8, `access` 2 (`role.created` / `role.updated` — `delete_role` silent, decision A), `saas` 9 (`tenant.created` × 2 paths, `workspace.created`, `invitation.created` × 3, `member.role_assigned` / `role_revoked` / `role_changed` — 3 per `change_role`, decision B), `saas::access::delete_role` `role.deleted`. Sync after `COMMIT`, `warn!` on failure. `PgAuditLogger` wired in `examples/saas-leptos` and `seed`. Tests: 101 → 116 (audit 3 unit; audit-pg 4 integration; authn +4; saas +4).
-- **Stage 3f (next): Platform admin + suspend.** `saas::platform::{list_tenants, suspend_tenant, activate_tenant}`; `resolve_active_tenant` + `ActiveTenant` + `CoreError::TenantSuspended`; explicit call in ~15 `#[server]`; `/platform/tenants` and `/platform/audit` UI. Emits `tenant.suspended` / `tenant.activated`.
-- Stage 3g: `axum-minimal` (portability proof).
-- Stage 3h: infra + minor (`has_policy` pre-check, `pg_advisory_xact_lock`, `my_permissions` cache, `casbin_rule` dedup).
-- Stage 4: Dockerfile, CI, observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (distributed), RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention/immutability, distributed single-flight refresh.
+- Stage 3e (done): Audit log. `audit` (trait) + `audit-pg` (`PgAuditLogger`); migration `20261107000001_audit_log.sql` (`audit_log` + 4 indexes, `actor_id ON DELETE SET NULL`). `Authn::with_audit`, `AccessState::with_audit`, `SaasBuilder::with_audit` — builder-style, additive (default `NoopAuditLogger`). 19 of 21 events emitted (all except `tenant.suspended` / `tenant.activated` — Stage 3f).
+- **Stage 3f (done): Platform admin + tenant suspension.** `saas::platform::*` extended with `list_tenants` / `suspend_tenant` / `activate_tenant` / `resolve_active_tenant` / `ActiveTenant`; `CoreError::TenantSuspended`; explicit `resolve_active_tenant` call in the mutating `#[server]` functions of the example; `/platform` (rename of `PlatformPage` → `PlatformTenantListPage`) + new `/platform/audit` (`(audit, read)`); `tenant.suspended` / `tenant.activated` events (idempotent, transition-only). Migration `20261108000001_platform_admin_permissions.sql` adds `(tenants, list)`, `(tenants, manage)`, `(audit, read)` to `permissions` and tops up the platform owner. 8 new integration tests (116 → 124).
+- **Stage 3g (next): `axum-minimal`.** Second consumer example without Leptos, proving portability: pure `axum::Router`, `axum::extract::FromRequestParts` for `CurrentUser`, `axum-extra`/`tower-cookies` for cookies, same `saas::*` / `authn::*` / `audit::*` calls, same `resolve_active_tenant` in mutation handlers. Deliberate deviation from ADR-0002 rev.2 §3.8 ("`FromRequestParts` deferred") — that is exactly what the example demonstrates; documented in `handoff §16`.
+- Stage 3h: infra + minor (`has_policy` pre-check in `grant_role`, `pg_advisory_xact_lock` in the owner guard, `my_permissions` cache, `casbin_rule` dedup + unique index, owner-sync trigger).
+- Stage 4: Dockerfile, CI, observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (distributed), RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`.
 
 ## License
 

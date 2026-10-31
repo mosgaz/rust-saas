@@ -44,6 +44,7 @@ lettre = { version = "0.11", default-features = false, features = [
 async-trait = { version = "0.1", optional = true }
 
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 uuid = { version = "1", features = ["serde", "v4", "js"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"

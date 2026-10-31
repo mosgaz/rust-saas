@@ -20,6 +20,28 @@
 //! The check runs after the `SELECT ... FOR UPDATE` lookup and before
 //! `used_count` is incremented, so a rejected accept does not consume a use.
 //!
+//! **Stage 3f (ADR-0002 rev.2 §2.5):** both `create_invitation` and
+//! `accept_invitation` reject when the target tenant's `status != 'active'`
+//! with [`CoreError::TenantSuspended`]. `create_invitation` is the
+//! "defense in depth" path: the example's `#[server]` already calls
+//! `saas::platform::resolve_active_tenant` before the service, but a
+//! future consumer that calls `saas::invitation::create_invitation`
+//! directly must not be able to bypass suspension. `accept_invitation`
+//! runs the status check **inside** the service (the `#[server]` does not
+//! resolve for `accept_invitation`, because the invitation token is the
+//! only authorization proof the actor has and the tenant id is not known
+//! to the client before the lookup). Both checks run before any mutation:
+//! `create_invitation` before `INSERT`, `accept_invitation` before
+//! `used_count++` and before `*_members` / `casbin_rule` writes.
+//!
+//! `revoke_invitation` and `list_invitations` do **not** resolve the
+//! tenant status — they are cleanup concerns: an owner must be able to
+//! revoke stale invitations and list history on a suspended tenant
+//! (ADR-0002 rev.2 §2.4). `check_invitation` (public) does not resolve
+//! either — an anonymous visitor on `/invitations/:token` gets the
+//! invitation's existence and status regardless; if they try to accept,
+//! `accept_invitation` rejects with `TenantSuspended`.
+//!
 //! **Stage 3e (ADR-0004):** the three mutation services emit audit events
 //! after the business operation commits:
 //! - `create_invitation` → `invitation.created`
@@ -35,7 +57,7 @@
 //! operation (ADR-0004 §2.4).
 
 use audit::{events, AuditEvent};
-use domain::{AuthUser, Invitation, InvitationTarget};
+use domain::{AuthUser, Invitation, InvitationTarget, TenantStatus};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -47,6 +69,13 @@ const DEFAULT_TTL_HOURS: i32 = 168;
 /// Creates an invitation.
 ///
 /// Emits `invitation.created` (Stage 3e) after the row is committed.
+///
+/// Stage 3f: rejects with [`CoreError::TenantSuspended`] if the target
+/// tenant is not `'active'` (defense in depth — the caller normally runs
+/// `saas::platform::resolve_active_tenant` first; a direct caller must not
+/// bypass suspension). For `InvitationTarget::Workspace(_)` the check
+/// joins through `workspaces` → `tenants` (workspaces have no status of
+/// their own).
 pub async fn create_invitation(
     state: &SaasState,
     actor: &AuthUser,
@@ -62,6 +91,15 @@ pub async fn create_invitation(
         .authz
         .require(actor.id, &domain_str, "invitations", "create")
         .await?;
+
+    let (tenant_id, workspace_id) = match target {
+        InvitationTarget::Tenant(id) => (Some(id), None),
+        InvitationTarget::Workspace(id) => (None, Some(id)),
+    };
+
+    // Stage 3f: defense in depth — reject before any further work
+    // (validate_role / INSERT) if the target tenant is suspended.
+    ensure_tenant_active(state, tenant_id, workspace_id).await?;
 
     validate_role(state, target, &role).await?;
 
@@ -81,11 +119,6 @@ pub async fn create_invitation(
 
     let token = generate_token();
     let token_hash = hash_token(&token);
-
-    let (tenant_id, workspace_id) = match target {
-        InvitationTarget::Tenant(id) => (Some(id), None),
-        InvitationTarget::Workspace(id) => (None, Some(id)),
-    };
 
     let invitation = sqlx::query_as::<_, Invitation>(
         r#"
@@ -161,11 +194,16 @@ pub async fn check_invitation(
 ///       [`CoreError::Forbidden`] (case-insensitive, §«Решения C»).
 ///    Both checks run **before** `used_count` is incremented, so a
 ///    rejected accept does not consume a use.
-/// 3. `UPDATE used_count`.
-/// 4. Insert `*_members` (`ON CONFLICT DO NOTHING`; multi-role PK) and
+/// 3. **Stage 3f:** [`ensure_tenant_active`] on the invitation's tenant
+///    (`InvitationTarget::Workspace` joins through `workspaces`). Runs
+///    **before** `used_count++`, so a suspended tenant does not consume a
+///    use; the address checks in step 2 take priority (they run in-memory;
+///    the status check needs one SELECT).
+/// 4. `UPDATE used_count`.
+/// 5. Insert `*_members` (`ON CONFLICT DO NOTHING`; multi-role PK) and
 ///    `authz.grant_role`.
-/// 5. `COMMIT`.
-/// 6. Emit `invitation.accepted` (Stage 3e).
+/// 6. `COMMIT`.
+/// 7. Emit `invitation.accepted` (Stage 3e).
 ///
 /// Link invitations (`email IS NULL`) skip step 2 entirely; unverified
 /// actors may still accept them (Stage 3c preserves the Stage 2a
@@ -205,6 +243,13 @@ pub async fn accept_invitation(
             return Err(CoreError::Forbidden);
         }
     }
+
+    // Stage 3f: reject before `used_count++` if the target tenant is
+    // suspended. The invitation row is locked (`FOR UPDATE`), but the
+    // `tenants` row is not — a concurrent `suspend_tenant` can land
+    // between this check and the insert; acceptable for the reference
+    // consumer (suspension is an admin action, not a per-request race).
+    ensure_tenant_active(state, invitation.tenant_id, invitation.workspace_id).await?;
 
     sqlx::query("update invitations set used_count = used_count + 1 where id = $1")
         .bind(invitation.id)
@@ -296,6 +341,10 @@ pub async fn accept_invitation(
 /// Revokes an invitation.
 ///
 /// Emits `invitation.revoked` (Stage 3e) after the row is updated.
+///
+/// Stage 3f: does **not** resolve the tenant status — revoke is a cleanup
+/// concern and must remain available on a suspended tenant (ADR-0002 rev.2
+/// §2.4).
 pub async fn revoke_invitation(
     state: &SaasState,
     actor: &AuthUser,
@@ -349,6 +398,9 @@ pub async fn revoke_invitation(
 }
 
 /// Lists invitations.
+///
+/// Stage 3f: does **not** resolve the tenant status — listing is a
+/// read-only concern and must remain available on a suspended tenant.
 pub async fn list_invitations(
     state: &SaasState,
     actor: &AuthUser,
@@ -421,4 +473,58 @@ async fn validate_role(
         )));
     }
     Ok(())
+}
+
+/// Rejects if the target tenant's `status != 'active'`.
+///
+/// Stage 3f helper used by [`create_invitation`] and
+/// [`accept_invitation`] (ADR-0002 rev.2 §2.5). Exactly one of
+/// `tenant_id` / `workspace_id` must be `Some`; for `Workspace` the check
+/// joins through `workspaces` → `tenants` (workspaces have no status of
+/// their own).
+///
+/// Errors:
+/// - `TenantSuspended` — tenant exists and its status is not `'active'`.
+/// - `NotFound` — the referenced tenant/workspace row is gone (e.g. a
+///   cascaded delete that raced the FK; defensive only — the FK normally
+///   removes the invitation first).
+/// - `Internal` — neither id is set (should be unreachable: the
+///   `invitations` CHECK constraint guarantees exactly one).
+async fn ensure_tenant_active(
+    state: &SaasState,
+    tenant_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+) -> Result<(), CoreError> {
+    let status: Option<TenantStatus> = match (tenant_id, workspace_id) {
+        (Some(tid), _) => {
+            sqlx::query_scalar("select status from tenants where id = $1")
+                .bind(tid)
+                .fetch_optional(state.pool())
+                .await?
+        }
+        (_, Some(wid)) => {
+            sqlx::query_scalar(
+                r#"
+                select t.status
+                from tenants t
+                join workspaces w on w.tenant_id = t.id
+                where w.id = $1
+                "#,
+            )
+            .bind(wid)
+            .fetch_optional(state.pool())
+            .await?
+        }
+        _ => {
+            return Err(CoreError::Internal(
+                "invitation has neither tenant_id nor workspace_id".into(),
+            ));
+        }
+    };
+
+    match status {
+        Some(TenantStatus::Active) => Ok(()),
+        Some(TenantStatus::Suspended) => Err(CoreError::TenantSuspended),
+        None => Err(CoreError::NotFound),
+    }
 }

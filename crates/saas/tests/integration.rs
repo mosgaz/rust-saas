@@ -18,6 +18,15 @@
 //! the expected `audit_log` rows appear for `provision_tenant`,
 //! `create_workspace`, the invitation lifecycle, and `change_role`
 //! (three events: assigned + revoked + changed).
+//!
+//! Stage 3f adds the "Platform admin + tenant suspend" section:
+//! `resolve_active_tenant` (member + active → `Ok(ActiveTenant)`; member +
+//! suspended → `TenantSuspended`; non-member → `Forbidden`),
+//! `list_tenants` (requires `(tenants, list)` in `PLATFORM_DOMAIN`),
+//! `suspend_tenant` / `activate_tenant` (idempotent; emit `tenant.suspended`
+//! / `tenant.activated` only on a transition), and
+//! `invitation::{create, accept}_invitation` rejecting on a suspended
+//! tenant (before `used_count++` for `accept`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,7 +35,7 @@ use access::{AccessState, RoleKey};
 use audit_pg::PgAuditLogger;
 use authz::{AuthorizationEngine, AuthzError};
 use authz_casbin::CasbinAuthz;
-use domain::{AuthUser, InvitationTarget};
+use domain::{AuthUser, InvitationTarget, TenantStatus};
 use saas::member::MemberScope;
 use saas::{
     access as saas_access, invitation, member, platform, tenant, workspace, CoreError, SaasBuilder,
@@ -2229,4 +2238,321 @@ async fn change_role_emits_three_events(pool: PgPool) {
     assert_eq!(metadata["scope"], ws_domain.as_str());
     assert_eq!(metadata["from_role"], "editor");
     assert_eq!(metadata["to_role"], "viewer");
+}
+
+// ─── Stage 3f: platform admin + tenant suspend ─────────────────────────────
+
+/// Active tenant + member actor → `Ok(ActiveTenant)`; `Deref` exposes
+/// `.name`, `.status`, `.id`, and `into_inner()` unwraps.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn resolve_active_tenant_active_returns_tenant(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner = make_user(&pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
+        .await
+        .unwrap();
+
+    let active = platform::resolve_active_tenant(&saas, &owner, tenant.id)
+        .await
+        .expect("member of an active tenant must resolve");
+
+    assert_eq!(active.id, tenant.id);
+    assert_eq!(active.name, tenant.name);
+    assert_eq!(active.status, TenantStatus::Active);
+
+    let unwrapped = active.into_inner();
+    assert_eq!(unwrapped.id, tenant.id);
+}
+
+/// Member actor + suspended tenant → `TenantSuspended`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn resolve_active_tenant_suspended_returns_tenant_suspended(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner = make_user(&pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
+        .await
+        .unwrap();
+    sqlx::query("update tenants set status = 'suspended' where id = $1")
+        .bind(tenant.id)
+        .execute(&pool)
+        .await
+        .expect("force suspended");
+
+    let err = platform::resolve_active_tenant(&saas, &owner, tenant.id)
+        .await
+        .expect_err("suspended tenant must be rejected");
+    assert!(matches!(err, CoreError::TenantSuspended), "got {err:?}");
+}
+
+/// Non-member on an active tenant → `Forbidden` (membership check runs
+/// before the status check).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn resolve_active_tenant_non_member_returns_forbidden(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner = make_user(&pool, "owner").await;
+    let outsider = make_user(&pool, "outsider").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
+        .await
+        .unwrap();
+
+    let err = platform::resolve_active_tenant(&saas, &outsider, tenant.id)
+        .await
+        .expect_err("non-member must be forbidden");
+    assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
+}
+
+/// `list_tenants` requires `(tenants, list)` in `PLATFORM_DOMAIN`: an actor
+/// without platform owner is rejected, the platform admin sees every tenant.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn list_tenants_requires_platform_tenants_list(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let outsider = make_user(&pool, "outsider").await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let a = make_user(&pool, "a").await;
+    let b = make_user(&pool, "b").await;
+    let tenant_a =
+        platform::provision_tenant(&saas, &admin, unique_name("LA"), &a, &owner_key)
+            .await
+            .unwrap();
+    let tenant_b =
+        platform::provision_tenant(&saas, &admin, unique_name("LB"), &b, &owner_key)
+            .await
+            .unwrap();
+
+    let err = platform::list_tenants(&saas, &outsider)
+        .await
+        .expect_err("non-platform-admin must be forbidden");
+    assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
+
+    let tenants = platform::list_tenants(&saas, &admin)
+        .await
+        .expect("platform admin must list tenants");
+    let ids: Vec<Uuid> = tenants.iter().map(|t| t.id).collect();
+    assert_eq!(ids.len(), 2, "exactly two tenants created");
+    assert!(ids.contains(&tenant_a.id));
+    assert!(ids.contains(&tenant_b.id));
+}
+
+/// First `suspend_tenant` on an active tenant transitions the status and
+/// emits one `tenant.suspended` row; a second call is idempotent — no new
+/// audit rows, same `suspended` status.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn suspend_tenant_emits_event_and_is_idempotent(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("Susp"), &admin, &owner_key)
+            .await
+            .unwrap();
+
+    let before: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let suspended = platform::suspend_tenant(&saas, &admin, tenant.id)
+        .await
+        .expect("suspend_tenant must succeed");
+    assert_eq!(suspended.status, TenantStatus::Suspended);
+    assert_eq!(suspended.id, tenant.id);
+
+    let rows: Vec<(String, Option<Uuid>, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        r#"
+        select event_type, actor_id, target_type, target_id
+        from audit_log
+        order by occurred_at asc, id asc
+        offset $1
+        "#,
+    )
+    .bind(before)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "one tenant.suspended event");
+    assert_eq!(rows[0].0, "tenant.suspended");
+    assert_eq!(rows[0].1, Some(admin.id));
+    assert_eq!(rows[0].2.as_deref(), Some("tenant"));
+    assert_eq!(rows[0].3, Some(tenant.id));
+
+    // Second call: idempotent — same status, no extra audit row.
+    let again = platform::suspend_tenant(&saas, &admin, tenant.id)
+        .await
+        .expect("idempotent suspend");
+    assert_eq!(again.status, TenantStatus::Suspended);
+    assert_eq!(again.id, tenant.id);
+
+    let after: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before + 1, "second call must not emit");
+}
+
+/// First `activate_tenant` on a suspended tenant transitions the status and
+/// emits one `tenant.activated` row; a second call is idempotent — no new
+/// audit rows, same `active` status.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn activate_tenant_emits_event_and_is_idempotent(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("Act"), &admin, &owner_key)
+            .await
+            .unwrap();
+    platform::suspend_tenant(&saas, &admin, tenant.id)
+        .await
+        .expect("setup suspend");
+
+    let before: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let active = platform::activate_tenant(&saas, &admin, tenant.id)
+        .await
+        .expect("activate_tenant must succeed");
+    assert_eq!(active.status, TenantStatus::Active);
+    assert_eq!(active.id, tenant.id);
+
+    let rows: Vec<(String, Option<Uuid>, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        r#"
+        select event_type, actor_id, target_type, target_id
+        from audit_log
+        order by occurred_at asc, id asc
+        offset $1
+        "#,
+    )
+    .bind(before)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "one tenant.activated event");
+    assert_eq!(rows[0].0, "tenant.activated");
+    assert_eq!(rows[0].1, Some(admin.id));
+    assert_eq!(rows[0].2.as_deref(), Some("tenant"));
+    assert_eq!(rows[0].3, Some(tenant.id));
+
+    // Second call: idempotent.
+    let again = platform::activate_tenant(&saas, &admin, tenant.id)
+        .await
+        .expect("idempotent activate");
+    assert_eq!(again.status, TenantStatus::Active);
+
+    let after: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before + 1, "second call must not emit");
+}
+
+/// `accept_invitation` on a suspended tenant returns `TenantSuspended`;
+/// `used_count` is not incremented and no `*_members` / `casbin_rule` rows
+/// are written.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn accept_invitation_on_suspended_tenant_returns_tenant_suspended(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    let (inv, token) = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        None,
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .expect("create link invitation");
+
+    sqlx::query("update tenants set status = 'suspended' where id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .expect("force suspended");
+
+    let invitee = make_user(&pool, "invitee").await;
+    let err = invitation::accept_invitation(&saas, &invitee, &token)
+        .await
+        .expect_err("suspended tenant must be rejected");
+    assert!(matches!(err, CoreError::TenantSuspended), "got {err:?}");
+
+    let used: i32 = sqlx::query_scalar("select used_count from invitations where id = $1")
+        .bind(inv.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(used, 0, "rejected accept must not consume a use");
+
+    let members: i64 = sqlx::query_scalar(
+        "select count(*) from tenant_members where tenant_id = $1 and user_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(invitee.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(members, 0, "rejected accept must not write *_members");
+
+    let granted = saas
+        .authz()
+        .has_role(invitee.id, &domain::tenant_domain(tenant_id), "owner")
+        .await
+        .unwrap();
+    assert!(!granted, "rejected accept must not grant casbin role");
+}
+
+/// `create_invitation` on a suspended tenant returns `TenantSuspended`
+/// (defense in depth — the `#[server]` normally resolves first).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_invitation_on_suspended_tenant_returns_tenant_suspended(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let (tenant_id, owner) = provision_tenant_for_invitation(&pool, &saas).await;
+
+    sqlx::query("update tenants set status = 'suspended' where id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .expect("force suspended");
+
+    let err = invitation::create_invitation(
+        &saas,
+        &owner,
+        InvitationTarget::Tenant(tenant_id),
+        None,
+        "owner".into(),
+        None,
+        Some(1),
+    )
+    .await
+    .expect_err("suspended tenant must be rejected");
+    assert!(matches!(err, CoreError::TenantSuspended), "got {err:?}");
+
+    let count: i64 = sqlx::query_scalar("select count(*) from invitations where tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "rejected create must not insert an invitation");
 }

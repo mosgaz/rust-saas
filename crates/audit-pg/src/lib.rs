@@ -19,9 +19,19 @@
 //! Indexes on `occurred_at`, `(actor_id, occurred_at)`, `(event_type,
 //! occurred_at)`, and `(target_type, target_id, occurred_at)` live in
 //! `crates/db/migrations/`.
+//!
+//! Stage 3f adds [`AuditRow`] and [`PgAuditLogger::list`] for the
+//! platform-admin audit view (`/platform/audit`). `list` is a read-only
+//! helper — it does **not** participate in the write path and is not part
+//! of the [`audit::AuditLogger`] trait (the trait is intentionally a
+//! single-method write interface; reads are implementation-specific so
+//! consumers can pick pagination/filtering for their own storage).
 
 use audit::{AuditError, AuditEvent, AuditLogger};
-use sqlx::PgPool;
+use serde::{Deserialize, Serialize};
+use sqlx::types::chrono::{DateTime, Utc};
+use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 /// PostgreSQL-backed [`AuditLogger`].
 ///
@@ -41,6 +51,37 @@ impl PgAuditLogger {
     /// Borrowed view of the underlying pool (for tests / health checks).
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Lists the most recent audit rows, newest first.
+    ///
+    /// Read-only helper for the platform-admin audit view (Stage 3f); not
+    /// part of the [`AuditLogger`] trait. `limit` is passed through to SQL
+    /// as `LIMIT $1` — callers should clamp it to a sane upper bound (the
+    /// example uses `LIMIT_MAX = 200`). Rows are ordered by
+    /// `(occurred_at DESC, id DESC)` so that ties (same-microsecond rows,
+    /// e.g. `change_role`'s three events) are stable across calls.
+    pub async fn list(&self, limit: i64) -> Result<Vec<AuditRow>, AuditError> {
+        sqlx::query_as::<_, AuditRow>(
+            r#"
+            select
+                id,
+                occurred_at,
+                actor_id,
+                actor_email,
+                event_type,
+                target_type,
+                target_id,
+                metadata
+            from audit_log
+            order by occurred_at desc, id desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AuditError::Internal(e.to_string()))
     }
 }
 
@@ -65,4 +106,24 @@ impl AuditLogger for PgAuditLogger {
         .map_err(|e| AuditError::Internal(e.to_string()))?;
         Ok(())
     }
+}
+
+/// A row from the `audit_log` table, as read by [`PgAuditLogger::list`].
+///
+/// Read-side mirror of [`audit::AuditEvent`]: it carries the DB-generated
+/// `id` and `occurred_at` (the DTO does not) and its shape matches the
+/// columns in `crates/db/migrations/20261107000001_audit_log.sql`.
+/// `metadata` is a free-form `serde_json::Value` (JSONB). `actor_email`
+/// may survive `users` row deletion — `actor_id` becomes `NULL` via
+/// `ON DELETE SET NULL` (ADR-0004 §2.3).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct AuditRow {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub actor_id: Option<Uuid>,
+    pub actor_email: Option<String>,
+    pub event_type: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
 }

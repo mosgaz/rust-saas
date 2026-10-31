@@ -1,5 +1,20 @@
 //! Tenant pages: the list of tenants the current user belongs to, and a
 //! single-tenant page (create workspace, open invitations/members/roles).
+//!
+//! **Stage 3f (ADR-0002 rev.2):** the `create_workspace` server function
+//! calls `saas::platform::resolve_active_tenant` before delegating to
+//! `saas::tenant::create_workspace`. Resolution checks that the actor is a
+//! member of the tenant (`EXISTS tenant_members`) and that its status is
+//! `'active'`; a non-member gets `Forbidden`, a suspended tenant gets
+//! `TenantSuspended` (both map to HTTP 403 in `error.rs`). The mutation
+//! target is `active.id` — the same id that the caller supplied, but
+//! type-checked through `ActiveTenant` so an accidental bypass would fail
+//! to compile.
+//!
+//! Reads are **not** resolved: `list_my_tenants` (membership query) and
+//! `my_permissions` (UX helper) run on a suspended tenant by design — a
+//! tenant member must still see which tenants they belong to and which
+//! actions *would* be permitted when the tenant is reactivated.
 
 use domain::Workspace;
 use leptos::callback::Callback;
@@ -14,6 +29,10 @@ use crate::pages::member::my_permissions;
 // ─── Server functions ───────────────────────────────────────────────────────
 
 /// Lists tenants the current user is a member of.
+///
+/// Read-only; no `resolve_active_tenant` — membership is the only filter
+/// and suspended tenants are still listed (their status is shown in the
+/// UI).
 #[server]
 pub async fn list_my_tenants() -> Result<Vec<domain::Tenant>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -24,12 +43,21 @@ pub async fn list_my_tenants() -> Result<Vec<domain::Tenant>, ServerFnError> {
 }
 
 /// Creates a workspace inside a tenant; the creator becomes `owner`.
+///
+/// Stage 3f: resolves the tenant first (membership + active status) — a
+/// suspended tenant returns `TenantSuspended` (HTTP 403). See the module
+/// doc for the reasoning.
 #[server]
 pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
     let owner_key =
         access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let active = saas::platform::resolve_active_tenant(&state.saas, &user, tenant_id)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    let tenant_id = active.id;
 
     saas::tenant::create_workspace(&state.saas, &user, tenant_id, name, &user, &owner_key)
         .await
@@ -119,6 +147,12 @@ struct TenantParams {
 /// `/tenants/:tenant_id` — single tenant page: create a workspace (only
 /// when permitted), links to invitations/members/roles (only when
 /// permitted).
+///
+/// `my_permissions` is read-only and does **not** call
+/// `resolve_active_tenant`: the page renders on a suspended tenant, but the
+/// `create_workspace` server function itself rejects with
+/// `TenantSuspended` (HTTP 403) — UI gating is convenience, not a security
+/// boundary.
 #[component]
 pub fn TenantPage() -> impl IntoView {
     let params = use_params::<TenantParams>();

@@ -16,6 +16,9 @@
 //! real logger (`PgAuditLogger`). Emissions live in submodules:
 //! - `platform::create_tenant` / `platform::provision_tenant` →
 //!   `tenant.created`.
+//! - `platform::suspend_tenant` / `platform::activate_tenant` →
+//!   `tenant.suspended` / `tenant.activated` (Stage 3f; emitted only on a
+//!   status transition).
 //! - `tenant::create_workspace` → `workspace.created`.
 //! - `invitation::{create, accept, revoke}_invitation` →
 //!   `invitation.{created, accepted, revoked}`.
@@ -25,9 +28,18 @@
 //!   `member.role_assigned` / `member.role_revoked` emitted by its inner
 //!   `saas::access::{assign_role, revoke_role}` calls — three events total).
 //!
-//! `tenant.suspended` / `tenant.activated` are declared in `audit::events`
-//! but only emitted in Stage 3f once `suspend_tenant` / `activate_tenant`
-//! exist (decision C).
+//! Stage 3f: platform-level administration and tenant suspension.
+//! - [`platform`] is extracted into `crates/saas/src/platform.rs`; paths
+//!   are preserved via `pub mod platform;` + `pub use platform::{…}`.
+//!   [`ActiveTenant`] and [`resolve_active_tenant`] are re-exported at the
+//!   crate root for convenience.
+//! - [`CoreError::TenantSuspended`] is the typed rejection returned by
+//!   [`platform::resolve_active_tenant`] (and the invitation services) when
+//!   the tenant's `status != 'active'`. Mapped to HTTP 403 in the example.
+//! - All 21 audit events are now emitted; `tenant.suspended` /
+//!   `tenant.activated` fire on transitions only (`UPDATE … WHERE status =
+//!   <expected> RETURNING *` returns a row; zero-row updates are a no-op
+//!   without emission).
 //!
 //! Audit is best-effort: a failed write is `tracing::warn!` and does not
 //! fail the business operation (ADR-0004 §2.4).
@@ -37,13 +49,16 @@ use std::sync::Arc;
 use ::access::{AccessError, AccessState, RoleKey};
 use audit::{AuditEvent, AuditLogger, NoopAuditLogger};
 use authz::{AuthorizationEngine, AuthzError};
-use domain::{AuthUser, Document, Tenant, Workspace, PLATFORM_DOMAIN};
+use domain::{AuthUser, Document, Tenant, Workspace};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 pub mod access;
 pub mod invitation;
 pub mod member;
+
+pub mod platform;
+pub use platform::{resolve_active_tenant, ActiveTenant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -57,6 +72,13 @@ pub enum CoreError {
     /// "resend verification email" instead of a generic "forbidden".
     #[error("email not verified")]
     EmailNotVerified,
+    /// The tenant exists and the actor is a member, but its `status` is not
+    /// `'active'` (Stage 3f; ADR-0002 rev.2). Returned by
+    /// [`platform::resolve_active_tenant`] and by the invitation services
+    /// (`create_invitation` / `accept_invitation`) when the target tenant
+    /// is suspended. Mapped to HTTP 403 in the example.
+    #[error("tenant is suspended")]
+    TenantSuspended,
     #[error("not found")]
     NotFound,
     #[error("validation error: {0}")]
@@ -183,119 +205,6 @@ impl SaasBuilder {
             access,
             audit,
         })
-    }
-}
-
-pub mod platform {
-    use super::*;
-    use audit::events;
-
-    /// Creates a tenant container. No side effects.
-    ///
-    /// Emits `tenant.created` (Stage 3e) after the row is committed.
-    pub async fn create_tenant(
-        state: &SaasState,
-        actor: &AuthUser,
-        name: String,
-    ) -> Result<Tenant, CoreError> {
-        state
-            .authz
-            .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
-            .await?;
-
-        let tenant = sqlx::query_as::<_, Tenant>(
-            "insert into tenants (name) values ($1) returning id, name, status, created_at",
-        )
-        .bind(&name)
-        .fetch_one(&state.pool)
-        .await?;
-
-        state
-            .audit_or_warn(AuditEvent {
-                event_type: events::TENANT_CREATED.into(),
-                actor_id: Some(actor.id),
-                actor_email: Some(actor.email.clone()),
-                target_type: Some("tenant".into()),
-                target_id: Some(tenant.id),
-                metadata: serde_json::json!({ "name": name }),
-            })
-            .await;
-
-        Ok(tenant)
-    }
-
-    /// Creates a tenant and assigns an explicit owner with `owner_role_key`.
-    ///
-    /// Emits `tenant.created` (Stage 3e) after the transaction commits;
-    /// the target is the new tenant, the actor is `actor` (not `owner`).
-    pub async fn provision_tenant(
-        state: &SaasState,
-        actor: &AuthUser,
-        name: String,
-        owner: &AuthUser,
-        owner_role_key: &RoleKey,
-    ) -> Result<Tenant, CoreError> {
-        state
-            .authz
-            .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
-            .await?;
-
-        let mut tx = state.pool.begin().await?;
-
-        let tenant = sqlx::query_as::<_, Tenant>(
-            "insert into tenants (name) values ($1) returning id, name, status, created_at",
-        )
-        .bind(&name)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let domain_str = domain::tenant_domain(tenant.id);
-
-        ::access::create_owner_role(state.access(), &domain_str)
-            .await
-            .map_err(CoreError::from)?;
-
-        let permissions =
-            ::access::get_permissions_for_role(state.access(), &domain_str, owner_role_key)
-                .await
-                .map_err(CoreError::from)?;
-
-        state
-            .authz
-            .grant_role(owner.id, &domain_str, owner_role_key.as_str(), &permissions)
-            .await?;
-
-        sqlx::query(
-            r#"
-            insert into tenant_members (tenant_id, user_id, role)
-            values ($1, $2, $3)
-            on conflict do nothing
-            "#,
-        )
-        .bind(tenant.id)
-        .bind(owner.id)
-        .bind(owner_role_key.as_str())
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        state
-            .audit_or_warn(AuditEvent {
-                event_type: events::TENANT_CREATED.into(),
-                actor_id: Some(actor.id),
-                actor_email: Some(actor.email.clone()),
-                target_type: Some("tenant".into()),
-                target_id: Some(tenant.id),
-                metadata: serde_json::json!({
-                    "name": name,
-                    "owner_id": owner.id.to_string(),
-                    "owner_role_key": owner_role_key.as_str(),
-                }),
-            })
-            .await;
-
-        Ok(tenant)
     }
 }
 
@@ -526,7 +435,7 @@ mod tests {
     use std::sync::Mutex;
 
     use chrono::Utc;
-    use domain::InvitationTarget;
+    use domain::{InvitationTarget, PLATFORM_DOMAIN};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RequireCall {
