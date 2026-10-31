@@ -137,6 +137,16 @@ async fn main() -> anyhow::Result<()> {
         cookie: cookie_cfg.clone(),
     };
 
+    // Stage 4.4a: readiness probe. Inline (not a separate module) so
+    // it does not leak into the `hydrate` build (axum is optional and
+    // only enabled under `ssr`).
+    async fn healthz() -> impl axum::response::IntoResponse {
+        (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({ "status": "ok" })),
+        )
+    }
+
     let routes = generate_route_list(saas_leptos::App);
 
     // Auth-scoping (ADR-0002): SSR pages and Leptos `_server/*` handlers go
@@ -165,9 +175,13 @@ async fn main() -> anyhow::Result<()> {
             saas_leptos::middleware::same_origin_guard,
         ));
 
-    let public: Router<saas_leptos::state::AppState> = Router::new().fallback(
-        leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell),
-    );
+    let public: Router<saas_leptos::state::AppState> = Router::new()
+        .route("/healthz", axum::routing::get(healthz))
+        .fallback(
+            leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(
+                saas_leptos::shell,
+            ),
+        );
 
     let router = protected
         .merge(public)

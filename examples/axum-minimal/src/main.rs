@@ -69,6 +69,7 @@ mod csrf;
 mod email;
 mod error;
 mod extract;
+mod health;
 mod middleware;
 mod rate_limit;
 mod state;
@@ -206,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(axum::middleware::from_fn(csrf::csrf_guard));
 
     let public: Router<Arc<AppState>> = Router::new()
+        .route("/healthz", get(health::healthz))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout));
