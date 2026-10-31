@@ -739,6 +739,78 @@ Second consumer — pure Axum, no Leptos; the portability proof.
 - **Stage 3h (done): infra + minor.** `has_policy` pre-check in `authz-casbin::grant_role` (idempotent `p`-rows); migration `20261110000001_casbin_rule_unique_idx.sql` (dedup + unique index); `pg_advisory_xact_lock` in `saas::member::{change_role, remove_role}` (race-free owner guard); `PermsCache` in `saas-leptos` (30s TTL, invalidated after mutations). 124 → 130 tests, +1 migration.
 - Stage 4 (next): Dockerfile, CI, observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (distributed), RLS, E2E HTTP tests, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`, SSR-correct guards in `saas-leptos`, server-side per-route middleware (defense in depth).
 
+
+## Pluggability: what can be replaced, what cannot
+
+`rust-saas` is **not** a hexagonal framework with a port on every axis.
+It is a PostgreSQL-backed core with **two ports** (`authz`, `audit`) and
+concrete implementations elsewhere. This section is the honest contract.
+
+### Ports (traits + implementations)
+
+| Concern | Trait | Default impl | Replace without forking? |
+|---|---|---|---|
+| Authorization | `authz::AuthorizationEngine` | `authz-casbin::CasbinAuthz` | **yes** — e.g. OPA, Keycloak |
+| Audit | `audit::AuditLogger` | `audit-pg::PgAuditLogger` | **yes** — Kafka, file, OTel |
+
+### Concrete dependencies (replacement = fork)
+
+| Concern | Concrete | Replacement |
+|---|---|---|
+| Identity storage | `identity::*` (`users`) | fork `identity` + edits in `authn`, `saas` |
+| Auth mechanism | `authn::Authn` | fork `authn` + edits in `saas`, examples |
+| Role storage | `access::AccessState` (`roles`, `permissions`, `role_permissions`) | fork `access` + edits in `saas` |
+| SaaS business logic | `saas::*` (platform, tenant, workspace, invitation, member, access) | fork `saas` |
+| Database | `PgPool` everywhere | non-goal |
+
+### Composition & migrations
+
+- **Full schema** — `db::migrate` (workspace set, 12 migrations in
+  `crates/db/migrations/`). All crates share one database.
+- **Partial schema** — `db::migrate_with(pool, &[&Migrator])` against a
+  **fresh** database. Example: `db::migrate_with(&pool, &[audit_pg::MIGRATOR])`
+  creates only `users` (FK target) + `audit_log`. A consumer picks **one**
+  path per database; composition of `migrate()` and a per-crate set on the
+  same database is **not** supported (sqlx → `VersionMissing`).
+
+### Stack
+
+- Library crates do not depend on Leptos, Axum, HTTP, JWT delivery, or
+  SMTP. Both examples (`saas-leptos`, `axum-minimal`) use the same public
+  contracts; the library is unchanged by the second consumer (Stage 3g).
+- Email delivery (`EmailSender`) is example-local. CSRF is example-local.
+  Cookies are example-local. `AuthLayer` (Stage 4.1d) is example-local
+  (`axum-minimal` only — `saas-leptos` is covered by `#[server]`).
+
+## Non-goals
+
+Explicitly **out of scope** for this reference. A consumer that needs any
+of these should not treat their absence as a bug:
+
+1. **Multi-DB.** PostgreSQL only. A different backend means rewriting
+   almost every crate.
+2. **Generic DAL / repository traits over `PgPool`.** `PgPool` in public
+   signatures is deliberate.
+3. **`RoleStore` / `UserStore` / `Authn` trait / `saas` split (S1–S4).**
+   Replacement is a fork; the two ports cover the common cases.
+4. **Full hexagonal architecture.** Two ports, not "everything is a trait".
+5. **Runtime pluggability (dynamic dispatch for everything).**
+   `Arc<dyn Trait>` only for `AuthorizationEngine` and `AuditLogger`.
+6. **HTTP-framework-specific features in the library.** CSRF, cookie
+   attributes, rate limiting, IP/user-agent, email transport — all at the
+   consumer.
+7. **`no_std` / zero-copy.**
+8. **Distributed transactions / 2PC.** ADR-0003 (A-lite) records the
+   trade-off; cross-table tx is `Stage 4+` conditional on compliance
+   requirements.
+
+## Compatibility
+
+All `crates/*` share **one version** (`[workspace.package] version =
+"0.1.0"`). Consumers must pin every path / git dependency to the same
+revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change
+log.
+
 ## License
 
 See the `LICENSE` file in the root of the repository.

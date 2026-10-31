@@ -168,3 +168,79 @@ async fn log_actor_id_on_delete_set_null(pool: PgPool) {
         "denormalized actor_email must survive"
     );
 }
+// ─── Stage 4.3c: per-crate MIGRATOR ────────────────────────────────────────
+
+/// `audit_pg::MIGRATOR` builds the schema a standalone consumer needs:
+/// `000_users_bootstrap.sql` (FK target for `audit_log.actor_id`) and
+/// `001_audit_log.sql` (table + indexes). `#[sqlx::test]` (no `migrations = …`)
+/// gives an **empty** database — exactly what a partial consumer starts
+/// from.
+///
+/// Composition with `db::migrate` is *not* tested here on purpose: sqlx
+/// rejects mixing two `Migrator`s on one database (`VersionMissing`), and
+/// `crates/db/src/lib.rs::migrate_with` documents that a consumer picks
+/// one path per database.
+#[sqlx::test]
+async fn migrator_builds_standalone_schema(pool: PgPool) {
+    audit_pg::MIGRATOR
+        .run(&pool)
+        .await
+        .expect("per-crate MIGRATOR must build audit_log + users bootstrap");
+
+    // `users` exists (migration `000_…`).
+    let has_users: bool = sqlx::query_scalar(
+        "select exists (select 1 from information_schema.tables where table_name = 'users')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_users, "000_users_bootstrap must have run");
+
+    // `audit_log` exists (migration `001_…`).
+    let has_audit: bool = sqlx::query_scalar(
+        "select exists (select 1 from information_schema.tables where table_name = 'audit_log')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_audit, "001_audit_log must have run");
+
+    // End-to-end: an insert via `PgAuditLogger` lands in `audit_log`.
+    let logger = PgAuditLogger::from_pool(pool.clone());
+    logger
+        .log(&AuditEvent::new("stage4_3c.standalone"))
+        .await
+        .expect("insert via standalone schema");
+
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from audit_log where event_type = 'stage4_3c.standalone'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// `MIGRATOR` is idempotent: a second `run()` against the same database is
+/// a no-op (sqlx skips versions already recorded in `_sqlx_migrations`).
+/// This is *within* one migrator, not composition with `db::migrate`.
+#[sqlx::test]
+async fn migrator_is_idempotent_on_repeat_run(pool: PgPool) {
+    audit_pg::MIGRATOR
+        .run(&pool)
+        .await
+        .expect("first MIGRATOR run");
+    audit_pg::MIGRATOR
+        .run(&pool)
+        .await
+        .expect("second MIGRATOR run must be a no-op");
+
+    let versions: i64 =
+        sqlx::query_scalar("select count(*) from _sqlx_migrations where success = true")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        versions, 2,
+        "exactly the two per-crate migrations (000, 001) must be recorded"
+    );
+}
