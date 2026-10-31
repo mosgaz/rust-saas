@@ -1264,3 +1264,66 @@ async fn email_verified_emits_user_email_verified(pool: PgPool) {
     assert_eq!(*target_id, Some(user.id));
     assert_eq!(metadata, &serde_json::json!({}));
 }
+// ─── Stage 4.1: iat-vs-`password_changed_at` ────────────────────────────────
+
+/// Stage 4.1: an access token issued **before** a password reset is
+/// rejected by `verify_token` (its `iat` is older than
+/// `users.password_changed_at`). Closes the gap where a stolen access-token
+/// survived a `reset_password` for up to `access_ttl`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_token_rejects_token_issued_before_password_change(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("vt-before-reset");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let old_token = authn.issue_access_token(&user).unwrap();
+
+    // Both `iat` and `password_changed_at` are second-precision; 1.1s
+    // guarantees they land in different seconds.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+    authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("reset");
+
+    let err = authn
+        .verify_token(&old_token)
+        .await
+        .expect_err("token issued before password change must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+}
+
+/// Stage 4.1: an access token issued **after** a password reset is
+/// accepted. Sanity check — the new check must not break the normal flow.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_token_accepts_token_issued_after_password_change(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("vt-after-reset");
+    authn.register(&email, "Password123!").await.unwrap();
+
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+
+    let user = authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("reset");
+
+    // Issue the token *after* the reset so `iat >= password_changed_at`
+    // (the `<=` side: same-second is accepted).
+    let fresh_token = authn.issue_access_token(&user).unwrap();
+    let verified = authn
+        .verify_token(&fresh_token)
+        .await
+        .expect("fresh token must verify")
+        .expect("user must be found");
+    assert_eq!(verified.id, user.id);
+}

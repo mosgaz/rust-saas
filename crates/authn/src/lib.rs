@@ -32,8 +32,9 @@
 //! `users.password_hash` and `users.password_changed_at = now()` (via
 //! `identity::update_password_tx`), expires every outstanding reset token
 //! for the user, and revokes every refresh-token family
-//! ([`RevokeReason::PasswordReset`]). Access JWTs remain valid until their
-//! short `exp`; iat-vs-`password_changed_at` enforcement is Stage 4.
+//! ([`RevokeReason::PasswordReset`]). Access JWTs issued before the change
+//! are rejected by [`Authn::verify_token`] via the iat-vs-
+//! `password_changed_at` check (Stage 4.1).
 //!
 //! Stage 3e: audit events (ADR-0004). [`Authn`] carries an
 //! `Arc<dyn AuditLogger>` (default [`NoopAuditLogger`]). After a successful
@@ -962,8 +963,27 @@ impl Authn {
             Err(_) => return Ok(None),
         };
 
-        let user = identity::find_by_id(&self.pool, id).await?;
-        Ok(user)
+        // Stage 4.1: extract `iat` before the DB hit — a token without
+        // `iat` cannot be iat-checked, so reject it as malformed.
+        let Some(iat) = data.claims.get("iat").and_then(|v| v.as_i64()) else {
+            return Err(AuthnError::TokenInvalid);
+        };
+
+        let record = identity::find_record_by_id(&self.pool, id).await?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+
+        // Reject access tokens issued before the last password change.
+        // `iat` is seconds; `password_changed_at` is compared at the same
+        // granularity. A token issued in the same second as a reset is
+        // accepted — the 1-second window is far narrower than the
+        // 15-minute `access_ttl` this closes.
+        if iat < record.password_changed_at.timestamp() {
+            return Err(AuthnError::TokenInvalid);
+        }
+
+        Ok(Some(record.into()))
     }
 }
 
@@ -1188,12 +1208,36 @@ mod tests {
         assert!(result.is_none());
     }
 
+
     #[tokio::test]
     async fn verify_token_rejects_garbage() {
         let err = authn("secret")
             .verify_token("not.a.jwt")
             .await
             .expect_err("verify must reject");
+        assert!(matches!(err, AuthnError::TokenInvalid));
+    }
+
+    #[tokio::test]
+    async fn verify_token_rejects_missing_iat() {
+        // Stage 4.1: `iat` is required — without it the iat-vs-
+        // `password_changed_at` check cannot run. Reject before any DB hit.
+        let secret = "missing-iat-secret";
+        let now = Utc::now().timestamp();
+        let claims = json!({
+            "sub": Uuid::new_v4().to_string(),
+            "exp": now + 3600,
+        });
+        let token = jsonwebtoken::encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode");
+        let err = authn(secret)
+            .verify_token(&token)
+            .await
+            .expect_err("missing iat must be rejected");
         assert!(matches!(err, AuthnError::TokenInvalid));
     }
 }
