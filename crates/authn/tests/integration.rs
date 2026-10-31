@@ -17,11 +17,11 @@
 use std::sync::Arc;
 
 use audit_pg::PgAuditLogger;
+use authn::IdentityErrorKind;
 use authn::{
     Authn, AuthnError, EMAIL_VERIFICATION_TTL_HOURS, PASSWORD_RESET_TTL_HOURS,
     REFRESH_GRACE_SECONDS,
 };
-use identity::IdentityError;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -98,7 +98,7 @@ async fn register_duplicate_email_fails(pool: PgPool) {
         .await
         .expect_err("register must fail");
     assert!(
-        matches!(err, AuthnError::Identity(IdentityError::DuplicateEmail)),
+        matches!(err, AuthnError::Identity(IdentityErrorKind::DuplicateEmail)),
         "got {err:?}"
     );
 }
@@ -949,7 +949,7 @@ async fn reset_password_short_password_returns_validation(pool: PgPool) {
     assert!(
         matches!(
             err,
-            AuthnError::Identity(IdentityError::Validation(_))
+            AuthnError::Identity(IdentityErrorKind::Validation(_))
         ),
         "got {err:?}"
     );

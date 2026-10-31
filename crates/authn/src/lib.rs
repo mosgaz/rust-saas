@@ -82,6 +82,18 @@ use uuid::Uuid;
 
 use identity::{IdentityError, UserRecord};
 
+impl From<sqlx::Error> for AuthnError {
+    fn from(e: sqlx::Error) -> Self {
+        AuthnError::Db(e.to_string())
+    }
+}
+
+impl From<IdentityError> for AuthnError {
+    fn from(e: IdentityError) -> Self {
+        AuthnError::Identity(IdentityErrorKind::from(e))
+    }
+}
+
 /// Default access-token lifetime (Stage 2b). Can be overridden per instance
 /// via [`Authn::with_ttl`].
 pub const DEFAULT_ACCESS_TTL_MINUTES: i64 = 15;
@@ -110,6 +122,34 @@ pub const EMAIL_VERIFICATION_TTL_HOURS: i64 = 24;
 /// Password-reset token lifetime (Stage 3d): 1 hour.
 pub const PASSWORD_RESET_TTL_HOURS: i64 = 1;
 
+/// Public projection of `identity::IdentityError`: carries only the
+/// variants that are meaningful to a caller of `authn`. The opaque `Db`
+/// and the free-form `Internal` are folded into `Internal(String)` so that
+/// `authn` does not expose `IdentityError` as a type (Stage 4.2,
+/// `COMPATIBILITY.md`).
+#[derive(Debug, thiserror::Error)]
+pub enum IdentityErrorKind {
+    #[error("user not found")]
+    NotFound,
+    #[error("email already registered")]
+    DuplicateEmail,
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("internal identity error: {0}")]
+    Internal(String),
+}
+
+impl From<IdentityError> for IdentityErrorKind {
+    fn from(e: IdentityError) -> Self {
+        match e {
+            IdentityError::NotFound => IdentityErrorKind::NotFound,
+            IdentityError::DuplicateEmail => IdentityErrorKind::DuplicateEmail,
+            IdentityError::Validation(s) => IdentityErrorKind::Validation(s),
+            IdentityError::Db(s) => IdentityErrorKind::Internal(s),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthnError {
     #[error("invalid credentials")]
@@ -131,10 +171,10 @@ pub enum AuthnError {
     AlreadyVerified,
     #[error("internal authentication error: {0}")]
     Internal(String),
-    #[error(transparent)]
-    Identity(#[from] IdentityError),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("identity error: {0}")]
+    Identity(IdentityErrorKind),
+    #[error("db error: {0}")]
+    Db(String),
 }
 
 /// Reason recorded in `refresh_tokens.revoked_reason` (Stage 3b). The column
@@ -598,7 +638,7 @@ impl Authn {
                 .await?;
 
         let Some(verified_at) = verified_at else {
-            return Err(AuthnError::Identity(IdentityError::NotFound));
+            return Err(AuthnError::Identity(IdentityErrorKind::NotFound));
         };
 
         if verified_at.is_some() {

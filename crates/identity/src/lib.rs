@@ -31,8 +31,8 @@ pub enum IdentityError {
     DuplicateEmail,
     #[error("validation error: {0}")]
     Validation(String),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("db error: {0}")]
+    Db(String),
 }
 
 /// Full `users` row, including `password_hash`, `email_verified_at`, and
@@ -62,6 +62,12 @@ impl From<UserRecord> for AuthUser {
             email_verified: r.email_verified_at.is_some(),
             created_at: r.created_at,
         }
+    }
+}
+
+impl From<sqlx::Error> for IdentityError {
+    fn from(e: sqlx::Error) -> Self {
+        IdentityError::Db(e.to_string())
     }
 }
 
@@ -168,7 +174,7 @@ pub async fn create_user(
         sqlx::Error::Database(db) if db.constraint() == Some("users_email_key") => {
             IdentityError::DuplicateEmail
         }
-        other => IdentityError::Db(other),
+        other => IdentityError::Db(other.to_string()),
     })
 }
 

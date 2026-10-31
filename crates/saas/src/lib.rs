@@ -85,8 +85,17 @@ pub enum CoreError {
     Validation(String),
     #[error("internal error: {0}")]
     Internal(String),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("db error: {0}")]
+    /// Opaque DB failure. `String` (not `sqlx::Error`) so that a consumer
+    /// does not need `sqlx` in its dependency tree just to pattern-match
+    /// this variant (Stage 4.2, `COMPATIBILITY.md`).
+    Db(String),
+}
+
+impl From<sqlx::Error> for CoreError {
+    fn from(e: sqlx::Error) -> Self {
+        CoreError::Db(e.to_string())
+    }
 }
 
 impl From<AuthzError> for CoreError {
