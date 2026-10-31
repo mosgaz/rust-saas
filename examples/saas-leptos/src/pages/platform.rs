@@ -6,6 +6,9 @@
 //! (route `/platform/audit`) — read-only view of the most recent audit
 //! rows.
 //!
+//! Stage 3h: `PlatformTenantListPage` reads `my_permissions("platform")`
+//! through `PermsCache` (TTL 30s) for consistency with other pages.
+//!
 //! **Naming.** The component is `PlatformTenantListPage`, not
 //! `PlatformPage` (Stage 3f). The route stays `/platform`; the second page
 //! lives at `/platform/audit`.
@@ -48,6 +51,8 @@ use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::perms_cache::PermsCache;
+
 // ─── Client-side DTO for audit rows ────────────────────────────────────────
 
 /// Client-side mirror of `audit_pg::AuditRow`.
@@ -85,7 +90,7 @@ impl From<audit_pg::AuditRow> for AuditRowView {
     }
 }
 
-// ─── Server functions ───────────────────────────────────────────────────────
+// ─── Server functions ──────────────────────────────────────────────────────
 
 /// Creates a tenant and assigns the current user as its owner.
 ///
@@ -174,7 +179,7 @@ pub async fn list_audit(limit: i64) -> Result<Vec<AuditRowView>, ServerFnError> 
     Ok(rows.into_iter().map(AuditRowView::from).collect())
 }
 
-// ─── `/platform` — tenant list ─────────────────────────────────────────────
+// ─── `/platform` — tenant list ──────────────────────────────────────────────
 
 /// `/platform` — create a tenant (as its owner) and manage the platform
 /// tenant list (suspend / activate).
@@ -186,9 +191,14 @@ pub fn PlatformTenantListPage() -> impl IntoView {
     let name = RwSignal::new(String::new());
     let created = RwSignal::new(None::<Tenant>);
     let error = RwSignal::new(None::<String>);
+    let cache = use_context::<PermsCache>().expect("PermsCache in context");
 
     Effect::new(move |_| {
         let _ = refresh.get();
+        // `PermsCache` is `Clone` but not `Copy`. Clone per invocation so
+        // `Effect::new`'s `move |_|` remains `FnMut`: the async block below
+        // consumes the clone, not the captured `cache`.
+        let cache = cache.clone();
         spawn_local(async move {
             match list_tenants().await {
                 Ok(list) => {
@@ -202,11 +212,16 @@ pub fn PlatformTenantListPage() -> impl IntoView {
             // existing `#[server]` from `pages/member.rs`; it resolves the
             // actor and calls `saas::access::my_permissions` server-side
             // (SSR-only modules never leak into this hydrate-compiled
-            // component).
-            match crate::pages::member::my_permissions(domain::PLATFORM_DOMAIN.to_string()).await {
-                Ok(p) => perms.set(p.into_iter().collect()),
-                Err(_) => perms.set(Default::default()),
-            }
+            // component). Read through `PermsCache` for consistency with
+            // the member/role pages (Stage 3h).
+            let perms_vec = cache
+                .get_or_fetch(domain::PLATFORM_DOMAIN.to_string(), |d| async move {
+                    crate::pages::member::my_permissions(d)
+                        .await
+                        .unwrap_or_default()
+                })
+                .await;
+            perms.set(perms_vec.into_iter().collect());
         });
     });
 

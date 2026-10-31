@@ -28,6 +28,11 @@
 //!
 //! A server-side per-route middleware (defense in depth) is deferred to
 //! Stage 4 — see `handoff.md` §16 and Appendix B §2.49 / §IV.40.
+//!
+//! **Stage 3h:** `PermsCache` provided as context at the root `App`
+//! component. Pages read `my_permissions` through the cache
+//! (`PermsCache::get_or_fetch`) and invalidate it after mutations
+//! (`assign_role`, `remove_role`, `change_role`, role CRUD). TTL 30s.
 
 // Leptos' `view!` macro expands to deeply nested generic types; the default
 // rustc recursion limit (128) is insufficient once `pages/member.rs` grows
@@ -40,6 +45,7 @@ pub mod email;
 pub mod guard;
 pub mod layout;
 pub mod pages;
+pub mod perms_cache;
 
 #[cfg(feature = "ssr")]
 pub mod error;
@@ -57,12 +63,17 @@ use leptos_meta::*;
 use leptos_router::{components::*, path};
 
 use crate::guard::{GuardRoute, RouteGuard};
+use crate::perms_cache::PermsCache;
 
 /// Root component: provides the meta context, mounts the router, and wraps
 /// every page in the global [`layout::Layout`].
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+
+    // Stage 3h: client-side permissions cache, shared across all pages.
+    // Pages call `use_context::<PermsCache>()` to read/invalidate.
+    provide_context(PermsCache::new());
 
     view! {
         <Router>

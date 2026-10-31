@@ -27,6 +27,16 @@
 //! / `tenant.activated` only on a transition), and
 //! `invitation::{create, accept}_invitation` rejecting on a suspended
 //! tenant (before `used_count++` for `accept`).
+//!
+//! Stage 3h adds the "Advisory lock serialization" section:
+//! `owner_guard_race_serialized_by_advisory_lock` — two concurrent
+//! `remove_role` calls targeting the last two holders of a `protected`
+//! role are serialized by the advisory lock; exactly one succeeds, the
+//! other gets `Forbidden`. `advisory_lock_does_not_block_other_roles` —
+//! different `(domain, role_key)` pairs use different lock keys, so two
+//! concurrent `remove_role` calls on different roles both succeed (this
+//! test is a smoke check, not a timing proof — see the test's doc
+//! comment).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1023,12 +1033,13 @@ async fn member_change_role_replaces_role(pool: PgPool) {
         .can(user.id, &ws_domain, "documents", "write")
         .await
         .unwrap();
+    assert!(!can_write, "editor rights must be gone");
+
     let can_read = saas
         .authz()
         .can(user.id, &ws_domain, "documents", "read")
         .await
         .unwrap();
-    assert!(!can_write, "editor rights must be gone");
     assert!(can_read, "viewer rights must be present");
 
     let members = member::list(&saas, &admin, MemberScope::Workspace(ws.id))
@@ -1037,8 +1048,12 @@ async fn member_change_role_replaces_role(pool: PgPool) {
     let entry = members
         .iter()
         .find(|m| m.user_id == user.id)
-        .expect("user must be listed");
-    assert_eq!(entry.roles, vec!["viewer".to_string()]);
+        .expect("user must still be a member");
+    assert_eq!(
+        entry.roles,
+        vec!["viewer".to_string()],
+        "user must hold exactly one role: viewer"
+    );
 }
 
 /// `change_role` with identical keys is a no-op (no `require`, no SQL).
@@ -1507,6 +1522,11 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
 
 /// `saas::access::delete_role` removes the role row, its `g`/`p` rows in
 /// `casbin_rule`, and its `*_members` bookkeeping rows.
+///
+/// NOTE: this test uses the `delete_role(&saas, &actor, role_id)` signature.
+/// If `saas::access::delete_role` has since been changed to take
+/// `(domain, role_key)`, update the call below and drop the unused `role`
+/// binding (`let role = create_role(...)`).
 #[sqlx::test(migrations = "../db/migrations")]
 async fn delete_role_purges_casbin_and_members(pool: PgPool) {
     let saas = setup(&pool).await;
@@ -2555,4 +2575,201 @@ async fn create_invitation_on_suspended_tenant_returns_tenant_suspended(pool: Pg
         .await
         .unwrap();
     assert_eq!(count, 0, "rejected create must not insert an invitation");
+}
+
+// ─── Stage 3h: Advisory lock serialization ──────────────────────────────────
+
+/// Stage 3h (ADR-0003 §2.3): two concurrent `remove_role` calls targeting
+/// the last two holders of a `protected` role must be serialized by the
+/// advisory lock. The first succeeds (count was 2); the second sees
+/// count = 1 and gets `Forbidden`. Without the advisory lock, both could
+/// observe count = 2 and both succeed, leaving the domain without any
+/// holder of the protected role.
+///
+/// IMPLEMENTATION NOTE: `pg_advisory_lock` is session-level. The guard must
+/// hold the lock on the **same** `PoolConnection` for the whole
+/// guard + mutate sequence (or use `pg_advisory_xact_lock` inside a
+/// transaction); otherwise the lock is released together with the
+/// connection between `count_users_with_role` and `revoke_role`, and the
+/// race is not actually serialized. This test is a sentinel for that
+/// property — it does not inspect lock keys directly.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn owner_guard_race_serialized_by_advisory_lock(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(
+        &saas,
+        &admin,
+        unique_name("RaceAcme"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    // Add a second owner so count = 2. Both admins can then try to remove
+    // the other; without the advisory lock, both could succeed.
+    let owner2 = make_user(&pool, "owner2").await;
+    saas_access::assign_role(
+        &saas,
+        &admin,
+        owner2.id,
+        &domain::tenant_domain(tenant.id),
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let tenant_domain = domain::tenant_domain(tenant.id);
+
+    // Sanity: both hold owner.
+    assert!(saas
+        .authz()
+        .has_role(admin.id, &tenant_domain, "owner")
+        .await
+        .unwrap());
+    assert!(saas
+        .authz()
+        .has_role(owner2.id, &tenant_domain, "owner")
+        .await
+        .unwrap());
+
+    // Two admins concurrently try to remove each other's owner role.
+    // Advisory lock on `owner-guard:{domain}:owner` serializes the guard:
+    // the first sees count = 2 and succeeds; the second sees count = 1
+    // and gets Forbidden.
+    let (r1, r2) = tokio::join!(
+        member::remove_role(
+            &saas,
+            &admin,
+            MemberScope::Tenant(tenant.id),
+            owner2.id,
+            &owner_key,
+        ),
+        member::remove_role(
+            &saas,
+            &owner2,
+            MemberScope::Tenant(tenant.id),
+            admin.id,
+            &owner_key,
+        ),
+    );
+
+    // Exactly one must succeed, the other must be Forbidden.
+    let ok_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+    let forbidden_count = [&r1, &r2]
+        .iter()
+        .filter(|r| matches!(r, Err(CoreError::Forbidden)))
+        .count();
+    assert_eq!(
+        ok_count, 1,
+        "exactly one remove_role must succeed; got r1={r1:?}, r2={r2:?}"
+    );
+    assert_eq!(
+        forbidden_count, 1,
+        "exactly one must be Forbidden; got r1={r1:?}, r2={r2:?}"
+    );
+
+    // After the race, exactly one owner must remain.
+    let remaining: i64 = saas
+        .authz()
+        .count_users_with_role(&tenant_domain, "owner")
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1, "exactly one owner must remain after the race");
+}
+
+/// Stage 3h: two concurrent `remove_role` calls on different
+/// `(domain, role_key)` pairs must both succeed. Different lock keys
+/// (`owner-guard:{domain}:owner` vs `owner-guard:{domain}:editor`) must
+/// not serialize or deadlock.
+///
+/// SCOPE NOTE: this is a smoke test, not a timing proof. Both calls succeed
+/// regardless of whether the implementation serializes them, so it only
+/// catches gross failures (a lock on the wrong key that causes `Forbidden`
+/// due to a miscounted guard, or a global-domain lock that deadlocks with
+/// itself). Proving "no serialization" would require holding one key's
+/// advisory lock from a separate connection and observing the other key
+/// proceed; that needs a lock-key helper exposed from the impl.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn advisory_lock_does_not_block_other_roles(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(
+        &saas,
+        &admin,
+        unique_name("LockAcme"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let tenant_domain = domain::tenant_domain(tenant.id);
+
+    // Create a non-protected role `editor` and assign it to a user.
+    let editor_key = RoleKey::parse("editor").unwrap();
+    saas_access::create_role(
+        &saas,
+        &admin,
+        &tenant_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let editor = make_user(&pool, "editor").await;
+    saas_access::assign_role(&saas, &admin, editor.id, &tenant_domain, &editor_key)
+        .await
+        .unwrap();
+
+    // Add a second owner so `remove_role` of the first owner is allowed
+    // (count >= 2 for protected role).
+    let owner2 = make_user(&pool, "owner2").await;
+    saas_access::assign_role(&saas, &admin, owner2.id, &tenant_domain, &owner_key)
+        .await
+        .unwrap();
+
+    // Concurrently: remove owner (protected, count=2) and remove editor
+    // (non-protected). Different advisory lock keys → both must succeed.
+    let (r1, r2) = tokio::join!(
+        member::remove_role(
+            &saas,
+            &admin,
+            MemberScope::Tenant(tenant.id),
+            admin.id,
+            &owner_key,
+        ),
+        member::remove_role(
+            &saas,
+            &admin,
+            MemberScope::Tenant(tenant.id),
+            editor.id,
+            &editor_key,
+        ),
+    );
+
+    r1.expect("removing owner (count=2) must succeed");
+    r2.expect("removing editor (non-protected) must succeed");
+
+    // Both roles were actually removed.
+    assert!(!saas
+        .authz()
+        .has_role(admin.id, &tenant_domain, "owner")
+        .await
+        .unwrap());
+    assert!(!saas
+        .authz()
+        .has_role(editor.id, &tenant_domain, "editor")
+        .await
+        .unwrap());
 }
