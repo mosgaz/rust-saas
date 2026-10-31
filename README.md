@@ -461,6 +461,44 @@ Expected behaviours:
 
 The `axum-minimal` cookie flow (`access_token` / `refresh_token`) and the auto-refresh behaviour are identical to `saas-leptos` (same library calls, same middleware contract); only the transport (JSON vs `#[server]` RPC) and the absence of Leptos differ.
 
+### CSRF (Stage 4.1c)
+
+Two complementary mechanisms, documented side by side because the two
+examples have different transport options:
+
+- **axum-minimal** — CSRF double-submit: csrf cookie (non-HttpOnly) +
+  X-CSRF-Token header. Middleware csrf::csrf_guard rejects mutations
+  (POST/PUT/PATCH/DELETE, except /auth/{register,login,logout}) whose
+  header does not match the cookie. csrf::csrf_issue sets the cookie on
+  the first request to the router.
+- **saas-leptos** — SameSite=Lax on auth cookies plus
+  middleware::same_origin_guard on the protected router. Leptos
+  #[server] does not expose a hook to inject a custom header into every
+  RPC, so the guard compares Origin authority with Host authority for
+  mutations and rejects a mismatch. Requests without Origin (non-browser
+  clients: curl, SSR probes) pass through.
+
+Full double-submit for saas-leptos is deliberately deferred — it would
+require forking Leptos' server_fn client pipeline. Origin-check plus
+SameSite=Lax covers the same attack class. Recorded in
+internal-docs/sass-19.md §16.
+
+Smoke — axum-minimal:
+
+    # 1. First request sets the csrf cookie.
+    curl -i http://127.0.0.1:3395/tenants -c /tmp/cj.txt | grep -i 'set-cookie: csrf'
+
+    # 2. Mutation without the header -> 403 on protected routes.
+    curl -i -X POST http://127.0.0.1:3395/tenants -H 'Content-Type: application/json' -d '{"name":"Smoke"}' -b /tmp/cj.txt | head -1
+
+    # 3. Same request with the header -> 200 (or 401 if not logged in).
+    CSRF=$(awk '$6=="csrf" {print $7}' /tmp/cj.txt)
+    curl -i -X POST http://127.0.0.1:3395/tenants -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{"name":"Smoke"}' -b /tmp/cj.txt | head -1
+
+Smoke — saas-leptos:
+
+    curl -i -X POST http://127.0.0.1:3395/_server/create_tenant -H 'Origin: https://evil.example' -H 'Content-Type: application/json' -d '{}' -b /tmp/cj.txt | head -1
+    # HTTP/1.1 403 Forbidden
 ### Checking the build
 
 From the repository root:

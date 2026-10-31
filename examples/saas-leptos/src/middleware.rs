@@ -161,3 +161,130 @@ fn set_cookie_names(response: &Response) -> HashSet<String> {
     }
     names
 }
+// ─── Stage 4.1c: Origin/Host same-origin guard ─────────────────────────────
+
+/// Rejects cross-origin mutation requests on the protected router
+/// (`/_server/*` RPC and SSR pages). This is the `saas-leptos`
+/// counterpart of `axum-minimal`'s CSRF double-submit:
+///
+/// - **`axum-minimal`** — `csrf` cookie + `X-CSRF-Token` header
+///   (`examples/axum-minimal/src/csrf.rs`).
+/// - **`saas-leptos`** — Leptos `#[server]` does not expose a
+///   server-function client hook that would let us inject a custom header
+///   into every call. Instead, `SameSite=Lax` on `access_token` /
+///   `refresh_token` already blocks cross-site form submits and `img`-GET
+///   side effects; the remaining hole is a top-level navigation that
+///   `Lax` permits. `Origin` is sent by every browser on `POST` /
+///   `PUT` / `PATCH` / `DELETE`, so comparing its authority with `Host`
+///   closes that hole without touching the Leptos pipeline.
+///
+/// Contract:
+/// - Non-mutating methods pass through.
+/// - Missing `Origin` (non-browser clients: `curl`, SSR probes) — pass
+///   through. A CSRF attacker is a **browser**, and browsers always send
+///   `Origin` on cross-origin mutations.
+/// - `Origin` authority ≠ `Host` authority — reject with 403.
+/// - `Origin` authority = `Host` authority (ignoring scheme) — pass
+///   through.
+///
+/// Authority comparison ignores the scheme (`https://` vs `http://`) so
+/// that a reverse proxy terminating TLS in front of an HTTP backend does
+/// not cause false positives. Ports are kept (`localhost:3395` ≠
+/// `localhost:3396`), which is the correct semantic for CSRF.
+pub async fn same_origin_guard(req: Request, next: Next) -> Response {
+    use axum::http::Method;
+
+    let is_mutation = matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if !is_mutation {
+        return next.run(req).await;
+    }
+
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // `Origin: null` (opaque origin, e.g. sandboxed iframe or some
+    // redirects) — reject explicitly; a legitimate app never sends it.
+    if let Some(o) = origin.as_deref() {
+        if o == "null" {
+            return cross_origin_forbidden();
+        }
+        let origin_authority = o.splitn(2, "://").nth(1).unwrap_or(o);
+        match host.as_deref() {
+            Some(h) if origin_authority == h => next.run(req).await,
+            Some(_) => cross_origin_forbidden(),
+            // No `Host` header (HTTP/1.0 without host, or malformed).
+            // Fail closed if we have an `Origin` but no `Host` to compare
+            // against — otherwise an attacker could strip `Host` via a
+            // proxy misconfiguration.
+            None => cross_origin_forbidden(),
+        }
+    } else {
+        // No `Origin` header — non-browser client. Browsers send `Origin`
+        // on every `POST`/`PUT`/`PATCH`/`DELETE`; missing `Origin` here
+        // means the caller is not a browser, and a CSRF attack requires a
+        // browser. Pass through.
+        next.run(req).await
+    }
+
+}
+
+
+/// Rejection response for cross-origin mutations — same body shape as
+/// `AppError`: `{"error": "..."}`.
+fn cross_origin_forbidden() -> Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": "cross-origin request rejected" })),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod origin_guard_tests {
+    //! Unit-testable pieces of `same_origin_guard`: authority extraction
+    //! and the mutation-method predicate. The middleware itself is
+    //! exercised end-to-end in the README smoke checklist (curl against a
+    //! running instance).
+
+    fn authority(origin: &str) -> &str {
+        origin.splitn(2, "://").nth(1).unwrap_or(origin)
+    }
+
+    #[test]
+    fn authority_strips_scheme() {
+        assert_eq!(authority("https://example.com"), "example.com");
+        assert_eq!(authority("http://localhost:3395"), "localhost:3395");
+    }
+
+    #[test]
+    fn authority_keeps_port() {
+        assert_ne!(authority("http://localhost:3395"), "localhost:3396");
+    }
+
+    #[test]
+    fn same_origin_passes() {
+        let origin = "http://localhost:3395";
+        let host = "localhost:3395";
+        assert_eq!(authority(origin), host);
+    }
+
+    #[test]
+    fn cross_origin_fails() {
+        let origin = "https://evil.example";
+        let host = "localhost:3395";
+        assert_ne!(authority(origin), host);
+    }
+}

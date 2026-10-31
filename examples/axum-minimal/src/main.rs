@@ -64,6 +64,7 @@ use tower_http::trace::TraceLayer;
 mod audit;
 mod auth;
 mod cookie;
+mod csrf;
 mod email;
 mod error;
 mod extract;
@@ -187,7 +188,8 @@ async fn main() -> anyhow::Result<()> {
             get(workspace::list_documents).post(workspace::create_document),
         )
         .route("/audit", get(audit::list_audit))
-        .route_layer(from_fn_with_state(app_state.clone(), middleware::auto_refresh));
+        .route_layer(from_fn_with_state(app_state.clone(), middleware::auto_refresh))
+        .route_layer(axum::middleware::from_fn(csrf::csrf_guard));
 
     let public: Router<Arc<AppState>> = Router::new()
         .route("/auth/register", post(auth::register))
@@ -197,6 +199,12 @@ async fn main() -> anyhow::Result<()> {
     let router = protected
         .merge(public)
         .layer(TraceLayer::new_for_http())
+        // Stage 4.1c: issue a `csrf` cookie on the first request
+        // (runs after the handler; if the client already has one, no-op).
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            csrf::csrf_issue,
+        ))
         .with_state(app_state);
 
     // ── Serve ──────────────────────────────────────────────────────────────

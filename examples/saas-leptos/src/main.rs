@@ -157,6 +157,12 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(axum::middleware::from_fn_with_state(
             (authn, cookie_cfg),
             saas_leptos::middleware::auto_refresh,
+        ))
+        // Stage 4.1c: reject cross-origin mutations on /_server/* and SSR
+        // pages. SameSite=Lax on auth cookies is the first line; the
+        // Origin/Host check covers top-level navigations that Lax permits.
+        .route_layer(axum::middleware::from_fn(
+            saas_leptos::middleware::same_origin_guard,
         ));
 
     let public: Router<saas_leptos::state::AppState> = Router::new().fallback(
