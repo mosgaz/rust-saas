@@ -2773,3 +2773,87 @@ async fn advisory_lock_does_not_block_other_roles(pool: PgPool) {
         .await
         .unwrap());
 }
+// ─── Stage 4.0: `role.deleted` audit emission ──────────────────────────────
+
+/// Stage 4.0: `saas::access::delete_role` is the canonical emission point
+/// for `role.deleted` (decision A, Stage 3e). The direct
+/// `access::delete_role` deliberately does not emit — it leaves orphans in
+/// `casbin_rule` / `*_members` and would misreport a partial delete.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn delete_role_emits_role_deleted(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(
+        &saas,
+        &admin,
+        unique_name("AuditAcme"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("AuditEng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let temp_key = RoleKey::parse("temp").unwrap();
+    let role = saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &temp_key,
+        "Temp".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let before: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    saas_access::delete_role(&saas, &admin, role.id)
+        .await
+        .expect("delete_role must succeed");
+
+    let rows: Vec<(
+        String,
+        Option<Uuid>,
+        Option<String>,
+        Option<Uuid>,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        r#"
+        select event_type, actor_id, target_type, target_id, metadata
+        from audit_log
+        order by occurred_at asc, id asc
+        offset $1
+        "#,
+    )
+    .bind(before)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 1, "delete_role must emit exactly one role.deleted");
+    let (event_type, actor_id, target_type, target_id, metadata) = &rows[0];
+    assert_eq!(event_type, "role.deleted");
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(target_type.as_deref(), Some("role"));
+    assert_eq!(*target_id, Some(role.id));
+    assert_eq!(metadata["domain"], ws_domain.as_str());
+    assert_eq!(metadata["key"], "temp");
+}

@@ -162,7 +162,6 @@ dependencies = [
  "async-trait",
  "authz",
  "casbin",
- "domain",
  "sqlx",
  "sqlx-adapter",
  "thiserror 2.0.21",
@@ -1538,6 +1537,22 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rust-saas"
+version = "0.1.0"
+dependencies = [
+ "access",
+ "audit",
+ "audit-pg",
+ "authn",
+ "authz",
+ "authz-casbin",
+ "db",
+ "domain",
+ "identity",
+ "saas",
 ]
 
 [[package]]
