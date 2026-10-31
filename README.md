@@ -407,6 +407,52 @@ Then in the browser:
 21. **Wait 15+ minutes** — auto-refresh rotates the refresh token.
 22. Rate limits: `request_email_verification` — 3/hour per email; `request_password_reset` — 5/hour per email.
 
+### Run the `saas-leptos` Docker image
+
+The image `rust-saas/saas-leptos:<tag>` is a self-contained build of the
+reference app. It **does not** run migrations or seed on its own — the
+contract is the same as the dev flow: `docker compose up -d` +
+`cargo run -p seed`, then the container.
+
+From the repository root:
+
+```bash
+# 1. Start PostgreSQL (and Mailpit) — same compose as dev.
+docker compose up -d
+
+# 2. Apply migrations and seed demo data.
+#    Seed reads DATABASE_URL from .env (default:
+#    postgres://postgres:postgres@localhost:5430/rust_saas), which maps to
+#    the `postgres` service on the compose network.
+cargo run -p seed
+
+# 3. Start the container on the compose network so it can reach
+#    postgres:5432 inside the network.
+docker run --rm -d --name saas-leptos \
+  --network rust-saas_rust_saas_net \
+  -e DATABASE_URL='postgres://postgres:postgres@postgres:5432/rust_saas' \
+  -e JWT_SECRET='change-me' \
+  -p 3395:3395 \
+  rust-saas/saas-leptos:<tag>
+```
+
+Open `http://127.0.0.1:3395` and sign in with a seed account
+(`platform-admin@example.test` / `PlatformAdmin123!`).
+
+If you skip step 2, the app boots but there are no users — `/login`
+rejects every attempt, and pages that need an actor render the anonymous
+state. Run `cargo run -p seed` and retry.
+
+A small fail-fast smoke test is available at
+`examples/saas-leptos/smoke.sh` — it starts the image, checks SSR +
+static assets + seed presence, and stops the container. Run it from
+`examples/saas-leptos/`:
+
+```bash
+./smoke.sh
+# override IMAGE=<tag> to test another build
+```
+
 ### Run the `axum-minimal` example (Stage 3g)
 
 The second example is also outside the workspace and has its own manifest. It uses the same database and seed data as `saas-leptos`, so run `cargo run -p seed` once (from the repository root) before starting it.
@@ -515,7 +561,7 @@ From the repository root:
 cargo test
 ```
 
-**129 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+43 = 54; `access` 0+6 = 6; `authz-casbin` 0+11 = 11; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`).
+**130 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+43 = 54; `access` 0+6 = 6; `authz-casbin` 0+11 = 11; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`).
 
 Stage 3g (`axum-minimal`) does **not** change the library test counter — `crates/*` is untouched (0 migrations, 0 breaking changes, 0 new library tests). The example ships no `tests/` directory (binary-only crate; the plan marks example smoke tests optional). Its smoke coverage is the curl checklist above, which exercises the same `saas::*` / `authn::*` calls as `saas-leptos`.
 
