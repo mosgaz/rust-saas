@@ -1,6 +1,16 @@
 //! Workspace pages: the list of workspaces the current user belongs to, a
 //! single-workspace page (documents + links to invitations/members/roles),
 //! and a single-document page.
+//!
+//! **Stage 3f (ADR-0002 rev.2):** `create_document` resolves the tenant
+//! that owns the workspace (via `SELECT tenant_id FROM workspaces WHERE
+//! id = $1`) and calls `saas::platform::resolve_active_tenant` before
+//! delegating to `saas::workspace::create_document`. A non-member or a
+//! member of a suspended tenant gets HTTP 403 (`Forbidden` /
+//! `TenantSuspended`). Reads (`list_documents`, `get_document`,
+//! `list_my_workspaces`) do **not** resolve — see the module doc on
+//! `pages::tenant` for the reasoning (history is readable; UI gating is
+//! convenience, backend `require` is authoritative).
 
 use domain::Document;
 use leptos::callback::Callback;
@@ -16,6 +26,8 @@ use crate::pages::member::my_permissions;
 // ─── Server functions ───────────────────────────────────────────────────────
 
 /// Lists workspaces the current user is a member of.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_my_workspaces() -> Result<Vec<domain::Workspace>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -26,16 +38,25 @@ pub async fn list_my_workspaces() -> Result<Vec<domain::Workspace>, ServerFnErro
 }
 
 /// Creates a document in a workspace.
+///
+/// Stage 3f: resolves the tenant that owns the workspace first
+/// (membership + active status); a suspended tenant returns
+/// `TenantSuspended` (HTTP 403). See the module doc.
 #[server]
 pub async fn create_document(workspace_id: Uuid, title: String) -> Result<Document, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+
+    let _tenant_id = resolve_ws_tenant(&state, &user, workspace_id).await?;
+
     saas::workspace::create_document(&state.saas, &user, workspace_id, title)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Lists documents in a workspace.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -46,6 +67,8 @@ pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerF
 }
 
 /// Gets a single document.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn get_document(
     workspace_id: Uuid,
@@ -56,6 +79,39 @@ pub async fn get_document(
     saas::workspace::get_document(&state.saas, &user, workspace_id, document_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
+}
+
+/// Resolves the tenant that owns `workspace_id` and verifies it is active
+/// for `user` (Stage 3f).
+///
+/// Two steps: (1) `SELECT tenant_id FROM workspaces WHERE id = $1`
+/// (`NotFound` if the workspace is gone); (2) `saas::platform::resolve_active_tenant`
+/// (membership + `status = 'active'`). Returns the tenant id — the caller
+/// does not need it today, but keeping the return value makes the helper
+/// usable from other mutations that must pass `tenant_id` downstream.
+///
+/// `#[cfg(feature = "ssr")]` — the helper reads `AppState.saas` and calls
+/// into `saas::platform::*`; both are SSR-only. It is called from
+/// `#[server]`-functions, which are also SSR-only at runtime.
+#[cfg(feature = "ssr")]
+async fn resolve_ws_tenant(
+    state: &crate::state::AppState,
+    user: &domain::AuthUser,
+    workspace_id: Uuid,
+) -> Result<Uuid, ServerFnError> {
+    let tenant_id: Option<Uuid> =
+        sqlx::query_scalar("select tenant_id from workspaces where id = $1")
+            .bind(workspace_id)
+            .fetch_optional(state.saas.pool())
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tenant_id = tenant_id
+        .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
+
+    let active = saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(active.id)
 }
 
 // ─── Document list (nested) ─────────────────────────────────────────────────
@@ -242,9 +298,13 @@ struct WorkspaceParams {
     workspace_id: Uuid,
 }
 
-/// `/workspaces/:workspace_id` — single workspace page: document list, create
-/// form (only when permitted), and links to invitations/members/roles (only
-/// when permitted).
+/// `/workspaces/:workspace_id` — single workspace page: document list,
+/// create form (only when permitted), and links to invitations/members/
+/// roles (only when permitted).
+///
+/// `my_permissions` is read-only and does not resolve the tenant; the
+/// `create_document` server function itself rejects with `TenantSuspended`
+/// (HTTP 403) when the tenant is not active.
 #[component]
 pub fn WorkspacePage() -> impl IntoView {
     let params = use_params::<WorkspaceParams>();

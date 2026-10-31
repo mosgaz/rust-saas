@@ -13,6 +13,16 @@
 //! Role key is passed to the server as a raw string and parsed into
 //! `access::RoleKey` server-side; the client never sees `access` types
 //! (`access` is SSR-only).
+//!
+//! **Stage 3f (ADR-0002 rev.2):** `assign_member_role` and
+//! `remove_member_role` resolve the tenant that owns the domain before
+//! delegating to `saas::member::*`. For a tenant domain the id comes
+//! directly from the string; for a workspace domain the server does a
+//! `SELECT tenant_id FROM workspaces WHERE id = $1`. A suspended tenant
+//! yields `TenantSuspended` (HTTP 403); a non-member yields `Forbidden`.
+//! `list_members` and `my_permissions` are read-only and stay outside the
+//! resolution path (a suspended tenant must still allow reading its
+//! history — see the `pages::tenant` module doc).
 
 use std::collections::HashSet;
 
@@ -32,6 +42,8 @@ use access::RoleKey;
 
 /// Lists members of the domain identified by `domain`
 /// (`tenant:{uuid}` or `workspace:{uuid}`).
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_members(domain: String) -> Result<Vec<Member>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -43,6 +55,8 @@ pub async fn list_members(domain: String) -> Result<Vec<Member>, ServerFnError> 
 }
 
 /// Returns the actor's effective permissions in `domain`.
+///
+/// Read-only UX helper; no `resolve_active_tenant`.
 #[server]
 pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -54,6 +68,9 @@ pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, Ser
 
 /// Assigns `role_key` to `user_id` in `domain` (`(members, manage)` required
 /// via `saas::access::assign_role`).
+///
+/// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
+/// returns `TenantSuspended` (HTTP 403).
 #[server]
 pub async fn assign_member_role(
     domain: String,
@@ -62,6 +79,7 @@ pub async fn assign_member_role(
 ) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
     saas::access::assign_role(&state.saas, &user, user_id, &domain, &key)
         .await
@@ -70,6 +88,9 @@ pub async fn assign_member_role(
 
 /// Removes `role_key` from `user_id` in `domain` (`(members, manage)` required
 /// via `saas::member::remove_role`).
+///
+/// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
+/// returns `TenantSuspended` (HTTP 403).
 #[server]
 pub async fn remove_member_role(
     domain: String,
@@ -78,6 +99,7 @@ pub async fn remove_member_role(
 ) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
     let scope = parse_scope(&domain)?;
     saas::member::remove_role(&state.saas, &user, scope, user_id, &key)
@@ -98,6 +120,43 @@ fn parse_scope(domain: &str) -> Result<saas::member::MemberScope, ServerFnError>
     } else {
         Err(ServerFnError::new(format!("invalid domain: {domain}")))
     }
+}
+
+/// Resolves the tenant that owns `domain` (`tenant:{id}` or
+/// `workspace:{id}`) and verifies it is active for `user` (Stage 3f).
+///
+/// For `workspace:{id}` this performs an extra `SELECT tenant_id FROM
+/// workspaces WHERE id = $1` (`NotFound` if the workspace is gone) before
+/// calling `saas::platform::resolve_active_tenant`. Returns the tenant id;
+/// the caller may ignore it today — keeping it explicit makes the helper
+/// reusable from mutations that must pass `tenant_id` downstream.
+///
+/// `#[cfg(feature = "ssr")]` — calls into `crate::state::AppState` and
+/// `saas::platform::*`, both SSR-only.
+#[cfg(feature = "ssr")]
+pub(crate) async fn resolve_domain_tenant(
+    state: &crate::state::AppState,
+    user: &domain::AuthUser,
+    domain: &str,
+) -> Result<Uuid, ServerFnError> {
+    let tenant_id: Uuid = if let Some(id) = domain.strip_prefix("tenant:") {
+        Uuid::parse_str(id).map_err(|e| ServerFnError::new(e.to_string()))?
+    } else if let Some(id) = domain.strip_prefix("workspace:") {
+        let workspace_id = Uuid::parse_str(id).map_err(|e| ServerFnError::new(e.to_string()))?;
+        let tid: Option<Uuid> = sqlx::query_scalar("select tenant_id from workspaces where id = $1")
+            .bind(workspace_id)
+            .fetch_optional(state.saas.pool())
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        tid.ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?
+    } else {
+        return Err(ServerFnError::new(format!("invalid domain: {domain}")));
+    };
+
+    let active = saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(active.id)
 }
 
 // ─── Shared panel ───────────────────────────────────────────────────────────

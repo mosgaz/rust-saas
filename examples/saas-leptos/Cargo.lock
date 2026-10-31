@@ -175,6 +175,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "audit",
+ "serde",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.21",
  "uuid",
@@ -2793,6 +2795,7 @@ dependencies = [
  "lettre",
  "saas",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "tower-http",

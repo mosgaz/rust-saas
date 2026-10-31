@@ -32,6 +32,27 @@
 //!     you are logged in as Y" and a link to `/login`.
 //!   Link invitations (`email IS NULL`) skip both checks (Stage 2a
 //!   behaviour preserved).
+//!
+//! **Stage 3f (ADR-0002 rev.2):**
+//! - `create_invitation` resolves the tenant via
+//!   [`resolve_invitation_target`] **in addition to** the status check
+//!   inside `saas::invitation::create_invitation` — defense in depth. A
+//!   suspended tenant yields `TenantSuspended` (HTTP 403) from the
+//!   `#[server]` before the service is called; a non-member gets
+//!   `Forbidden`.
+//! - `accept_invitation` does **not** resolve in the `#[server]`: the
+//!   invitation token is the only authorization proof the actor has, and
+//!   the tenant id is not known to the client before the lookup.
+//!   `saas::invitation::accept_invitation` performs the status check
+//!   itself, before incrementing `used_count` (defense in depth preserved
+//!   inside the library).
+//! - `list_invitations` and `revoke_invitation` do **not** resolve: an
+//!   owner must be able to list and revoke stale invitations on a
+//!   suspended tenant (cleanup concern, ADR-0002 rev.2 §2.4).
+//! - `check_invitation` and `get_invitation_info` do **not** resolve: an
+//!   anonymous visitor on `/invitations/:token` gets the invitation's
+//!   existence and status regardless; a subsequent Accept will be rejected
+//!   with `TenantSuspended`.
 
 use domain::{Invitation, InvitationTarget};
 use leptos::prelude::*;
@@ -87,6 +108,10 @@ pub async fn get_invitation_info(token: String) -> Result<Option<Invitation>, Se
 ///
 /// Link invitations (`email IS NULL`) return `None` for the third element:
 /// the raw token is displayed once in the UI and shared out of band.
+///
+/// Stage 3f: resolves the tenant before delegating to
+/// `saas::invitation::create_invitation` (defense in depth — the service
+/// itself also checks `status = 'active'`).
 #[server]
 pub async fn create_invitation(
     target: InvitationTarget,
@@ -96,6 +121,8 @@ pub async fn create_invitation(
 ) -> Result<(Invitation, String, Option<EmailResult>), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+
+    resolve_invitation_target(&state, &user, target).await?;
 
     let (invitation, token) = saas::invitation::create_invitation(
         &state.saas,
@@ -120,6 +147,9 @@ pub async fn create_invitation(
 }
 
 /// Lists invitations for a tenant or workspace, newest first.
+///
+/// Read-only; no `resolve_active_tenant` (cleanup concern — a suspended
+/// tenant must still be listable).
 #[server]
 pub async fn list_invitations(target: InvitationTarget) -> Result<Vec<Invitation>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -130,6 +160,8 @@ pub async fn list_invitations(target: InvitationTarget) -> Result<Vec<Invitation
 }
 
 /// Revokes an invitation (sets `revoked_at`).
+///
+/// Cleanup concern; no `resolve_active_tenant`.
 #[server]
 pub async fn revoke_invitation(
     target: InvitationTarget,
@@ -149,6 +181,11 @@ pub async fn revoke_invitation(
 /// `CoreError::Forbidden` (email mismatch, case-insensitive) before any
 /// mutation; the UI's client-side gating is a convenience, not the security
 /// boundary.
+///
+/// Stage 3f: no `resolve_active_tenant` in this layer — the invitation
+/// token is the only authorization proof, and the tenant id is not known
+/// before the lookup. `saas::invitation::accept_invitation` performs the
+/// status check itself, before `used_count++`.
 #[server]
 pub async fn accept_invitation(token: String) -> Result<Invitation, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -156,6 +193,44 @@ pub async fn accept_invitation(token: String) -> Result<Invitation, ServerFnErro
     saas::invitation::accept_invitation(&state.saas, &user, &token)
         .await
         .map_err(crate::error::core_error_to_server_fn)
+}
+
+/// Resolves the tenant that owns `target` and verifies it is active for
+/// `user` (Stage 3f, `create_invitation` only).
+///
+/// For `InvitationTarget::Tenant(id)` calls `saas::platform::resolve_active_tenant`
+/// directly; for `InvitationTarget::Workspace(id)` first does a
+/// `SELECT tenant_id FROM workspaces WHERE id = $1` (`NotFound` if the
+/// workspace is gone) and then resolves.
+///
+/// `#[cfg(feature = "ssr")]` — calls into `crate::state::AppState` and
+/// `saas::platform::*`, both SSR-only. Invoked from a `#[server]`-function
+/// (SSR-only at runtime).
+#[cfg(feature = "ssr")]
+async fn resolve_invitation_target(
+    state: &crate::state::AppState,
+    user: &domain::AuthUser,
+    target: InvitationTarget,
+) -> Result<(), ServerFnError> {
+    let tenant_id = match target {
+        InvitationTarget::Tenant(id) => id,
+        InvitationTarget::Workspace(id) => {
+            let tid: Option<Uuid> =
+                sqlx::query_scalar("select tenant_id from workspaces where id = $1")
+                    .bind(id)
+                    .fetch_optional(state.saas.pool())
+                    .await
+                    .map_err(|e| ServerFnError::new(e.to_string()))?;
+            tid.ok_or_else(|| {
+                crate::error::core_error_to_server_fn(saas::CoreError::NotFound)
+            })?
+        }
+    };
+
+    saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(())
 }
 
 // ─── Shared panel ───────────────────────────────────────────────────────────

@@ -117,6 +117,7 @@ dependencies = [
  "async-trait",
  "audit",
  "chrono",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror 2.0.21",

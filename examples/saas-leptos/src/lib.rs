@@ -11,6 +11,11 @@
 //! ([`pages::auth::ResetPasswordPage`]). Both are public — no `CurrentUser`
 //! is required; the reset flow ends with a manual redirect to `/login`
 //! (no auto-login).
+//!
+//! Stage 3f renames `PlatformPage` to `PlatformTenantListPage` (route
+//! `/platform` stays) and adds `/platform/audit`
+//! ([`pages::platform::PlatformAuditListPage`]) for the platform-admin
+//! audit view.
 
 // Leptos' `view!` macro expands to deeply nested generic types; the default
 // rustc recursion limit (128) is insufficient once `pages/member.rs` grows
@@ -60,7 +65,14 @@ pub fn App() -> impl IntoView {
                         path=path!("/reset-password/:token")
                         view=pages::auth::ResetPasswordPage
                     />
-                    <Route path=path!("/platform") view=pages::platform::PlatformPage />
+                    <Route
+                        path=path!("/platform")
+                        view=pages::platform::PlatformTenantListPage
+                    />
+                    <Route
+                        path=path!("/platform/audit")
+                        view=pages::platform::PlatformAuditListPage
+                    />
 
                     <Route path=path!("/tenants") view=pages::tenant::TenantListPage />
                     <Route path=path!("/tenants/:tenant_id") view=pages::tenant::TenantPage />

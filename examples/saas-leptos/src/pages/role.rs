@@ -13,6 +13,15 @@
 //! `PermissionCheckboxes`), both in the create form (`RoleListPage`) and in
 //! the edit form (`RoleFormPage`); the wire format to the server stays
 //! `Vec<"resource:action">`.
+//!
+//! **Stage 3f (ADR-0002 rev.2):** `create_role`, `update_role`, and
+//! `delete_role` resolve the tenant that owns the role's domain before
+//! delegating to `saas::access::*`. `create_role` knows the domain directly
+//! (the `#[server]` argument); `update_role` and `delete_role` receive only
+//! `role_id` and must first call `access::get_role_by_id` to learn the
+//! domain. `list_roles`, `get_role`, and `my_permissions` are read-only and
+//! stay outside the resolution path — see the `pages::tenant` module doc
+//! for the reasoning.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -22,6 +31,9 @@ use leptos_router::hooks::{use_navigate, use_params};
 use leptos_router::params::Params;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[cfg(feature = "ssr")]
+use crate::pages::member::resolve_domain_tenant;
 
 // ─── DTOs ───────────────────────────────────────────────────────────────────
 
@@ -61,6 +73,8 @@ impl From<access::Role> for RoleView {
 // ─── Server functions ───────────────────────────────────────────────────────
 
 /// Lists roles in `domain`.
+///
+/// Read-only; no `resolve_active_tenant`.
 #[server]
 pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -76,7 +90,7 @@ pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> 
 /// Uses `access::get_role_by_id` (no `actor`, §5 p.5 helper): any
 /// authenticated user who knows the `role_id` can read its metadata. The
 /// mutation (`update_role`) performs `authz.require(actor, domain,
-/// "roles", "manage")` server-side.
+/// "roles", "manage")` server-side. Read-only; no `resolve_active_tenant`.
 #[server]
 pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -102,6 +116,9 @@ pub async fn list_permissions() -> Result<Vec<(String, String, String)>, ServerF
 }
 
 /// Creates a role. `permissions` are `"resource:action"` pairs.
+///
+/// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
+/// returns `TenantSuspended` (HTTP 403).
 #[server]
 pub async fn create_role(
     domain: String,
@@ -112,6 +129,8 @@ pub async fn create_role(
 ) -> Result<RoleView, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+
+    resolve_domain_tenant(&state, &user, &domain).await?;
 
     let key = access::RoleKey::parse(key).map_err(crate::error::access_error_to_server_fn)?;
     let pairs = parse_permission_pairs(&permissions)?;
@@ -132,6 +151,10 @@ pub async fn create_role(
 
 /// Updates a role's `name`, `description`, and `permissions`. Never `key`
 /// (ADR-0001: `roles.key` is immutable).
+///
+/// Stage 3f: loads the role to learn its domain, then resolves the tenant
+/// that owns it (membership + `status = 'active'`). A suspended tenant
+/// returns `TenantSuspended` (HTTP 403).
 #[server]
 pub async fn update_role(
     role_id: Uuid,
@@ -141,6 +164,15 @@ pub async fn update_role(
 ) -> Result<RoleView, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+
+    let existing = access::get_role_by_id(state.saas.access(), role_id)
+        .await
+        .map_err(crate::error::access_error_to_server_fn)?
+        .ok_or_else(|| {
+            crate::error::core_error_to_server_fn(saas::CoreError::NotFound)
+        })?;
+    resolve_domain_tenant(&state, &user, &existing.domain).await?;
+
     let pairs = parse_permission_pairs(&permissions)?;
 
     let role = saas::access::update_role(&state.saas, &user, role_id, name, description, &pairs)
@@ -150,16 +182,30 @@ pub async fn update_role(
 }
 
 /// Deletes a role.
+///
+/// Stage 3f: loads the role to learn its domain, then resolves the tenant
+/// that owns it. A suspended tenant returns `TenantSuspended` (HTTP 403).
 #[server]
 pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
+
+    let existing = access::get_role_by_id(state.saas.access(), role_id)
+        .await
+        .map_err(crate::error::access_error_to_server_fn)?
+        .ok_or_else(|| {
+            crate::error::core_error_to_server_fn(saas::CoreError::NotFound)
+        })?;
+    resolve_domain_tenant(&state, &user, &existing.domain).await?;
+
     saas::access::delete_role(&state.saas, &user, role_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Returns the actor's effective permissions in `domain`.
+///
+/// Read-only UX helper; no `resolve_active_tenant`.
 #[server]
 pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
