@@ -2,7 +2,7 @@
 
 **rust-saas** is a Rust library and reference application for building multi-tenant SaaS.
 
-The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, and authorization from each other, so they can be reused in other applications through git dependencies. The `examples/saas-leptos` directory contains a reference consumer that combines them with an isomorphic Leptos frontend and an Axum-based backend.
+The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, and authorization from each other, so they can be reused in other applications through git dependencies. The `examples/saas-leptos` directory contains a reference consumer that combines them with an isomorphic Leptos frontend and an Axum-based backend. The `examples/axum-minimal` directory contains a second consumer on pure Axum, without Leptos — the portability proof from Stage 3g.
 
 ## Features
 
@@ -21,6 +21,8 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **Audit log (Stage 3e): `audit` trait crate + `audit-pg` (`PgAuditLogger`); `Authn`/`AccessState`/`SaasState` inject `Arc<dyn AuditLogger>` via `with_audit`; 21 event types; sync after `COMMIT` in a separate transaction; `NoopAuditLogger` fallback for dev / tests / seed; failures are `tracing::warn!` and never fail the business operation.**
 - **Platform admin (Stage 3f): `saas::platform::{list_tenants, suspend_tenant, activate_tenant}` gated by `(tenants, list)` / `(tenants, manage)` in `PLATFORM_DOMAIN`; `/platform` page creates tenants and toggles suspend/activate; `/platform/audit` renders the most recent `audit_log` rows (`(audit, read)`).**
 - **Tenant suspension (Stage 3f): `saas::platform::resolve_active_tenant` + `ActiveTenant` + `CoreError::TenantSuspended`. Mutating `#[server]` calls (`create_workspace`, `create_document`, `create_role`, `update_role`, `delete_role`, `assign_member_role`, `remove_member_role`, `create_invitation`) resolve the tenant first; reads and cleanup (`list_*`, `get_*`, `my_permissions`, `revoke_invitation`) stay available on a suspended tenant. `suspend_tenant` / `activate_tenant` are idempotent and emit `tenant.suspended` / `tenant.activated` only on a transition.**
+- **Client route guards (Stage 3f + follow-up): `examples/saas-leptos/src/guard.rs` — `RouteGuard` enum + monolithic `GuardRoute` + standalone `RequireAuth` / `RequirePermission` / `RequireAnyPermission`. UX-only, not a security boundary; the policy lives next to `<Route>` in `lib.rs`, pages do not know about guards. SSR-correct guard and server-side middleware — Stage 4.**
+- **Second consumer (Stage 3g): `examples/axum-minimal` — pure Axum, no Leptos. Portability proof: the same `saas::*` / `authn::*` / `audit::*` public contracts and the same `resolve_active_tenant` calls in mutation handlers as `saas-leptos`. `CurrentUser` implemented as `axum::extract::FromRequestParts` — a deliberate deviation from ADR-0002 rev.2 §3.8, recorded in `handoff §16`. 11 endpoints (`/auth/{register,login,logout,refresh}`, `/tenants`, `/workspaces`, `/documents`, `/audit`); `NoopEmailSender` (no SMTP transport).**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
@@ -74,11 +76,20 @@ crates/                  (library — the Cargo workspace)
 └── seed/               Bootstrap data and demo accounts (all email-verified)
 
 examples/                (reference consumers — outside the workspace)
-└── saas-leptos/        Leptos SSR + Axum + #[server] + middleware + cookies
-                        + SMTP transport (lettre, 10s timeout) + in-memory rate limiter
-                        + forgot-password / reset-password pages
-                        + /platform + /platform/audit (platform admin)
-                        + PgAuditLogger wired through Authn / AccessState / SaasBuilder
+├── saas-leptos/        Leptos SSR + Axum + #[server] + middleware + cookies
+│                       + SMTP transport (lettre, 10s timeout) + in-memory rate limiter
+│                       + forgot-password / reset-password pages
+│                       + /platform + /platform/audit (platform admin)
+│                       + PgAuditLogger wired through Authn / AccessState / SaasBuilder
+│                       + client route guards (Stage 3f + follow-up)
+└── axum-minimal/       Stage 3g: pure Axum, no Leptos — portability proof
+                        + CurrentUser via axum::extract::FromRequestParts
+                        + 11 endpoints: /auth/{register,login,logout,refresh},
+                          GET|POST /tenants, GET|POST /workspaces,
+                          GET|POST /documents, GET /audit
+                        + auto_refresh on the protected router (public routes bypass it)
+                        + NoopEmailSender (no SMTP transport)
+                        + same resolve_active_tenant in mutation handlers as saas-leptos
 ```
 
 `examples/*` is listed in `workspace.exclude`; each example has its own `Cargo.toml` and `Cargo.lock`, and depends on the library crates via path dependencies pointing at `../../crates/*`.
@@ -106,6 +117,8 @@ Plus a cross-cutting concern:
 ```text
 saas-leptos  -> domain, authz, authz-casbin, access, identity, authn, saas, db,
                 audit, audit-pg                                              (example)
+axum-minimal -> domain, authz, authz-casbin, access, identity, authn, saas, db,
+                audit, audit-pg                                              (example)
 seed         -> authz, authz-casbin, access, authn, identity, db, domain, saas,
                 audit, audit-pg
 saas         -> authz (trait), access, identity, domain, audit, sqlx, sha2
@@ -131,7 +144,7 @@ Forbidden edges:
 - `authz-casbin` does not depend on business tables (`users`, `tenants`, `invitations`, `refresh_tokens`, `password_reset_tokens`, `roles`, `permissions`). It uses raw SQL only against its own `casbin_rule` table (`has_role`, `count_users_with_role`, `purge_role`).
 - **`audit` does not depend on `sqlx`, `SaasState`, `Authn`, `AccessState`, `identity`, or any business crate.** Trait-only, symmetric to `authz`. Only `serde`, `uuid`, `thiserror`, `async-trait`, `chrono`, `serde_json`.
 - **`audit-pg` depends on `audit` and owns the `audit_log` table.** The only writer. Symmetric to `authz-casbin` / `casbin_rule`.
-- The example (`examples/saas-leptos`) does not call `casbin_rule` or `audit_log` directly and does not call `authz.require` — only `saas::*`, `saas::access::*`, `saas::member::*`, and `authn::*`. The `/platform/audit` read-only helper does not go through `saas::*` for historical reasons (the `AuditLogger` trait is a single-method write interface; `PgAuditLogger::list` is a per-implementation read helper), but it does enforce `(audit, read)` via `saas::access::my_permissions`.
+- The examples (`examples/saas-leptos`, `examples/axum-minimal`) do not call `casbin_rule` or `audit_log` directly and do not call `authz.require` — only `saas::*`, `saas::access::*`, `saas::member::*`, and `authn::*`. The `/platform/audit` read-only helper does not go through `saas::*` for historical reasons (the `AuditLogger` trait is a single-method write interface; `PgAuditLogger::list` is a per-implementation read helper), but it does enforce `(audit, read)` via `saas::access::my_permissions`.
 - Library crates do not depend on `examples/*`.
 
 ### Multi-tenancy model
@@ -197,7 +210,7 @@ Example permissions and demo roles:
 - `tenants.status` is `active` (default) or `suspended`.
 - **Suspend/activate** are admin actions: `saas::platform::{suspend_tenant, activate_tenant}` require `(tenants, manage)` in `PLATFORM_DOMAIN`. Both are **idempotent**: `UPDATE … WHERE status = <expected> RETURNING *` emits `tenant.suspended` / `tenant.activated` only when the update actually matched a row. A second call returns the row unchanged with no audit emission.
 - **Resolution.** `saas::platform::resolve_active_tenant(state, actor, tenant_id)` returns `ActiveTenant` only when (1) the actor is a member of the tenant (`EXISTS tenant_members`) and (2) `status = 'active'`. Non-member → `Forbidden`; suspended → `TenantSuspended`; missing → `NotFound`.
-- **Mutation paths.** The example's `#[server]` mutation functions call `resolve_active_tenant` **explicitly** before delegating to `saas::*` (`create_workspace`, `create_document`, `create_role`, `update_role`, `delete_role`, `assign_member_role`, `remove_member_role`, `create_invitation`). `saas::invitation::{create_invitation, accept_invitation}` also check the tenant status inside the service (defense in depth). Reads and cleanup (`list_*`, `get_*`, `my_permissions`, `revoke_invitation`, `check_invitation`) do **not** resolve.
+- **Mutation paths.** The example's `#[server]` mutation functions (and `axum-minimal`'s handler functions) call `resolve_active_tenant` **explicitly** before delegating to `saas::*` (`create_workspace`, `create_document`, `create_role`, `update_role`, `delete_role`, `assign_member_role`, `remove_member_role`, `create_invitation`). `saas::invitation::{create_invitation, accept_invitation}` also check the tenant status inside the service (defense in depth). Reads and cleanup (`list_*`, `get_*`, `my_permissions`, `revoke_invitation`, `check_invitation`) do **not** resolve.
 - **Platform admin is not a bypass.** A platform admin who is not a member of the target tenant cannot resolve it — `resolve_active_tenant` returns `Forbidden`. An escape hatch (`_or_platform_admin`) is deliberately deferred to Stage 4.
 
 ## Technology stack
@@ -206,7 +219,7 @@ Example permissions and demo roles:
 |---|---|
 | Language | Rust |
 | UI | Leptos (in the reference example) |
-| Backend | Axum (in the reference example) |
+| Backend | Axum (in the reference example and in `axum-minimal`) |
 | Database | PostgreSQL 16 |
 | Database access | SQLx |
 | Authorization | Casbin (via `authz-casbin`) |
@@ -214,11 +227,11 @@ Example permissions and demo roles:
 | Audit | `audit` (trait-only) + `audit-pg` (`audit_log`) |
 | Email verification | SHA-256 (`sha2`) over a random raw token; raw token not persisted; 24-hour TTL, single-active per user |
 | Password reset | SHA-256 (`sha2`) over a random raw token; raw token not persisted; 1-hour TTL, single-active per user, one-shot |
-| Email delivery | `lettre` (async SMTP, tokio1-rustls, 10s timeout) in the example; Mailpit for local dev |
-| Rate limiting | In-memory sliding-window (`SimpleRateLimiter` in the example; not distributed) |
+| Email delivery | `lettre` (async SMTP, tokio1-rustls, 10s timeout) in `saas-leptos`; `NoopEmailSender` in `axum-minimal`; Mailpit for local dev |
+| Rate limiting | In-memory sliding-window (`SimpleRateLimiter` in both examples; not distributed) |
 | Invitation tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Refresh tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
-| Styling | Tailwind CSS v4 |
+| Styling | Tailwind CSS v4 (in `saas-leptos`) |
 | Local infrastructure | Docker Compose v2 — PostgreSQL + Mailpit |
 | Logging | `tracing` + `tracing-subscriber` (`RUST_LOG` env-filter) |
 | Testing | `cargo test`; `#[sqlx::test]` for per-test isolated databases |
@@ -307,11 +320,11 @@ RUST_LOG=info
 
 Notes:
 
-- `.env` lives in the **repository root** and is discovered by the seed binary, the example, and `#[sqlx::test]`.
+- `.env` lives in the **repository root** and is discovered by the seed binary, both examples, and `#[sqlx::test]`.
 - `.env` must be LF, not CRLF.
 - Do not put `LEPTOS_*` variables into `.env`.
 - `DATABASE_URL` is used in three places: by the running application, by `seed`, and by `cargo test`. The user in `DATABASE_URL` must have the `CREATE DATABASE` privilege for `#[sqlx::test]`.
-- `SMTP_URL` is read only by `examples/saas-leptos`. The library (`authn`) does not depend on `lettre`.
+- `SMTP_URL` is read only by `examples/saas-leptos`. `axum-minimal` uses `NoopEmailSender` unconditionally. The library (`authn`) does not depend on `lettre`.
 
 ### Apply migrations and seed data
 
@@ -344,7 +357,7 @@ Bootstrap audit events (visible in `audit_log` after seed): `tenant.created`, `w
 
 **Existing database.** `20261107000001_audit_log.sql` adds a new table (`audit_log`), `20261108000001_platform_admin_permissions.sql` adds new `(resource, action)` rows and top-ups the platform owner — no backfill. If your DB predates the earlier migrations, `docker compose down -v` + `cargo run -p seed` is the recommended path.
 
-### Run the reference application
+### Run the reference application (`saas-leptos`)
 
 The example is outside the workspace and has its own manifest, so it is run from its directory:
 
@@ -390,12 +403,66 @@ Then in the browser:
 21. **Wait 15+ minutes** — auto-refresh rotates the refresh token.
 22. Rate limits: `request_email_verification` — 3/hour per email; `request_password_reset` — 5/hour per email.
 
+### Run the `axum-minimal` example (Stage 3g)
+
+The second example is also outside the workspace and has its own manifest. It uses the same database and seed data as `saas-leptos`, so run `cargo run -p seed` once (from the repository root) before starting it.
+
+```bash
+cargo run --manifest-path examples/axum-minimal/Cargo.toml
+```
+
+It listens on `BIND_ADDR` (default `127.0.0.1:3395`). If `saas-leptos` is already using that port, set `BIND_ADDR=127.0.0.1:3397` (or similar) in `.env`.
+
+Smoke checklist (curl, from the repository root). The example returns JSON, not HTML, so it is easy to script:
+
+```bash
+# register (rate-limited 3/h per email; use a fresh address each time)
+curl -X POST http://127.0.0.1:3395/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"smoke-1@example.test","password":"Smoke123!"}' \
+  -c /tmp/axum-minimal-cookies.txt
+
+# login as a seed demo account
+curl -X POST http://127.0.0.1:3395/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"platform-admin@example.test","password":"PlatformAdmin123!"}' \
+  -c /tmp/axum-minimal-cookies.txt
+
+# list tenants (empty for platform admin — not a tenant member)
+curl -X GET http://127.0.0.1:3395/tenants -b /tmp/axum-minimal-cookies.txt
+
+# create a tenant (the caller becomes its owner)
+curl -X POST http://127.0.0.1:3395/tenants \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Axum Smoketest"}' \
+  -b /tmp/axum-minimal-cookies.txt
+
+# list workspaces, audit
+curl -X GET http://127.0.0.1:3395/workspaces -b /tmp/axum-minimal-cookies.txt
+curl -X GET 'http://127.0.0.1:3395/audit?limit=10' -b /tmp/axum-minimal-cookies.txt
+
+# negative checks:
+# - POST /workspaces on a suspended tenant → 403 {"error":"tenant is suspended"}
+# - GET /audit as a non-platform-admin → 403 {"error":"forbidden"}
+# - GET /tenants anonymously → 401 {"error":"unauthorized"}
+```
+
+Expected behaviours:
+
+- Anonymous `GET /tenants` → `401 {"error":"unauthorized"}` (from `CurrentUser::require`).
+- `platform-admin@example.test` `POST /workspaces` on a suspended tenant → `403 {"error":"tenant is suspended"}` (from `resolve_active_tenant`).
+- `platform-admin@example.test` `GET /audit` → `200` + up to 10 rows (the platform owner has `(audit, read)`).
+- `owner@acme.test` `GET /audit` → `403 {"error":"forbidden"}` (no `(audit, read)`).
+- Anonymous `POST /auth/register` four times in an hour with the same email → the 4th call is `429`, with `Retry-After` header and `{"error":"rate limited; try again in <n>s","retry_after_secs":<n>}`.
+
+The `axum-minimal` cookie flow (`access_token` / `refresh_token`) and the auto-refresh behaviour are identical to `saas-leptos` (same library calls, same middleware contract); only the transport (JSON vs `#[server]` RPC) and the absence of Leptos differ.
+
 ### Checking the build
 
 From the repository root:
 
 ```bash
-clear && cargo test && cargo check && cargo check -p seed && cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr && cargo check --manifest-path examples/saas-leptos/Cargo.toml
+clear && cargo test && cargo check && cargo check -p seed && cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr && cargo check --manifest-path examples/saas-leptos/Cargo.toml && cargo check --manifest-path examples/axum-minimal/Cargo.toml
 ```
 
 ### Running tests
@@ -408,6 +475,8 @@ cargo test
 
 **124 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+41 = 52; `access` 0+6 = 6; `authz-casbin` 0+9 = 9; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3f added 8 integration tests in `saas::tests::integration` (resolve_active_tenant × 3, list_tenants, suspend_tenant, activate_tenant, accept_invitation_on_suspended, create_invitation_on_suspended).
 
+Stage 3g (`axum-minimal`) does **not** change the library test counter — `crates/*` is untouched (0 migrations, 0 breaking changes, 0 new library tests). The example ships no `tests/` directory (binary-only crate; the plan marks example smoke tests optional). Its smoke coverage is the curl checklist above, which exercises the same `saas::*` / `authn::*` calls as `saas-leptos`.
+
 Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/access`, `crates/saas`, and `crates/audit`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
 - Each test gets its own isolated database on the server pointed to by `DATABASE_URL`; `crates/db/migrations` are applied automatically; the database is dropped when the test finishes.
@@ -415,7 +484,7 @@ Unit tests live inline (`#[cfg(test)] mod tests`) in `crates/authn`, `crates/acc
 - The user in `DATABASE_URL` must have the `CREATE DATABASE` privilege.
 - Tests can run in parallel; isolation is per-database.
 
-The reference example has a small unit-test module too (`rate_limit.rs`); run it with `cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr rate_limit`.
+The reference examples have small unit-test modules too (`rate_limit.rs` in both; run with `cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr rate_limit` or `cargo test --manifest-path examples/axum-minimal/Cargo.toml rate_limit`).
 
 `accept_invitation`, `*::list_memberships`, and `check_invitation` have no unit tests: they do not call `authz.require` and go straight to SQL, which a lazy `PgPool` cannot serve; they are covered by integration tests.
 
@@ -459,22 +528,31 @@ The reference example has a small unit-test module too (`rate_limit.rs`); run it
 │   │       └── 20261108000001_platform_admin_permissions.sql
 │   └── seed/
 └── examples/
-    └── saas-leptos/
+    ├── saas-leptos/
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── auth.rs
+    │       ├── email.rs
+    │       ├── rate_limit.rs
+    │       ├── guard.rs
+    │       ├── pages/
+    │       │   ├── platform.rs
+    │       │   └── ...
+    │       └── ...
+    └── axum-minimal/          # Stage 3g: pure Axum, no Leptos
         ├── Cargo.toml
         └── src/
-            ├── auth.rs           # register / login / refresh / logout
-            │                     # + set_return_url / take_return_url
-            │                     # + request_email_verification / verify_email
-            │                     # + request_password_reset / reset_password (Stage 3d)
-            ├── email.rs          # EmailResult (hydration-visible);
-            │                     # EmailSender / SmtpEmailSender / NoopEmailSender (ssr);
-            │                     # send_verification + send_invitation + send_password_reset
-            ├── rate_limit.rs     # SimpleRateLimiter (ssr, in-memory)
-            ├── pages/
-            │   ├── platform.rs   # PlatformTenantListPage (`/platform`),
-            │   │                 # PlatformAuditListPage (`/platform/audit`) — Stage 3f
-            │   └── ...
-            └── ...
+            ├── main.rs        # entry point, router, AppState wiring
+            ├── state.rs       # AppState { authn, saas, email, rate_limit }
+            ├── error.rs       # AppError + IntoResponse (HTTP status mapping)
+            ├── extract.rs     # CurrentUser via axum::extract::FromRequestParts
+            ├── middleware.rs  # auto_refresh (protected router)
+            ├── auth.rs        # register / login / logout / refresh handlers
+            ├── tenant.rs      # list_my_tenants / create_tenant
+            ├── workspace.rs   # list/create workspaces + documents (resolve)
+            ├── audit.rs       # GET /audit (audit, read)
+            ├── email.rs       # EmailSender trait + NoopEmailSender
+            └── rate_limit.rs  # SimpleRateLimiter (in-memory, per-process)
 ```
 
 ### domain
@@ -543,7 +621,7 @@ Business logic, independent of UI framework.
   - `create_tenant` / `provision_tenant` — container and explicit-owner variants (unchanged from Stage 1.1).
   - `list_tenants` — platform admin tenant listing (`(tenants, list)`).
   - `suspend_tenant` / `activate_tenant` — idempotent status toggles (`(tenants, manage)`); emit `tenant.suspended` / `tenant.activated` only on a transition.
-  - `resolve_active_tenant` — `ActiveTenant` or `Forbidden` / `TenantSuspended` / `NotFound`. Membership via `EXISTS tenant_members`; `#[server]` mutation functions call it explicitly.
+  - `resolve_active_tenant` — `ActiveTenant` or `Forbidden` / `TenantSuspended` / `NotFound`. Membership via `EXISTS tenant_members`; `#[server]` mutation functions (and `axum-minimal` handler functions) call it explicitly.
 - Emits: `tenant.created` (in `platform::create_tenant` and `platform::provision_tenant`), `tenant.suspended` / `tenant.activated` (Stage 3f; transition only), `workspace.created` (in `tenant::create_workspace`), `invitation.created` / `.accepted` / `.revoked`, `member.role_assigned` / `.revoked` (from `saas::access::{assign_role, revoke_role}`), `role.deleted` (from `saas::access::delete_role`), `member.role_changed` (from `member::change_role`; in addition to the two events from its inner `assign_role` / `revoke_role`).
 
 ### db
@@ -556,7 +634,19 @@ Standalone binary for creating initial platform, tenant, workspace, user, role, 
 
 ### examples/saas-leptos
 
-Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `AccessState::with_audit`, `Authn::with_audit`, and `SaasBuilder::with_audit`. Routes: `/tenants`, `/workspaces`, `/invitations/:token`, `/verify/:token`, `/forgot-password`, `/reset-password/:token`, `/platform`, `/platform/audit` (Stage 3f), plus tenant/workspace member and role pages. `error.rs` maps errors to HTTP 400/401/403/404/409/429/500. `error.rs` does not map audit errors — audit never propagates to `ServerFnError`. `error.rs` maps `CoreError::TenantSuspended` to 403 with a distinct message (`"tenant is suspended"`) so the UI can show a dedicated banner.
+Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `AccessState::with_audit`, `Authn::with_audit`, and `SaasBuilder::with_audit`. Routes: `/tenants`, `/workspaces`, `/invitations/:token`, `/verify/:token`, `/forgot-password`, `/reset-password/:token`, `/platform`, `/platform/audit` (Stage 3f), plus tenant/workspace member and role pages. `error.rs` maps errors to HTTP 400/401/403/404/409/429/500. `error.rs` does not map audit errors — audit never propagates to `ServerFnError`. `error.rs` maps `CoreError::TenantSuspended` to 403 with a distinct message (`"tenant is suspended"`) so the UI can show a dedicated banner. `guard.rs` (Stage 3f follow-up) implements the client route guards — UX-only; the backend `authz.require` / `resolve_active_tenant` remains authoritative.
+
+### examples/axum-minimal (Stage 3g)
+
+Second consumer — pure Axum, no Leptos; the portability proof.
+
+- **11 endpoints**: `POST /auth/{register,login,logout,refresh}`, `GET|POST /tenants`, `GET|POST /workspaces`, `GET|POST /documents`, `GET /audit`. JSON request/response; `Set-Cookie` on the auth endpoints.
+- **`CurrentUser` via `axum::extract::FromRequestParts`** — a deliberate deviation from ADR-0002 rev.2 §3.8, which deferred `FromRequestParts` for `saas-leptos` and reserved the general rule for Stage 4. The deviation is the point of 3g: it shows that the library contract (`authn.verify_token` + `Extension<Option<AuthUser>>`) works for a second extractor style. Recorded in `handoff §16` and Appendix B §2.48.
+- **Same library calls, same `resolve_active_tenant`** — `saas::tenant::list_memberships`, `saas::platform::provision_tenant`, `saas::tenant::create_workspace`, `saas::workspace::{list_documents, create_document}`, `saas::platform::resolve_active_tenant` (in `create_workspace` and `create_document`), `saas::access::my_permissions` (in `list_audit`). Nothing library-side changed to support it — that is the proof.
+- **`NoopEmailSender`** — no SMTP transport. `EmailSender` trait is present so a future consumer can plug in a real sender without changing `AppState`; `EmailResult` matches `saas-leptos`'s shape.
+- **`SimpleRateLimiter`** — same in-memory sliding-window implementation as `saas-leptos`; applied to `POST /auth/register` (`3/h` per email). Not distributed (Stage 4).
+- **Router split** — protected (`auto_refresh`) vs public (`register`/`login`/`logout`), same rationale as `saas-leptos` (ADR-0002 rev.2 §2.1).
+- **No server-side per-route middleware** — same as `saas-leptos`: the `resolve_active_tenant` / `authz.require` calls inside handlers are the security boundary; the client is a JSON consumer that sees the same 401/403 responses a malicious curl would.
 
 ## Development principles
 
@@ -568,13 +658,13 @@ Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `Ac
 - Treat UI visibility as convenience, not as a security boundary.
 - **Roles are data, not code.** No built-in role enums; `owner` is a row created by `access::create_owner_role` / the SQL migration; custom roles are created and edited by the domain owner.
 - **`roles.key` is immutable**; `update_role` never changes it (rename = delete + create, ADR-0001).
-- **Tenant suspension is enforced explicitly, not by middleware** (ADR-0002 rev.2). Mutating `#[server]` functions call `saas::platform::resolve_active_tenant`; reads and cleanup stay available on a suspended tenant. `saas::invitation::{create, accept}_invitation` re-check the tenant status inside the service (defense in depth). Platform admin is not a superuser: a platform admin who is not a member of the target tenant gets `Forbidden` from `resolve_active_tenant`.
+- **Tenant suspension is enforced explicitly, not by middleware** (ADR-0002 rev.2). Mutating `#[server]` functions (in `saas-leptos`) and mutation handlers (in `axum-minimal`) call `saas::platform::resolve_active_tenant`; reads and cleanup stay available on a suspended tenant. `saas::invitation::{create, accept}_invitation` re-check the tenant status inside the service (defense in depth). Platform admin is not a superuser: a platform admin who is not a member of the target tenant gets `Forbidden` from `resolve_active_tenant`.
 - **`suspend_tenant` / `activate_tenant` are idempotent.** `UPDATE … WHERE status = <expected> RETURNING *` emits `tenant.suspended` / `tenant.activated` only when a row was actually updated; a second call returns the row unchanged with no audit emission.
 - `saas` and `authn` do not know about Leptos, Axum, or Casbin. `saas` does not know about `permissions`/`roles`/`role_permissions` — those belong to `access`. `authn` does not depend on `lettre` — SMTP transport lives in the example.
 - **`audit` (trait) does not depend on `sqlx`.** Symmetric to `authz`. `audit-pg` owns `audit_log` (sole writer). `NoopAuditLogger` is always available — not a feature flag.
 - Library crates do not depend on `examples/*`; each example has its own `Cargo.toml` and `Cargo.lock`.
-- Server functions resolve the actor through `extract::CurrentUser`; a missing actor is HTTP 401.
-- Library errors (`CoreError`, `AuthnError`, `IdentityError`, `AccessError`) are mapped to HTTP status codes in the example (`src/error.rs`); keep new variants covered by that mapping. `AuditError` is **not** in that mapping — audit never propagates.
+- Server functions (and Axum handlers) resolve the actor through the example's `CurrentUser`; a missing actor is HTTP 401. `saas-leptos` uses a plain helper, `axum-minimal` uses `FromRequestParts` — both surface the same "no actor → 401" contract to the caller.
+- Library errors (`CoreError`, `AuthnError`, `IdentityError`, `AccessError`) are mapped to HTTP status codes in each example (`src/error.rs`); keep new variants covered by that mapping. `AuditError` is **not** in that mapping — audit never propagates.
 - Invitation raw tokens are returned once from `saas::invitation::create_invitation` and are never persisted; only `invitations.token_hash` (SHA-256) is stored.
 - Refresh raw tokens, email-verification raw tokens, and password-reset raw tokens are returned once and never persisted; only their `token_hash` (SHA-256) is stored. `NoopEmailSender` logs only the recipient and the fact of a skipped send — **never the token**.
 - **`authn::reset_password` is one-shot**: a replayed raw token returns `TokenInvalid`. In one transaction it rewrites `users.password_hash`, bumps `users.password_changed_at`, expires every outstanding reset token for the user, and revokes every refresh-token family with `revoked_reason = "password_reset"`. No auto-login.
@@ -583,9 +673,9 @@ Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `Ac
 - **`saas::member::change_role` performs `assign` before `revoke`.** On a partial failure the user is over-permissioned (both roles) — recoverable idempotently by retrying `change_role`.
 - **`saas::member::{change_role, remove_role}` include an owner guard**: the last holder of a `protected` role cannot be removed from a domain. Guard reads `casbin_rule`.
 - **`saas::access::delete_role` cleans up `casbin_rule` (g+p), `*_members`, and the `roles` row** in six retry-safe steps; a partial failure can be recovered by calling `delete_role` again.
-- All library crates in the reference app and `seed` share a single `PgPool`.
-- The reference app's `auto_refresh` middleware runs on the protected router (SSR + `/_server/*`); static files and 404 responses bypass it.
-- **SMTP send timeout is 10 seconds**. Hydrate host check: `cargo check --features hydrate` catches type-level errors, not wasm-only; full `cargo leptos watch` is part of the merge checklist.
+- All library crates in the reference apps and `seed` share a single `PgPool`.
+- The `saas-leptos` `auto_refresh` middleware runs on the protected router (SSR + `/_server/*`); static files and 404 responses bypass it. The `axum-minimal` `auto_refresh` middleware runs on the protected router (`/auth/refresh`, `/tenants`, `/workspaces`, `/documents`, `/audit`); `register`/`login`/`logout` bypass it.
+- **SMTP send timeout is 10 seconds** (in `saas-leptos`). Hydrate host check: `cargo check --features hydrate` catches type-level errors, not wasm-only; full `cargo leptos watch` is part of the merge checklist.
 - **Audit events are constants in `audit::events`.** Adding a new event is a source change (no migration); per-event `metadata` is free-form JSONB, shape documented in Appendix B. `event_type` is `text` (not enum) — extensible without a migration.
 
 ## Roadmap
@@ -600,9 +690,10 @@ Reference consumer. `main.rs` builds a real `PgAuditLogger` and passes it to `Ac
 - Micro-PR (done): Docker Compose v1 → v2.
 - Stage 3e (done): Audit log. `audit` (trait) + `audit-pg` (`PgAuditLogger`); migration `20261107000001_audit_log.sql` (`audit_log` + 4 indexes, `actor_id ON DELETE SET NULL`). `Authn::with_audit`, `AccessState::with_audit`, `SaasBuilder::with_audit` — builder-style, additive (default `NoopAuditLogger`). 19 of 21 events emitted (all except `tenant.suspended` / `tenant.activated` — Stage 3f).
 - **Stage 3f (done): Platform admin + tenant suspension.** `saas::platform::*` extended with `list_tenants` / `suspend_tenant` / `activate_tenant` / `resolve_active_tenant` / `ActiveTenant`; `CoreError::TenantSuspended`; explicit `resolve_active_tenant` call in the mutating `#[server]` functions of the example; `/platform` (rename of `PlatformPage` → `PlatformTenantListPage`) + new `/platform/audit` (`(audit, read)`); `tenant.suspended` / `tenant.activated` events (idempotent, transition-only). Migration `20261108000001_platform_admin_permissions.sql` adds `(tenants, list)`, `(tenants, manage)`, `(audit, read)` to `permissions` and tops up the platform owner. 8 new integration tests (116 → 124).
-- **Stage 3g (next): `axum-minimal`.** Second consumer example without Leptos, proving portability: pure `axum::Router`, `axum::extract::FromRequestParts` for `CurrentUser`, `axum-extra`/`tower-cookies` for cookies, same `saas::*` / `authn::*` / `audit::*` calls, same `resolve_active_tenant` in mutation handlers. Deliberate deviation from ADR-0002 rev.2 §3.8 ("`FromRequestParts` deferred") — that is exactly what the example demonstrates; documented in `handoff §16`.
-- Stage 3h: infra + minor (`has_policy` pre-check in `grant_role`, `pg_advisory_xact_lock` in the owner guard, `my_permissions` cache, `casbin_rule` dedup + unique index, owner-sync trigger).
-- Stage 4: Dockerfile, CI, observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (distributed), RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`.
+- **Client route guards follow-up (done):** `examples/saas-leptos/src/guard.rs` — `RouteGuard` enum + monolithic `GuardRoute` + standalone `RequireAuth` / `RequirePermission` / `RequireAnyPermission`. All 13 private routes in `lib.rs` under `GuardRoute`; `pages/*.rs` untouched. UX-only, not a security boundary; SSR-correct guard and server-side middleware — Stage 4.
+- **Stage 3g (done): `axum-minimal`.** Second consumer on pure Axum, proving portability: `axum::Router::new()`, `axum::extract::FromRequestParts` for `CurrentUser` (deliberate deviation from ADR-0002 rev.2 §3.8), `axum-extra` cookies, `NoopEmailSender`, same `saas::*` / `authn::*` / `audit::*` calls and the same `resolve_active_tenant` in mutation handlers as `saas-leptos`. `crates/*` untouched — 0 migrations, 0 breaking changes, 124 library tests unchanged.
+- Stage 3h (next): infra + minor (`has_policy` pre-check in `grant_role`, `pg_advisory_xact_lock` in the owner guard, `my_permissions` cache, `casbin_rule` dedup + unique index, owner-sync trigger). 124 → ~130–132 tests, +1 migration.
+- Stage 4: Dockerfile, CI, observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (distributed), RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`, SSR-correct guards in `saas-leptos`, server-side per-route middleware (defense in depth).
 
 ## License
 
