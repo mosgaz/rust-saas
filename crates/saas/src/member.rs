@@ -24,8 +24,20 @@
 //!   role: if the target role is `protected`, the user holds it, and the
 //!   user is the last holder in the domain, the call returns
 //!   `CoreError::Forbidden`. Non-protected roles have no last-holder guard.
-//! - The guard is non-transactional (a concurrent admin can race between
-//!   `count_users_with_role` and `revoke`). See handoff §16.
+//!
+//! **Stage 3h (ADR-0003 §2.3):** the owner guard is serialized by a
+//! PostgreSQL advisory lock. Both `change_role` and `remove_role` open a
+//! short-lived transaction that does nothing but hold
+//! `pg_advisory_xact_lock(hashtext('owner-guard:{domain}:{role_key}'))`.
+//! The lock is held across the guard **and** the following
+//! `assign`/`revoke` calls, so two concurrent admins cannot both observe
+//! `count >= 2` and both revoke the last holder — the loser sees the
+//! post-revoke count (`count <= 1`) and gets `Forbidden`. The transaction
+//! is a lock holder only: `assign_role`/`revoke_role` still write through
+//! `state.pool` and the in-memory enforcer, so this does **not** become a
+//! cross-table transaction (ADR-0003 §2.1 unchanged). The
+//! `*_members` vs `casbin_rule` consistency window remains the known
+//! A-lite limitation (handoff §16).
 //!
 //! **Stage 3e (ADR-0004, decision B):** `change_role` is composable — its
 //! two inner calls `saas::access::assign_role` and
@@ -153,25 +165,29 @@ pub async fn list(
 
 /// Replaces `old_role_key` with `new_role_key` for `user_id` in `scope`.
 ///
-/// Order (Stage 2d: flip order + owner guard):
+/// Order (Stage 2d: flip order + owner guard; Stage 3h: advisory lock):
 /// 1. No-op if `old_role_key == new_role_key`.
 /// 2. `require(actor.id, scope.domain(), "members", "manage")`.
-/// 3. Guard: if `old_role_key` is `protected`, the user holds it, and the
-///    user is the last holder in the domain → `CoreError::Forbidden`.
-/// 4. `saas::access::assign_role(new_role_key)` — adds the new role to
+/// 3. Begin a lock-holder transaction and acquire
+///    `pg_advisory_xact_lock(hashtext('owner-guard:{domain}:{old_role}'))`.
+///    The transaction does no writes; it exists only to hold the advisory
+///    lock across steps 4–6 (ADR-0003 §2.3).
+/// 4. Guard (under the lock): if `old_role_key` is `protected`, the user
+///    holds it, and the user is the last holder in the domain →
+///    `CoreError::Forbidden`.
+/// 5. `saas::access::assign_role(new_role_key)` — adds the new role to
 ///    `*_members` and `casbin_rule`; emits `member.role_assigned`.
-/// 5. `saas::access::revoke_role(old_role_key)` — removes the old role from
-///    `*_members` and `casbin_rule`; emits `member.role_revoked`.
-/// 6. Emit `member.role_changed` (Stage 3e — this function, on top of the
+/// 6. `saas::access::revoke_role(old_role_key)` — removes the old role
+///    from `*_members` and `casbin_rule`; emits `member.role_revoked`.
+/// 7. `COMMIT` the lock-holder transaction (releases the advisory lock).
+/// 8. Emit `member.role_changed` (Stage 3e — this function, on top of the
 ///    two events already emitted by its inner calls).
 ///
-/// Not atomic: steps 4 and 5 each run their own SQL. If step 5 fails after
-/// step 4 committed, the user ends up over-permissioned (both roles); this
-/// is recoverable idempotently by calling `change_role` again (the previous
-/// `revoke` → `assign` order was not). Known limitation (handoff §16).
-/// `assign_role` and `revoke_role` each also check `(roles, grant)`, so
-/// `change_role` performs three `require` calls total; also a §16
-/// limitation.
+/// Not atomic across `*_members` and `casbin_rule`: steps 5 and 6 each run
+/// their own SQL. If step 6 fails after step 5 committed, the user ends up
+/// over-permissioned (both roles); recoverable idempotently by retrying
+/// `change_role`. Known A-lite limitation (handoff §16). The advisory
+/// lock closes only the *owner guard* race, not the atomicity window.
 pub async fn change_role(
     state: &SaasState,
     actor: &AuthUser,
@@ -190,10 +206,21 @@ pub async fn change_role(
         .require(actor.id, &domain_str, "members", "manage")
         .await?;
 
+    // Stage 3h: serialize the owner guard on `(domain, old_role_key)`.
+    // The transaction is a lock holder only — no writes happen inside it.
+    let mut lock_tx = state.pool().begin().await?;
+    let lock_key = format!("owner-guard:{}:{}", domain_str, old_role_key.as_str());
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&lock_key)
+        .execute(&mut *lock_tx)
+        .await?;
+
     guard_protected_last_holder(state, user_id, &domain_str, old_role_key).await?;
 
     saas_access::assign_role(state, actor, user_id, &domain_str, new_role_key).await?;
     saas_access::revoke_role(state, actor, user_id, &domain_str, old_role_key).await?;
+
+    lock_tx.commit().await?;
 
     state
         .audit_or_warn(AuditEvent {
@@ -215,18 +242,22 @@ pub async fn change_role(
 
 /// Removes `role_key` from `user_id` in `scope`.
 ///
-/// Order (Stage 2d: owner guard):
+/// Order (Stage 2d: owner guard; Stage 3h: advisory lock):
 /// 1. `require(actor.id, scope.domain(), "members", "manage")`.
-/// 2. Guard: if `role_key` is `protected`, the user holds it, and the user
-///    is the last holder in the domain → `CoreError::Forbidden`.
-/// 3. `saas::access::revoke_role` — removes the role from `*_members` and
+/// 2. Begin a lock-holder transaction and acquire
+///    `pg_advisory_xact_lock(hashtext('owner-guard:{domain}:{role}'))`
+///    (ADR-0003 §2.3).
+/// 3. Guard (under the lock): if `role_key` is `protected`, the user
+///    holds it, and the user is the last holder in the domain →
+///    `CoreError::Forbidden`.
+/// 4. `saas::access::revoke_role` — removes the role from `*_members` and
 ///    `casbin_rule`; emits `member.role_revoked`.
+/// 5. `COMMIT` the lock-holder transaction (releases the advisory lock).
 ///
 /// Removing the last holder of a **non-protected** role is allowed. Owner
-/// demote at `count >= 2` is allowed; at `count == 1` it is forbidden
-/// (handoff §16). To transfer ownership: `assign_role` to the new owner
-/// first (`count` becomes 2), then `remove_role`/`change_role` on the old
-/// owner.
+/// demote at `count >= 2` is allowed; at `count == 1` it is forbidden.
+/// To transfer ownership: `assign_role` to the new owner first (`count`
+/// becomes 2), then `remove_role` / `change_role` on the old owner.
 ///
 /// Does **not** emit `member.role_changed` — this is a revoke, not a swap
 /// (decision B). The audit trail already contains `member.role_revoked`
@@ -244,9 +275,20 @@ pub async fn remove_role(
         .require(actor.id, &domain_str, "members", "manage")
         .await?;
 
+    // Stage 3h: serialize the owner guard on `(domain, role_key)`.
+    let mut lock_tx = state.pool().begin().await?;
+    let lock_key = format!("owner-guard:{}:{}", domain_str, role_key.as_str());
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&lock_key)
+        .execute(&mut *lock_tx)
+        .await?;
+
     guard_protected_last_holder(state, user_id, &domain_str, role_key).await?;
 
     saas_access::revoke_role(state, actor, user_id, &domain_str, role_key).await?;
+
+    lock_tx.commit().await?;
+
     Ok(())
 }
 
@@ -263,8 +305,11 @@ pub async fn remove_role(
 ///    last holder).
 ///
 /// Reads `count` from `casbin_rule` (source of truth, handoff §5 p.4), not
-/// from `*_members`. Non-transactional: a concurrent admin can race between
-/// `count` and the caller's `revoke` (handoff §16).
+/// from `*_members`. Stage 3h: callers (`change_role` / `remove_role`)
+/// hold a `pg_advisory_xact_lock` on `owner-guard:{domain}:{role_key}` for
+/// the whole guard + mutation sequence, which serializes concurrent owner
+/// removals — two admins can no longer both observe `count = 2` and both
+/// revoke (ADR-0003 §2.3).
 async fn guard_protected_last_holder(
     state: &SaasState,
     user_id: Uuid,
