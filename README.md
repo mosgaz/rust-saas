@@ -811,6 +811,21 @@ All `crates/*` share **one version** (`[workspace.package] version =
 revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change
 log.
 
+## No Node.js
+
+This project does **not** depend on Node.js in any form — not at build
+time, not in the Docker images, not in CI, not in the dev shell.
+
+Tailwind CSS 4 is built by `cargo-leptos` via a **standalone binary** that
+it downloads on first use (pinned by `LEPTOS_TAILWIND_VERSION` in the
+Dockerfile, see `examples/saas-leptos/Dockerfile`). No `npm`, no `npx`,
+no `node_modules/`.
+
+If a future tool proposes a Node dependency, it is **rejected** by default
+and must be escalated as a design change — the rule exists so a stray
+`npx` in a build script cannot silently reintroduce a toolchain we do not
+ship.
+
 ## License
 
 See the `LICENSE` file in the root of the repository.

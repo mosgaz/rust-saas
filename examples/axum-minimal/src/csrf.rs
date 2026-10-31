@@ -98,6 +98,13 @@ pub async fn csrf_issue(
     req: Request,
     next: Next,
 ) -> Response {
+    // `/healthz` is a readiness probe: the orchestrator hits it every 10s,
+    // and issuing a fresh `csrf` cookie on each hit serves no one. Pass
+    // through without touching the response.
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+
     let had_cookie = CookieJar::from_headers(req.headers())
         .get(CSRF_COOKIE)
         .is_some();
