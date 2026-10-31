@@ -1,0 +1,41 @@
+[package]
+name = "axum-minimal"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Axum consumer of the rust-saas library (portability proof, Stage 3g)"
+
+[dependencies]
+# Library crates — same public contracts as `saas-leptos`; `crates/*` untouched.
+# `domain` is built with the `ssr` feature so its `sqlx::FromRow` / `sqlx::Type`
+# derives are available to the Axum handlers (same as `saas-leptos`).
+domain = { path = "../../crates/domain", features = ["ssr"] }
+authz = { path = "../../crates/authz" }
+authz-casbin = { path = "../../crates/authz-casbin" }
+access = { path = "../../crates/access" }
+identity = { path = "../../crates/identity" }
+authn = { path = "../../crates/authn" }
+saas = { path = "../../crates/saas" }
+db = { path = "../../crates/db" }
+audit = { path = "../../crates/audit" }
+audit-pg = { path = "../../crates/audit-pg" }
+
+# Axum stack (no Leptos).
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["cookie"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Shared utilities.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+
+# Independent workspace: second consumer example, not part of the library.
+[workspace]
