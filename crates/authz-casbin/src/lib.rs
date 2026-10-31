@@ -12,6 +12,15 @@
 //! `(role, domain)` is not expressible through `remove_filtered_grouping_policy`
 //! without an N+1 loop); the in-memory model is reloaded via `load_policy()`
 //! afterwards.
+//!
+//! Stage 3h (ADR-0003 §2.2): `grant_role` pre-checks `has_policy` /
+//! `has_grouping_policy` before each `add_policy` / `add_grouping_policy`
+//! call. `casbin-rs` 2.x `add_policy` does not deduplicate `p`-rows, so a
+//! repeated `grant_role` would otherwise insert duplicates; `has_policy` is
+//! an in-memory O(1) check and does not require modifying `sqlx-adapter`.
+//! The unique index `casbin_rule_unique_idx` (migration
+//! `20261110000001_casbin_rule_unique_idx.sql`) is a belt-and-suspenders
+//! safety net on the database side.
 
 use std::sync::Arc;
 
@@ -129,23 +138,40 @@ impl AuthorizationEngine for CasbinAuthz {
     ) -> Result<(), AuthzError> {
         let mut enforcer = self.enforcer.write().await;
 
-        enforcer
-            .add_grouping_policy(vec![
-                user_id.to_string(),
-                role_key.to_string(),
-                domain.to_string(),
-            ])
-            .await
-            .map_err(|e| AuthzError::Internal(e.to_string()))?;
+        // Idempotent `g`-row: skip `add_grouping_policy` when the user already
+        // holds `role_key` in `domain`. `add_grouping_policy` normally
+        // deduplicates, but the pre-check is cheap and makes the whole method
+        // idempotent by construction (ADR-0003 §2.2).
+        // `MgmtApi::has_grouping_policy` returns `bool` synchronously.
+        let grouping = vec![
+            user_id.to_string(),
+            role_key.to_string(),
+            domain.to_string(),
+        ];
+        if !enforcer.has_grouping_policy(grouping.clone()) {
+            enforcer
+                .add_grouping_policy(grouping)
+                .await
+                .map_err(|e| AuthzError::Internal(e.to_string()))?;
+        }
 
         for (resource, action) in permissions {
+            // Idempotent `p`-row: `casbin-rs` 2.x `add_policy` does not check
+            // for an existing `(sub, dom, obj, act)` and would insert a
+            // duplicate. `has_policy` is in-memory; no migration or adapter
+            // change is needed for the pre-check itself (ADR-0003 §2.2).
+            // `MgmtApi::has_policy` returns `bool` synchronously.
+            let policy = vec![
+                role_key.to_string(),
+                domain.to_string(),
+                resource.clone(),
+                action.clone(),
+            ];
+            if enforcer.has_policy(policy.clone()) {
+                continue;
+            }
             enforcer
-                .add_policy(vec![
-                    role_key.to_string(),
-                    domain.to_string(),
-                    resource.clone(),
-                    action.clone(),
-                ])
+                .add_policy(policy)
                 .await
                 .map_err(|e| AuthzError::Internal(e.to_string()))?;
         }

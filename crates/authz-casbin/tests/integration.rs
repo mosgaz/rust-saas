@@ -1,10 +1,19 @@
 //! Integration tests for `authz-casbin` against a real PostgreSQL.
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
-//! `crates/db/migrations` (including `casbin_rule`), and drops it afterwards.
+//! `crates/db/migrations` (including `casbin_rule` and the Stage 3h unique
+//! index `casbin_rule_unique_idx`), and drops it afterwards.
 //!
 //! `CasbinAuthz::from_pool` shares the test pool, so policies live in that
 //! test database.
+//!
+//! Stage 3h adds two tests for `p`-rows dedup:
+//! - `grant_role_is_idempotent_on_p_rows` — a repeated `grant_role` does not
+//!   insert duplicate `p`-rows or `g`-rows (the `has_policy` /
+//!   `has_grouping_policy` pre-check in `CasbinAuthz::grant_role`).
+//! - `unique_index_rejects_duplicates` — the unique index
+//!   `casbin_rule_unique_idx` (migration `20261110000001`) rejects a direct
+//!   duplicate `INSERT`, as a safety net behind the pre-check.
 
 use authz::{AuthorizationEngine, AuthzError};
 use authz_casbin::CasbinAuthz;
@@ -175,6 +184,151 @@ async fn grant_role_is_idempotent(pool: PgPool) {
     assert!(can_read, "permission must persist after duplicate grant");
 }
 
+/// Stage 3h: repeated `grant_role` must not insert duplicate `p`-rows (nor
+/// duplicate `g`-rows). Checks `casbin_rule` directly, not just the in-memory
+/// `can` result — the latter was already covered by `grant_role_is_idempotent`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn grant_role_is_idempotent_on_p_rows(pool: PgPool) {
+    let authz = setup(&pool).await;
+    let user_id = Uuid::new_v4();
+    let domain = "tenant:test-idempotent-p-rows";
+    let role_key = "editor";
+
+    let permissions = vec![
+        ("documents".to_string(), "read".to_string()),
+        ("documents".to_string(), "write".to_string()),
+        ("members".to_string(), "list".to_string()),
+    ];
+
+    authz
+        .grant_role(user_id, domain, role_key, &permissions)
+        .await
+        .expect("first grant_role");
+
+    let p_rows_first: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype = 'p' and v0 = $1 and v1 = $2",
+    )
+    .bind(role_key)
+    .bind(domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        p_rows_first, 3,
+        "first grant_role must insert exactly one p-row per permission"
+    );
+
+    let g_rows_first: i64 =
+        sqlx::query_scalar("select count(*) from casbin_rule where ptype = 'g' and v1 = $1 and v2 = $2")
+            .bind(role_key)
+            .bind(domain)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(g_rows_first, 1, "first grant_role must insert exactly one g-row");
+
+    // Repeat with the same (user, domain, role, permissions).
+    authz
+        .grant_role(user_id, domain, role_key, &permissions)
+        .await
+        .expect("second grant_role must succeed");
+
+    let p_rows_second: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype = 'p' and v0 = $1 and v1 = $2",
+    )
+    .bind(role_key)
+    .bind(domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        p_rows_second, p_rows_first,
+        "second grant_role must not add p-row duplicates (has_policy pre-check)"
+    );
+
+    let g_rows_second: i64 =
+        sqlx::query_scalar("select count(*) from casbin_rule where ptype = 'g' and v1 = $1 and v2 = $2")
+            .bind(role_key)
+            .bind(domain)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        g_rows_second, g_rows_first,
+        "second grant_role must not add g-row duplicates"
+    );
+
+    // Sanity: permissions are still effective.
+    assert!(authz
+        .can(user_id, domain, "documents", "read")
+        .await
+        .unwrap());
+    assert!(authz
+        .can(user_id, domain, "documents", "write")
+        .await
+        .unwrap());
+    assert!(authz
+        .can(user_id, domain, "members", "list")
+        .await
+        .unwrap());
+}
+
+/// Stage 3h: the unique index `casbin_rule_unique_idx` (migration
+/// `20261110000001`) rejects a direct duplicate `INSERT`. This is a
+/// belt-and-suspenders safety net behind `grant_role`'s `has_policy`
+/// pre-check — it must survive even if a future code path forgets the
+/// pre-check.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn unique_index_rejects_duplicates(pool: PgPool) {
+    // First row: succeed.
+    sqlx::query(
+        r#"
+        insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
+        values ('p', 'editor', 'tenant:idx-test', 'documents', 'read', '', '')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("first insert must succeed");
+
+    // Identical row: must violate the unique index.
+    let err = sqlx::query(
+        r#"
+        insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
+        values ('p', 'editor', 'tenant:idx-test', 'documents', 'read', '', '')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect_err("duplicate insert must fail the unique index");
+
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("duplicate"),
+        "expected unique-violation, got: {msg}"
+    );
+
+    // Only one row exists.
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype = 'p' and v1 = 'tenant:idx-test'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "duplicate insert must not add a row");
+
+    // A different `(ptype, v0, v1, v2, v3)` is allowed.
+    sqlx::query(
+        r#"
+        insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
+        values ('p', 'editor', 'tenant:idx-test', 'documents', 'write', '', '')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("distinct row must succeed");
+}
+
 #[sqlx::test(migrations = "../db/migrations")]
 async fn has_role_reflects_g_rows(pool: PgPool) {
     let authz = setup(&pool).await;
@@ -279,9 +433,8 @@ async fn purge_role_removes_g_and_p_rows_and_is_idempotent(pool: PgPool) {
         .unwrap();
     // Grant the same role to a second user without re-listing permissions.
     // `grant_role` always writes a g-row; p-rows are role-level and already
-    // present from the first grant. Re-listing permissions here would rely
-    // on casbin-rs's `add_policy` deduplicating (role, domain, resource,
-    // action) — which it does not guarantee; see handoff §16.
+    // present from the first grant. Re-listing permissions here is now safe
+    // (Stage 3h `has_policy` pre-check) but unnecessary.
     authz.grant_role(u2, domain, role_key, &[]).await.unwrap();
 
     let g_rows: i64 =
