@@ -16,6 +16,18 @@
 //! `/platform` stays) and adds `/platform/audit`
 //! ([`pages::platform::PlatformAuditListPage`]) for the platform-admin
 //! audit view.
+//!
+//! **Client route guards (this follow-up).** Every private route is
+//! wrapped in [`guard::GuardRoute`] with a [`guard::RouteGuard`] policy
+//! declared right here, next to the `<Route>`. `pages/*.rs` are not
+//! touched: the policy lives in the router. Guards are **UX-only** —
+//! `saas::*` and `saas::platform::*` still call `authz.require` /
+//! `resolve_active_tenant` server-side. Public routes (`/`, `/login`,
+//! `/register`, `/verify/:token`, `/forgot-password`,
+//! `/reset-password/:token`, `/invitations/:token`) have no guard.
+//!
+//! A server-side per-route middleware (defense in depth) is deferred to
+//! Stage 4 — see `handoff.md` §16 and Appendix B §2.49 / §IV.40.
 
 // Leptos' `view!` macro expands to deeply nested generic types; the default
 // rustc recursion limit (128) is insufficient once `pages/member.rs` grows
@@ -25,6 +37,7 @@
 
 pub mod auth;
 pub mod email;
+pub mod guard;
 pub mod layout;
 pub mod pages;
 
@@ -43,6 +56,8 @@ use leptos::prelude::*;
 use leptos_meta::*;
 use leptos_router::{components::*, path};
 
+use crate::guard::{GuardRoute, RouteGuard};
+
 /// Root component: provides the meta context, mounts the router, and wraps
 /// every page in the global [`layout::Layout`].
 #[component]
@@ -53,6 +68,7 @@ pub fn App() -> impl IntoView {
         <Router>
             <layout::Layout>
                 <Routes fallback=|| "Not found">
+                    // ── Public routes (no guard) ───────────────────────────
                     <Route path=path!("/") view=pages::home::HomePage />
                     <Route path=path!("/login") view=pages::auth::LoginPage />
                     <Route path=path!("/register") view=pages::auth::RegisterPage />
@@ -66,62 +82,204 @@ pub fn App() -> impl IntoView {
                         view=pages::auth::ResetPasswordPage
                     />
                     <Route
+                        path=path!("/invitations/:token")
+                        view=pages::invitation::InvitationAcceptPage
+                    />
+
+                    // ── Platform admin ─────────────────────────────────────
+                    <Route
                         path=path!("/platform")
-                        view=pages::platform::PlatformTenantListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Platform {
+                                    resource: "tenants",
+                                    action: "list",
+                                }
+                            >
+                                <pages::platform::PlatformTenantListPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/platform/audit")
-                        view=pages::platform::PlatformAuditListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Platform {
+                                    resource: "audit",
+                                    action: "read",
+                                }
+                            >
+                                <pages::platform::PlatformAuditListPage />
+                            </GuardRoute>
+                        }
                     />
 
-                    <Route path=path!("/tenants") view=pages::tenant::TenantListPage />
-                    <Route path=path!("/tenants/:tenant_id") view=pages::tenant::TenantPage />
+                    // ── Tenants ────────────────────────────────────────────
+                    <Route
+                        path=path!("/tenants")
+                        view=move || view! {
+                            <GuardRoute guard=RouteGuard::Auth>
+                                <pages::tenant::TenantListPage />
+                            </GuardRoute>
+                        }
+                    />
+                    <Route
+                        path=path!("/tenants/:tenant_id")
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::TenantAny(vec![
+                                    ("workspaces", "create"),
+                                    ("members", "list"),
+                                    ("roles", "list"),
+                                    ("invitations", "list"),
+                                ])
+                            >
+                                <pages::tenant::TenantPage />
+                            </GuardRoute>
+                        }
+                    />
                     <Route
                         path=path!("/tenants/:tenant_id/invitations")
-                        view=pages::invitation::TenantInvitationListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Tenant {
+                                    resource: "invitations",
+                                    action: "list",
+                                }
+                            >
+                                <pages::invitation::TenantInvitationListPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/tenants/:tenant_id/members")
-                        view=pages::member::TenantMemberListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Tenant {
+                                    resource: "members",
+                                    action: "list",
+                                }
+                            >
+                                <pages::member::TenantMemberListPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/tenants/:tenant_id/roles")
-                        view=pages::role::TenantRoleListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Tenant {
+                                    resource: "roles",
+                                    action: "list",
+                                }
+                            >
+                                <pages::role::TenantRoleListPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/tenants/:tenant_id/roles/:role_id")
-                        view=pages::role::TenantRoleFormPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Tenant {
+                                    resource: "roles",
+                                    action: "manage",
+                                }
+                            >
+                                <pages::role::TenantRoleFormPage />
+                            </GuardRoute>
+                        }
                     />
 
-                    <Route path=path!("/workspaces") view=pages::workspace::WorkspaceListPage />
+                    // ── Workspaces ─────────────────────────────────────────
+                    <Route
+                        path=path!("/workspaces")
+                        view=move || view! {
+                            <GuardRoute guard=RouteGuard::Auth>
+                                <pages::workspace::WorkspaceListPage />
+                            </GuardRoute>
+                        }
+                    />
                     <Route
                         path=path!("/workspaces/:workspace_id")
-                        view=pages::workspace::WorkspacePage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::WorkspaceAny(vec![
+                                    ("documents", "read"),
+                                    ("documents", "write"),
+                                    ("members", "list"),
+                                    ("roles", "list"),
+                                    ("invitations", "list"),
+                                ])
+                            >
+                                <pages::workspace::WorkspacePage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/workspaces/:workspace_id/documents/:document_id")
-                        view=pages::workspace::DocumentPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Workspace {
+                                    resource: "documents",
+                                    action: "read",
+                                }
+                            >
+                                <pages::workspace::DocumentPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/workspaces/:workspace_id/invitations")
-                        view=pages::invitation::WorkspaceInvitationListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Workspace {
+                                    resource: "invitations",
+                                    action: "list",
+                                }
+                            >
+                                <pages::invitation::WorkspaceInvitationListPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/workspaces/:workspace_id/members")
-                        view=pages::member::WorkspaceMemberListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Workspace {
+                                    resource: "members",
+                                    action: "list",
+                                }
+                            >
+                                <pages::member::WorkspaceMemberListPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/workspaces/:workspace_id/roles")
-                        view=pages::role::WorkspaceRoleListPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Workspace {
+                                    resource: "roles",
+                                    action: "list",
+                                }
+                            >
+                                <pages::role::WorkspaceRoleListPage />
+                            </GuardRoute>
+                        }
                     />
                     <Route
                         path=path!("/workspaces/:workspace_id/roles/:role_id")
-                        view=pages::role::WorkspaceRoleFormPage
-                    />
-
-                    <Route
-                        path=path!("/invitations/:token")
-                        view=pages::invitation::InvitationAcceptPage
+                        view=move || view! {
+                            <GuardRoute
+                                guard=RouteGuard::Workspace {
+                                    resource: "roles",
+                                    action: "manage",
+                                }
+                            >
+                                <pages::role::WorkspaceRoleFormPage />
+                            </GuardRoute>
+                        }
                     />
                 </Routes>
             </layout::Layout>
