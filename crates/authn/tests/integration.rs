@@ -731,11 +731,10 @@ async fn request_password_reset_persists_row(pool: PgPool) {
         "expires_at must be ~{PASSWORD_RESET_TTL_HOURS}h in the future"
     );
 
-    let stored_hash: String =
-        sqlx::query_scalar("select token_hash from password_reset_tokens")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let stored_hash: String = sqlx::query_scalar("select token_hash from password_reset_tokens")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(stored_hash.len(), 64, "sha-256 hex");
     assert_ne!(stored_hash, raw, "raw token must not be persisted");
 }
@@ -947,10 +946,7 @@ async fn reset_password_short_password_returns_validation(pool: PgPool) {
         .await
         .expect_err("short password must be rejected");
     assert!(
-        matches!(
-            err,
-            AuthnError::Identity(IdentityErrorKind::Validation(_))
-        ),
+        matches!(err, AuthnError::Identity(IdentityErrorKind::Validation(_))),
         "got {err:?}"
     );
 
@@ -1000,12 +996,11 @@ async fn reset_password_revokes_all_refresh_tokens(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let total: i64 =
-        sqlx::query_scalar("select count(*) from refresh_tokens where user_id = $1")
-            .bind(user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let total: i64 = sqlx::query_scalar("select count(*) from refresh_tokens where user_id = $1")
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         revoked, total,
         "reset_password must revoke every refresh-token row of the user"
@@ -1069,7 +1064,10 @@ async fn revoke_all_user_tokens_revokes_every_family_of_user(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(user_revoked, user_total, "every row of the target user revoked");
+    assert_eq!(
+        user_revoked, user_total,
+        "every row of the target user revoked"
+    );
 
     let other_revoked: i64 = sqlx::query_scalar(
         "select count(*) from refresh_tokens where user_id = $1 and revoked_at is not null",

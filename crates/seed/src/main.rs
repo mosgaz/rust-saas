@@ -63,9 +63,8 @@ async fn main() -> anyhow::Result<()> {
     // `SaasState` — one pool, one logger, one audit_log table.
     let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
-    let access_state = Arc::new(
-        AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
-    );
+    let access_state =
+        Arc::new(AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
 
     let state = SaasBuilder::new(pool.clone())
         .with_authz(authz.clone())

@@ -800,10 +800,7 @@ impl Authn {
     /// path; the silent `Ok(None)` path (unknown email) does not audit
     /// (Stage 3e). Does **not** validate the target's password; does
     /// **not** touch `email_verified_at` (reset ≠ verification).
-    pub async fn request_password_reset(
-        &self,
-        email: &str,
-    ) -> Result<Option<String>, AuthnError> {
+    pub async fn request_password_reset(&self, email: &str) -> Result<Option<String>, AuthnError> {
         let Some(record) = identity::find_by_email(&self.pool, email).await? else {
             return Ok(None);
         };
@@ -1247,7 +1244,6 @@ mod tests {
         let result = authn(secret).verify_token(&token).await.expect("verify");
         assert!(result.is_none());
     }
-
 
     #[tokio::test]
     async fn verify_token_rejects_garbage() {

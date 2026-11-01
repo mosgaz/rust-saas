@@ -15,6 +15,11 @@
 //! `my_permissions` (UX helper) run on a suspended tenant by design — a
 //! tenant member must still see which tenants they belong to and which
 //! actions *would* be permitted when the tenant is reactivated.
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<Uuid>`
+//! for the id field. The `IntoParam` impl for bare `Uuid` is gated behind
+//! Leptos's `nightly` feature; the `Option<Uuid>` impl works on stable.
+//! Closures unwrap with `.and_then(|p| p.field)`.
 
 use domain::Workspace;
 use leptos::callback::Callback;
@@ -141,7 +146,7 @@ pub fn TenantListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct TenantParams {
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
 }
 
 /// `/tenants/:tenant_id` — single tenant page: create a workspace (only
@@ -156,7 +161,13 @@ struct TenantParams {
 #[component]
 pub fn TenantPage() -> impl IntoView {
     let params = use_params::<TenantParams>();
-    let tenant_id = move || params.with(|r| r.as_ref().ok().map(|p| p.tenant_id));
+    let tenant_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.tenant_id)
+        })
+    };
 
     let can_create_workspace = RwSignal::new(false);
     let can_members = RwSignal::new(false);

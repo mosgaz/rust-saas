@@ -9,6 +9,8 @@
 # Build output
 target
 examples/*/target
+examples/*/dist
+examples/*/pkg
 
 # Local environment — never copy secrets into an image
 .env

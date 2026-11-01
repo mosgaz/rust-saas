@@ -6,6 +6,8 @@ and one revision**. Do not mix, for example, `access 0.1.0` with `saas
 version at the source; consumers must pin every path / git dependency to
 the same tag.
 
+**Current version:** `0.2.0` (`Cargo.toml` → `[workspace.package]`).
+
 ## Versioning policy
 
 - **Patch (`0.x.Y`)** — bugfixes, internal improvements. No public-API
@@ -17,6 +19,28 @@ the same tag.
 - **Major (`X.0.0`)** — out of `0.x`; full SemVer.
 
 ## Breaking changes so far
+
+### 0.1.0 — initial release
+
+Baseline for `0.2.0`. No documented breaking changes; the crate set,
+error types, and public API as of Stage 3h.
+
+### 0.2.0 — Stage 4.1 (iat-vs-`password_changed_at`)
+
+`authn::verify_token` now rejects access JWTs whose `iat` claim is older
+than `users.password_changed_at`. Before this, a token issued *before* a
+password reset remained valid until its `exp` (up to
+`ACCESS_TOKEN_TTL_MINUTES`, default 15 min). After this, it is rejected
+as `AuthnError::TokenInvalid` (same variant as "signature mismatch" — the
+error mapping in `error.rs` is unchanged).
+
+**Migration.** A consumer that intentionally relied on old access tokens
+surviving a password change should re-issue access + refresh tokens after
+`authn::reset_password` / a successful login. The normal flow is
+unaffected: a freshly issued token has `iat >= password_changed_at`.
+
+**Why.** A stolen access token could otherwise survive a password reset
+for up to `access_ttl`. The check closes that window.
 
 ### 0.2.0 — Stage 4.2 (error isolation)
 

@@ -420,14 +420,18 @@ async fn grant_role_is_idempotent_on_p_rows(pool: PgPool) {
         "first grant_role must insert exactly one p-row per permission"
     );
 
-    let g_rows_first: i64 =
-        sqlx::query_scalar("select count(*) from casbin_rule where ptype = 'g' and v1 = $1 and v2 = $2")
-            .bind(role_key)
-            .bind(domain)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(g_rows_first, 1, "first grant_role must insert exactly one g-row");
+    let g_rows_first: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype = 'g' and v1 = $1 and v2 = $2",
+    )
+    .bind(role_key)
+    .bind(domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        g_rows_first, 1,
+        "first grant_role must insert exactly one g-row"
+    );
 
     // Repeat with the same (user, domain, role, permissions).
     authz
@@ -448,13 +452,14 @@ async fn grant_role_is_idempotent_on_p_rows(pool: PgPool) {
         "second grant_role must not add p-row duplicates (has_policy pre-check)"
     );
 
-    let g_rows_second: i64 =
-        sqlx::query_scalar("select count(*) from casbin_rule where ptype = 'g' and v1 = $1 and v2 = $2")
-            .bind(role_key)
-            .bind(domain)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let g_rows_second: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype = 'g' and v1 = $1 and v2 = $2",
+    )
+    .bind(role_key)
+    .bind(domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         g_rows_second, g_rows_first,
         "second grant_role must not add g-row duplicates"

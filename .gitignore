@@ -102,6 +102,7 @@ dist/
 # Examples are excluded from workspace; each keeps its own target/ and lockfile
 examples/*/target/
 examples/*/dist/
+examples/*/pkg/
 
 # ─────────────────────────────────────────────────────────────────────────────
 # External context docs: handoff, ADRs, appendices, pluggability analysis.

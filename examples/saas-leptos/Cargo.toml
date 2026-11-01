@@ -54,7 +54,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 dotenvy = { version = "0.15", optional = true }
 icons = { version = "0.19", features = ["leptos"] }
-wasm-bindgen = "0.2"
+wasm-bindgen = "=0.2.129"
+web-time = "1.1.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
@@ -101,6 +102,16 @@ site-addr = "127.0.0.1:3395"
 reload-port = 3396
 bin-features = ["ssr"]
 lib-features = ["hydrate"]
+lib-profile-release = "wasm-release"
+wasm-opt-features = ["-Oz"]
 
 # Independent workspace: consumer example, not part of the library.
+
+[profile.wasm-release]
+inherits = "release"
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+
 [workspace]

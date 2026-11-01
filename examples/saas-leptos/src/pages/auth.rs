@@ -34,6 +34,12 @@
 //!   `TokenInvalid`. Does **not** auto-login — cookies from before the reset
 //!   are revoked server-side (all refresh-token families are revoked with
 //!   `revoked_reason = "password_reset"`); the user signs in again.
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use
+//! `Option<T>` for UUID/String fields. The `IntoParam` impl for bare `T` is
+//! gated behind Leptos's `nightly` feature; the `Option<T>` impl works on
+//! stable. Callers unwrap with `.and_then(|p| p.field)` where a
+//! `Option<String>` is expected.
 
 use crate::auth::{
     login, register, request_email_verification, request_password_reset, reset_password,
@@ -235,7 +241,7 @@ pub fn RegisterPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct VerifyTokenParams {
-    token: String,
+    token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -248,7 +254,13 @@ enum VerifyStatus {
 #[component]
 pub fn VerifyEmailPage() -> impl IntoView {
     let params = use_params::<VerifyTokenParams>();
-    let token = move || params.with(|r| r.as_ref().ok().map(|p| p.token.clone()));
+    let token = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.token.clone())
+        })
+    };
 
     let status = RwSignal::new(VerifyStatus::Loading);
 
@@ -381,13 +393,19 @@ pub fn ForgotPasswordPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct ResetTokenParams {
-    token: String,
+    token: Option<String>,
 }
 
 #[component]
 pub fn ResetPasswordPage() -> impl IntoView {
     let params = use_params::<ResetTokenParams>();
-    let token = move || params.with(|r| r.as_ref().ok().map(|p| p.token.clone()));
+    let token = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.token.clone())
+        })
+    };
 
     let password = RwSignal::new(String::new());
     let confirm = RwSignal::new(String::new());

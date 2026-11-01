@@ -37,6 +37,26 @@ RUN apt-get update \
 # Leptos 0.8 builds the client half against wasm32.
 RUN rustup target add wasm32-unknown-unknown
 
+# wasm-opt v133 — из GitHub release, а не apt: binaryen 112 в
+# debian:bookworm не понимает wasm-features, которые Rust 1.98
+# генерирует по умолчанию (bulk-memory, reference-types,
+# multivalue), и молчаливо фейлит — cargo-leptos копирует
+# неоптимизированный .wasm (~2.6 MB вместо ~400 KB).
+ARG BINARYEN_VERSION=133
+RUN ARCH=$(uname -m) \
+ && case "$ARCH" in \
+      x86_64) BIN_ARCH=x86_64 ;; \
+      aarch64) BIN_ARCH=aarch64 ;; \
+      *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL \
+      "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${BIN_ARCH}-linux.tar.gz" \
+      -o /tmp/binaryen.tar.gz \
+ && tar -xzf /tmp/binaryen.tar.gz -C /opt \
+ && ln -s "/opt/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt \
+ && rm /tmp/binaryen.tar.gz \
+ && wasm-opt --version
+
 # Tailwind CSS 4 is built by `cargo-leptos` via a **standalone binary**
 # it downloads on first use — **no Node.js, no npm, no `npx`**. That is the
 # project rule: this repository must not depend on Node in any form (build,
@@ -57,7 +77,7 @@ ENV LEPTOS_TAILWIND_VERSION=v4.2.1
 # own dependencies. We pin the major version in the comment below and
 # revisit when reproducible builds become a goal.
 #   cargo-leptos 0.2.x — current stable.
-RUN cargo install cargo-leptos --locked
+RUN cargo install cargo-leptos --version "=0.3.11" --locked
 
 # Same single-COPY reasoning as `axum-minimal`: `.dockerignore` keeps the
 # large directories out, and layered manifest-copy is deferred until build
@@ -66,6 +86,7 @@ COPY . .
 
 WORKDIR /build/examples/saas-leptos
 RUN cargo leptos build --release
+
 
 # ── runtime ────────────────────────────────────────────────────────────────
 FROM debian:${DEBIAN_VERSION}-slim AS runtime

@@ -53,6 +53,11 @@
 //!   anonymous visitor on `/invitations/:token` gets the invitation's
 //!   existence and status regardless; a subsequent Accept will be rejected
 //!   with `TenantSuspended`.
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<T>`
+//! for UUID/String fields. The `IntoParam` impl for bare `T` is gated
+//! behind Leptos's `nightly` feature; the `Option<T>` impl works on
+//! stable. Closures unwrap with `.and_then(|p| p.field)`.
 
 use domain::{Invitation, InvitationTarget};
 use leptos::prelude::*;
@@ -497,13 +502,19 @@ fn invite_status(inv: &Invitation) -> String {
 
 #[derive(Params, PartialEq)]
 struct TenantIdParams {
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
 }
 
 #[component]
 pub fn TenantInvitationListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
-    let tenant_id = move || params.with(|r| r.as_ref().ok().map(|p| p.tenant_id));
+    let tenant_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.tenant_id)
+        })
+    };
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -528,13 +539,19 @@ pub fn TenantInvitationListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceIdParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
 #[component]
 pub fn WorkspaceInvitationListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
-    let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
+    let workspace_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.workspace_id)
+        })
+    };
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -561,13 +578,19 @@ pub fn WorkspaceInvitationListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct InviteTokenParams {
-    token: String,
+    token: Option<String>,
 }
 
 #[component]
 pub fn InvitationAcceptPage() -> impl IntoView {
     let params = use_params::<InviteTokenParams>();
-    let token = move || params.with(|r| r.as_ref().ok().map(|p| p.token.clone()));
+    let token = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.token.clone())
+        })
+    };
 
     let invite_info = RwSignal::new(None::<Option<Invitation>>);
     let who = RwSignal::new(None::<Option<SessionUser>>);
@@ -776,5 +799,6 @@ pub fn InvitationAcceptPage() -> impl IntoView {
                 })
             }}
         </main>
+		
     }
 }

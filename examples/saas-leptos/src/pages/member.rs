@@ -28,6 +28,11 @@
 //! [`crate::perms_cache::PermsCache`] provided at the root `App`. The cache
 //! is invalidated after `assign_member_role` and `remove_member_role`, so
 //! the next render sees fresh permissions.
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<Uuid>`
+//! for the id fields. The `IntoParam` impl for bare `Uuid` is gated behind
+//! Leptos's `nightly` feature; the `Option<Uuid>` impl works on stable.
+//! Closures unwrap with `.and_then(|p| p.field)`.
 
 use std::collections::HashSet;
 
@@ -410,14 +415,20 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct TenantIdParams {
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
 }
 
 /// `/tenants/:tenant_id/members` — tenant member list.
 #[component]
 pub fn TenantMemberListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
-    let tenant_id = move || params.with(|r| r.as_ref().ok().map(|p| p.tenant_id));
+    let tenant_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.tenant_id)
+        })
+    };
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -441,14 +452,20 @@ pub fn TenantMemberListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceIdParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id/members` — workspace member list.
 #[component]
 pub fn WorkspaceMemberListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
-    let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
+    let workspace_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.workspace_id)
+        })
+    };
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
