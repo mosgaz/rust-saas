@@ -33,6 +33,28 @@ use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+/// Per-crate migration set for `audit-pg` (Stage 4.3c).
+///
+/// Idempotent (`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`),
+/// so calling `db::migrate` first and `db::migrate_with(&[MIGRATOR])`
+/// second is safe. Version namespace `001_…` (see `./migrations/`); it
+/// never collides with the workspace set (`YYYYMMDD…` in
+/// `crates/db/migrations/`).
+///
+/// A consumer that only needs `audit_log` can run this migrator alone:
+///
+/// ```ignore
+/// let pool = db::connect(&url).await?;
+/// db::migrate_with(&pool, &[audit_pg::MIGRATOR]).await?;
+/// ```
+///
+/// The table's foreign key to `users(id)` requires that table to exist;
+/// run `db::migrate` (or an equivalent identity migration) first in that
+/// case. Standalone use is fine when `audit_log` is queried only via this
+/// crate's API and `users` will be provisioned by the consumer's own
+/// migration.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// PostgreSQL-backed [`AuditLogger`].
 ///
 /// Stores only a `PgPool` — the same pool that `saas`/`access`/`authn` use

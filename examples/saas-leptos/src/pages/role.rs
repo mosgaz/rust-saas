@@ -27,6 +27,12 @@
 //! [`crate::perms_cache::PermsCache`] provided at the root `App`. The cache
 //! is invalidated after `create_role`, `update_role`, and `delete_role`, so
 //! the next render sees fresh permissions.
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<Uuid>`
+//! for the id fields. The `IntoParam` impl for bare `Uuid` is gated behind
+//! Leptos's `nightly` feature; the `Option<Uuid>` impl works on stable.
+//! Closures unwrap with `.and_then(|p| p.field)` — or, for pairs,
+//! `p.a.zip(p.b)` to produce `Option<(A, B)>`.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -689,14 +695,20 @@ pub fn RoleFormPage(domain: String, role_id: Uuid, back_url: String) -> impl Int
 
 #[derive(Params, PartialEq)]
 struct TenantIdParams {
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
 }
 
 /// `/tenants/:tenant_id/roles` — tenant roles.
 #[component]
 pub fn TenantRoleListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
-    let tenant_id = move || params.with(|r| r.as_ref().ok().map(|p| p.tenant_id));
+    let tenant_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.tenant_id)
+        })
+    };
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -717,14 +729,20 @@ pub fn TenantRoleListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceIdParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id/roles` — workspace roles.
 #[component]
 pub fn WorkspaceRoleListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
-    let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
+    let workspace_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.workspace_id)
+        })
+    };
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -749,8 +767,8 @@ pub fn WorkspaceRoleListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct TenantRoleFormParams {
-    tenant_id: Uuid,
-    role_id: Uuid,
+    tenant_id: Option<Uuid>,
+    role_id: Option<Uuid>,
 }
 
 /// `/tenants/:tenant_id/roles/:role_id` — edit a tenant role.
@@ -761,7 +779,7 @@ pub fn TenantRoleFormPage() -> impl IntoView {
         params.with(|r| {
             r.as_ref()
                 .ok()
-                .map(|p| (p.tenant_id, p.role_id))
+                .and_then(|p| p.tenant_id.zip(p.role_id))
         })
     };
 
@@ -790,8 +808,8 @@ pub fn TenantRoleFormPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceRoleFormParams {
-    workspace_id: Uuid,
-    role_id: Uuid,
+    workspace_id: Option<Uuid>,
+    role_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id/roles/:role_id` — edit a workspace role.
@@ -802,7 +820,7 @@ pub fn WorkspaceRoleFormPage() -> impl IntoView {
         params.with(|r| {
             r.as_ref()
                 .ok()
-                .map(|p| (p.workspace_id, p.role_id))
+                .and_then(|p| p.workspace_id.zip(p.role_id))
         })
     };
 

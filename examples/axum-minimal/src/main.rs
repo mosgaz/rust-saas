@@ -62,10 +62,14 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 mod audit;
+mod auth_layer;
 mod auth;
+mod cookie;
+mod csrf;
 mod email;
 mod error;
 mod extract;
+mod health;
 mod middleware;
 mod rate_limit;
 mod state;
@@ -152,12 +156,18 @@ async fn main() -> anyhow::Result<()> {
     let email: Arc<dyn email::EmailSender> = Arc::new(NoopEmailSender);
     let rate_limit = Arc::new(SimpleRateLimiter::new());
 
-    let app_state = AppState {
+    // Stage 4.1b: cookie policy (Secure/SameSite/Max-Age).
+    let cookie_cfg = std::sync::Arc::new(
+        cookie::CookieConfig::from_env(&bind_addr),
+    );
+
+    let app_state = Arc::new(AppState {
         authn: authn.clone(),
         saas,
         email,
         rate_limit,
-    };
+        cookie: cookie_cfg.clone(),
+    });
 
     // ── Router: public vs protected ────────────────────────────────────────
     //
@@ -180,9 +190,24 @@ async fn main() -> anyhow::Result<()> {
             get(workspace::list_documents).post(workspace::create_document),
         )
         .route("/audit", get(audit::list_audit))
-        .route_layer(from_fn_with_state(authn, middleware::auto_refresh));
+        // Axum note: the *last* `.route_layer` is the outermost. So the
+        // calls below are in reverse execution order — the request runs
+        // them top-to-bottom of this list.
+        //
+        // Stage 4.1d: server-side AuthLayer (innermost of the three — must
+        // run *after* auto_refresh has populated Extension<Option<AuthUser>>).
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_layer::auth_layer,
+        ))
+        // Stage 3g: auto_refresh (verify access / rotate refresh).
+        .route_layer(from_fn_with_state(app_state.clone(), middleware::auto_refresh))
+        // Stage 4.1c: CSRF guard (outermost — reject cross-origin before
+        // doing any auth work).
+        .route_layer(axum::middleware::from_fn(csrf::csrf_guard));
 
     let public: Router<Arc<AppState>> = Router::new()
+        .route("/healthz", get(health::healthz))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout));
@@ -190,7 +215,13 @@ async fn main() -> anyhow::Result<()> {
     let router = protected
         .merge(public)
         .layer(TraceLayer::new_for_http())
-        .with_state(Arc::new(app_state));
+        // Stage 4.1c: issue a `csrf` cookie on the first request
+        // (runs after the handler; if the client already has one, no-op).
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            csrf::csrf_issue,
+        ))
+        .with_state(app_state);
 
     // ── Serve ──────────────────────────────────────────────────────────────
     let listener = tokio::net::TcpListener::bind(bind_addr)

@@ -89,15 +89,19 @@ pub enum RouteGuard {
 /// Route params for `/tenants/:tenant_id/...` pages. Same shape as the
 /// per-page structs in `pages/*.rs`; defined locally so the guard module is
 /// self-contained (no cross-page `pub(crate)` visibility churn).
+///
+/// `Option<Uuid>` (not bare `Uuid`) is required on stable Rust: the
+/// `IntoParam` impl for non-`Option` types is gated behind Leptos's
+/// `nightly` feature.
 #[derive(Params, PartialEq)]
 struct TenantIdParams {
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
 }
 
 /// Route params for `/workspaces/:workspace_id/...` pages.
 #[derive(Params, PartialEq)]
 struct WorkspaceIdParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
 // ─── GuardRoute — monolithic ───────────────────────────────────────────────
@@ -129,12 +133,14 @@ pub fn GuardRoute(guard: RouteGuard, children: ChildrenFn) -> impl IntoView {
             RouteGuard::Tenant { .. } | RouteGuard::TenantAny(..) => params_t.with(|r| {
                 r.as_ref()
                     .ok()
-                    .map(|p| domain::tenant_domain(p.tenant_id))
+                    .and_then(|p| p.tenant_id)
+                    .map(domain::tenant_domain)
             }),
             RouteGuard::Workspace { .. } | RouteGuard::WorkspaceAny(..) => params_w.with(|r| {
                 r.as_ref()
                     .ok()
-                    .map(|p| domain::workspace_domain(p.workspace_id))
+                    .and_then(|p| p.workspace_id)
+                    .map(domain::workspace_domain)
             }),
         }
     });

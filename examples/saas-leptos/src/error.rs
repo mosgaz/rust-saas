@@ -42,7 +42,6 @@ use leptos::prelude::*;
 
 use access::AccessError;
 use authn::AuthnError;
-use identity::IdentityError;
 use saas::CoreError;
 
 fn status_for_core(e: &CoreError) -> u16 {
@@ -55,12 +54,13 @@ fn status_for_core(e: &CoreError) -> u16 {
     }
 }
 
-fn status_for_identity(e: &IdentityError) -> u16 {
+fn status_for_identity_kind(e: &authn::IdentityErrorKind) -> u16 {
+    use authn::IdentityErrorKind;
     match e {
-        IdentityError::Validation(_) => 400,
-        IdentityError::NotFound => 404,
-        IdentityError::DuplicateEmail => 409,
-        IdentityError::Db(_) => 500,
+        IdentityErrorKind::Validation(_) => 400,
+        IdentityErrorKind::NotFound => 404,
+        IdentityErrorKind::DuplicateEmail => 409,
+        IdentityErrorKind::Internal(_) => 500,
     }
 }
 
@@ -71,7 +71,7 @@ fn status_for_authn(e: &AuthnError) -> u16 {
         AuthnError::RefreshInvalid | AuthnError::RefreshReused => 401,
         AuthnError::AlreadyVerified => 409,
         AuthnError::Internal(_) => 500,
-        AuthnError::Identity(inner) => status_for_identity(inner),
+        AuthnError::Identity(inner) => status_for_identity_kind(inner),
         AuthnError::Db(_) => 500,
     }
 }

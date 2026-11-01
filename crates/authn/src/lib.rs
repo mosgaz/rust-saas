@@ -32,8 +32,9 @@
 //! `users.password_hash` and `users.password_changed_at = now()` (via
 //! `identity::update_password_tx`), expires every outstanding reset token
 //! for the user, and revokes every refresh-token family
-//! ([`RevokeReason::PasswordReset`]). Access JWTs remain valid until their
-//! short `exp`; iat-vs-`password_changed_at` enforcement is Stage 4.
+//! ([`RevokeReason::PasswordReset`]). Access JWTs issued before the change
+//! are rejected by [`Authn::verify_token`] via the iat-vs-
+//! `password_changed_at` check (Stage 4.1).
 //!
 //! Stage 3e: audit events (ADR-0004). [`Authn`] carries an
 //! `Arc<dyn AuditLogger>` (default [`NoopAuditLogger`]). After a successful
@@ -81,6 +82,18 @@ use uuid::Uuid;
 
 use identity::{IdentityError, UserRecord};
 
+impl From<sqlx::Error> for AuthnError {
+    fn from(e: sqlx::Error) -> Self {
+        AuthnError::Db(e.to_string())
+    }
+}
+
+impl From<IdentityError> for AuthnError {
+    fn from(e: IdentityError) -> Self {
+        AuthnError::Identity(IdentityErrorKind::from(e))
+    }
+}
+
 /// Default access-token lifetime (Stage 2b). Can be overridden per instance
 /// via [`Authn::with_ttl`].
 pub const DEFAULT_ACCESS_TTL_MINUTES: i64 = 15;
@@ -109,6 +122,34 @@ pub const EMAIL_VERIFICATION_TTL_HOURS: i64 = 24;
 /// Password-reset token lifetime (Stage 3d): 1 hour.
 pub const PASSWORD_RESET_TTL_HOURS: i64 = 1;
 
+/// Public projection of `identity::IdentityError`: carries only the
+/// variants that are meaningful to a caller of `authn`. The opaque `Db`
+/// and the free-form `Internal` are folded into `Internal(String)` so that
+/// `authn` does not expose `IdentityError` as a type (Stage 4.2,
+/// `COMPATIBILITY.md`).
+#[derive(Debug, thiserror::Error)]
+pub enum IdentityErrorKind {
+    #[error("user not found")]
+    NotFound,
+    #[error("email already registered")]
+    DuplicateEmail,
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("internal identity error: {0}")]
+    Internal(String),
+}
+
+impl From<IdentityError> for IdentityErrorKind {
+    fn from(e: IdentityError) -> Self {
+        match e {
+            IdentityError::NotFound => IdentityErrorKind::NotFound,
+            IdentityError::DuplicateEmail => IdentityErrorKind::DuplicateEmail,
+            IdentityError::Validation(s) => IdentityErrorKind::Validation(s),
+            IdentityError::Db(s) => IdentityErrorKind::Internal(s),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthnError {
     #[error("invalid credentials")]
@@ -130,10 +171,10 @@ pub enum AuthnError {
     AlreadyVerified,
     #[error("internal authentication error: {0}")]
     Internal(String),
-    #[error(transparent)]
-    Identity(#[from] IdentityError),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("identity error: {0}")]
+    Identity(IdentityErrorKind),
+    #[error("db error: {0}")]
+    Db(String),
 }
 
 /// Reason recorded in `refresh_tokens.revoked_reason` (Stage 3b). The column
@@ -597,7 +638,7 @@ impl Authn {
                 .await?;
 
         let Some(verified_at) = verified_at else {
-            return Err(AuthnError::Identity(IdentityError::NotFound));
+            return Err(AuthnError::Identity(IdentityErrorKind::NotFound));
         };
 
         if verified_at.is_some() {
@@ -759,10 +800,7 @@ impl Authn {
     /// path; the silent `Ok(None)` path (unknown email) does not audit
     /// (Stage 3e). Does **not** validate the target's password; does
     /// **not** touch `email_verified_at` (reset ≠ verification).
-    pub async fn request_password_reset(
-        &self,
-        email: &str,
-    ) -> Result<Option<String>, AuthnError> {
+    pub async fn request_password_reset(&self, email: &str) -> Result<Option<String>, AuthnError> {
         let Some(record) = identity::find_by_email(&self.pool, email).await? else {
             return Ok(None);
         };
@@ -962,8 +1000,27 @@ impl Authn {
             Err(_) => return Ok(None),
         };
 
-        let user = identity::find_by_id(&self.pool, id).await?;
-        Ok(user)
+        // Stage 4.1: extract `iat` before the DB hit — a token without
+        // `iat` cannot be iat-checked, so reject it as malformed.
+        let Some(iat) = data.claims.get("iat").and_then(|v| v.as_i64()) else {
+            return Err(AuthnError::TokenInvalid);
+        };
+
+        let record = identity::find_record_by_id(&self.pool, id).await?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+
+        // Reject access tokens issued before the last password change.
+        // `iat` is seconds; `password_changed_at` is compared at the same
+        // granularity. A token issued in the same second as a reset is
+        // accepted — the 1-second window is far narrower than the
+        // 15-minute `access_ttl` this closes.
+        if iat < record.password_changed_at.timestamp() {
+            return Err(AuthnError::TokenInvalid);
+        }
+
+        Ok(Some(record.into()))
     }
 }
 
@@ -1194,6 +1251,29 @@ mod tests {
             .verify_token("not.a.jwt")
             .await
             .expect_err("verify must reject");
+        assert!(matches!(err, AuthnError::TokenInvalid));
+    }
+
+    #[tokio::test]
+    async fn verify_token_rejects_missing_iat() {
+        // Stage 4.1: `iat` is required — without it the iat-vs-
+        // `password_changed_at` check cannot run. Reject before any DB hit.
+        let secret = "missing-iat-secret";
+        let now = Utc::now().timestamp();
+        let claims = json!({
+            "sub": Uuid::new_v4().to_string(),
+            "exp": now + 3600,
+        });
+        let token = jsonwebtoken::encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode");
+        let err = authn(secret)
+            .verify_token(&token)
+            .await
+            .expect_err("missing iat must be rejected");
         assert!(matches!(err, AuthnError::TokenInvalid));
     }
 }

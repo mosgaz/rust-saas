@@ -1952,15 +1952,10 @@ async fn provision_tenant_emits_tenant_created(pool: PgPool) {
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant = platform::provision_tenant(
-        &saas,
-        &admin,
-        unique_name("AuditAcme"),
-        &owner,
-        &owner_key,
-    )
-    .await
-    .expect("provision_tenant must succeed");
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &owner, &owner_key)
+            .await
+            .expect("provision_tenant must succeed");
 
     let rows = audit_rows(&pool).await;
     let created: Vec<_> = rows
@@ -1987,15 +1982,10 @@ async fn create_workspace_emits_workspace_created(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
 
     let owner_key = RoleKey::parse("owner").unwrap();
-    let tenant = platform::provision_tenant(
-        &saas,
-        &admin,
-        unique_name("AuditAcme"),
-        &admin,
-        &owner_key,
-    )
-    .await
-    .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &admin, &owner_key)
+            .await
+            .unwrap();
 
     let ws = tenant::create_workspace(
         &saas,
@@ -2035,15 +2025,10 @@ async fn invitation_lifecycle_emits_created_accepted(pool: PgPool) {
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant = platform::provision_tenant(
-        &saas,
-        &admin,
-        unique_name("AuditAcme"),
-        &owner,
-        &owner_key,
-    )
-    .await
-    .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &owner, &owner_key)
+            .await
+            .unwrap();
 
     let (inv, token) = invitation::create_invitation(
         &saas,
@@ -2140,15 +2125,10 @@ async fn change_role_emits_three_events(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
 
     let owner_key = RoleKey::parse("owner").unwrap();
-    let tenant = platform::provision_tenant(
-        &saas,
-        &admin,
-        unique_name("AuditAcme"),
-        &admin,
-        &owner_key,
-    )
-    .await
-    .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &admin, &owner_key)
+            .await
+            .unwrap();
     let ws = tenant::create_workspace(
         &saas,
         &admin,
@@ -2209,25 +2189,27 @@ async fn change_role_emits_three_events(pool: PgPool) {
     .await
     .expect("change_role must succeed");
 
-    let rows: Vec<(String, Option<Uuid>, Option<String>, Option<String>, Option<Uuid>, serde_json::Value)> =
-        sqlx::query_as(
-            r#"
+    let rows: Vec<(
+        String,
+        Option<Uuid>,
+        Option<String>,
+        Option<String>,
+        Option<Uuid>,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        r#"
             select event_type, actor_id, actor_email, target_type, target_id, metadata
             from audit_log
             order by occurred_at asc, id asc
             offset $1
             "#,
-        )
-        .bind(before)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+    )
+    .bind(before)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
 
-    assert_eq!(
-        rows.len(),
-        3,
-        "change_role must emit exactly 3 audit rows"
-    );
+    assert_eq!(rows.len(), 3, "change_role must emit exactly 3 audit rows");
 
     // 1. member.role_assigned (from assign_role) — target user, role_key = new.
     let (et, actor_id, actor_email, target_type, target_id, metadata) = &rows[0];
@@ -2272,9 +2254,10 @@ async fn resolve_active_tenant_active_returns_tenant(pool: PgPool) {
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
-        .await
-        .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
+            .await
+            .unwrap();
 
     let active = platform::resolve_active_tenant(&saas, &owner, tenant.id)
         .await
@@ -2297,9 +2280,10 @@ async fn resolve_active_tenant_suspended_returns_tenant_suspended(pool: PgPool) 
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
-        .await
-        .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
+            .await
+            .unwrap();
     sqlx::query("update tenants set status = 'suspended' where id = $1")
         .bind(tenant.id)
         .execute(&pool)
@@ -2323,9 +2307,10 @@ async fn resolve_active_tenant_non_member_returns_forbidden(pool: PgPool) {
     let outsider = make_user(&pool, "outsider").await;
     let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
-        .await
-        .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("Resolve"), &owner, &owner_key)
+            .await
+            .unwrap();
 
     let err = platform::resolve_active_tenant(&saas, &outsider, tenant.id)
         .await
@@ -2345,14 +2330,12 @@ async fn list_tenants_requires_platform_tenants_list(pool: PgPool) {
     let owner_key = RoleKey::parse("owner").unwrap();
     let a = make_user(&pool, "a").await;
     let b = make_user(&pool, "b").await;
-    let tenant_a =
-        platform::provision_tenant(&saas, &admin, unique_name("LA"), &a, &owner_key)
-            .await
-            .unwrap();
-    let tenant_b =
-        platform::provision_tenant(&saas, &admin, unique_name("LB"), &b, &owner_key)
-            .await
-            .unwrap();
+    let tenant_a = platform::provision_tenant(&saas, &admin, unique_name("LA"), &a, &owner_key)
+        .await
+        .unwrap();
+    let tenant_b = platform::provision_tenant(&saas, &admin, unique_name("LB"), &b, &owner_key)
+        .await
+        .unwrap();
 
     let err = platform::list_tenants(&saas, &outsider)
         .await
@@ -2378,10 +2361,9 @@ async fn suspend_tenant_emits_event_and_is_idempotent(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant =
-        platform::provision_tenant(&saas, &admin, unique_name("Susp"), &admin, &owner_key)
-            .await
-            .unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Susp"), &admin, &owner_key)
+        .await
+        .unwrap();
 
     let before: i64 = sqlx::query_scalar("select count(*) from audit_log")
         .fetch_one(&pool)
@@ -2436,10 +2418,9 @@ async fn activate_tenant_emits_event_and_is_idempotent(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner_key = RoleKey::parse("owner").unwrap();
 
-    let tenant =
-        platform::provision_tenant(&saas, &admin, unique_name("Act"), &admin, &owner_key)
-            .await
-            .unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Act"), &admin, &owner_key)
+        .await
+        .unwrap();
     platform::suspend_tenant(&saas, &admin, tenant.id)
         .await
         .expect("setup suspend");
@@ -2600,15 +2581,10 @@ async fn owner_guard_race_serialized_by_advisory_lock(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
 
     let owner_key = RoleKey::parse("owner").unwrap();
-    let tenant = platform::provision_tenant(
-        &saas,
-        &admin,
-        unique_name("RaceAcme"),
-        &admin,
-        &owner_key,
-    )
-    .await
-    .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("RaceAcme"), &admin, &owner_key)
+            .await
+            .unwrap();
 
     // Add a second owner so count = 2. Both admins can then try to remove
     // the other; without the advisory lock, both could succeed.
@@ -2701,15 +2677,10 @@ async fn advisory_lock_does_not_block_other_roles(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
 
     let owner_key = RoleKey::parse("owner").unwrap();
-    let tenant = platform::provision_tenant(
-        &saas,
-        &admin,
-        unique_name("LockAcme"),
-        &admin,
-        &owner_key,
-    )
-    .await
-    .unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("LockAcme"), &admin, &owner_key)
+            .await
+            .unwrap();
 
     let tenant_domain = domain::tenant_domain(tenant.id);
 
@@ -2772,4 +2743,87 @@ async fn advisory_lock_does_not_block_other_roles(pool: PgPool) {
         .has_role(editor.id, &tenant_domain, "editor")
         .await
         .unwrap());
+}
+// ─── Stage 4.0: `role.deleted` audit emission ──────────────────────────────
+
+/// Stage 4.0: `saas::access::delete_role` is the canonical emission point
+/// for `role.deleted` (decision A, Stage 3e). The direct
+/// `access::delete_role` deliberately does not emit — it leaves orphans in
+/// `casbin_rule` / `*_members` and would misreport a partial delete.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn delete_role_emits_role_deleted(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &admin, &owner_key)
+            .await
+            .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("AuditEng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let temp_key = RoleKey::parse("temp").unwrap();
+    let role = saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &temp_key,
+        "Temp".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .unwrap();
+
+    let before: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    saas_access::delete_role(&saas, &admin, role.id)
+        .await
+        .expect("delete_role must succeed");
+
+    let rows: Vec<(
+        String,
+        Option<Uuid>,
+        Option<String>,
+        Option<Uuid>,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        r#"
+        select event_type, actor_id, target_type, target_id, metadata
+        from audit_log
+        order by occurred_at asc, id asc
+        offset $1
+        "#,
+    )
+    .bind(before)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "delete_role must emit exactly one role.deleted"
+    );
+    let (event_type, actor_id, target_type, target_id, metadata) = &rows[0];
+    assert_eq!(event_type, "role.deleted");
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(target_type.as_deref(), Some("role"));
+    assert_eq!(*target_id, Some(role.id));
+    assert_eq!(metadata["domain"], ws_domain.as_str());
+    assert_eq!(metadata["key"], "temp");
 }

@@ -9,6 +9,8 @@ use leptos::prelude::LeptosOptions;
 use saas::SaasState;
 
 #[cfg(feature = "ssr")]
+use crate::cookie::CookieConfig;
+#[cfg(feature = "ssr")]
 use crate::email::EmailSender;
 #[cfg(feature = "ssr")]
 use crate::rate_limit::SimpleRateLimiter;
@@ -28,6 +30,10 @@ pub struct AppState {
     /// (3 / 1 h per email — enforced in `#[server] request_email_verification`).
     /// Not distributed; see `rate_limit.rs` module docs.
     pub rate_limit: Arc<SimpleRateLimiter>,
+    /// Cookie policy (Secure/SameSite/Max-Age) resolved from env at startup
+    /// (Stage 4.1b). Shared with `middleware::auto_refresh` and the auth
+    /// handlers in `src/auth.rs`.
+    pub cookie: Arc<CookieConfig>,
 }
 
 #[cfg(feature = "ssr")]

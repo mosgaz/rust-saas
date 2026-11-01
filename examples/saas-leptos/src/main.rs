@@ -65,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(authn::DEFAULT_REFRESH_TTL_DAYS);
 
+    let cookie_cfg = Arc::new(saas_leptos::cookie::CookieConfig::from_env(&bind_addr));
+
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
@@ -132,7 +134,18 @@ async fn main() -> anyhow::Result<()> {
         leptos_options: leptos_options.clone(),
         email,
         rate_limit,
+        cookie: cookie_cfg.clone(),
     };
+
+    // Stage 4.4a: readiness probe. Inline (not a separate module) so
+    // it does not leak into the `hydrate` build (axum is optional and
+    // only enabled under `ssr`).
+    async fn healthz() -> impl axum::response::IntoResponse {
+        (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({ "status": "ok" })),
+        )
+    }
 
     let routes = generate_route_list(saas_leptos::App);
 
@@ -152,13 +165,23 @@ async fn main() -> anyhow::Result<()> {
             },
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            authn,
+            (authn, cookie_cfg),
             saas_leptos::middleware::auto_refresh,
+        ))
+        // Stage 4.1c: reject cross-origin mutations on /_server/* and SSR
+        // pages. SameSite=Lax on auth cookies is the first line; the
+        // Origin/Host check covers top-level navigations that Lax permits.
+        .route_layer(axum::middleware::from_fn(
+            saas_leptos::middleware::same_origin_guard,
         ));
 
-    let public: Router<saas_leptos::state::AppState> = Router::new().fallback(
-        leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell),
-    );
+    let public: Router<saas_leptos::state::AppState> = Router::new()
+        .route("/healthz", axum::routing::get(healthz))
+        .fallback(
+            leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(
+                saas_leptos::shell,
+            ),
+        );
 
     let router = protected
         .merge(public)

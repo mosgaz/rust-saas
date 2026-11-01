@@ -1,7 +1,7 @@
 [package]
 name = "access"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Role and permission ownership: permissions, roles, role_permissions (ADR-0001)"
 
 [dependencies]

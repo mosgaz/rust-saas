@@ -137,6 +137,16 @@ fn status_for_identity(e: &IdentityError) -> StatusCode {
     }
 }
 
+fn status_for_identity_kind(e: &authn::IdentityErrorKind) -> StatusCode {
+    use authn::IdentityErrorKind;
+    match e {
+        IdentityErrorKind::Validation(_) => StatusCode::BAD_REQUEST,
+        IdentityErrorKind::NotFound => StatusCode::NOT_FOUND,
+        IdentityErrorKind::DuplicateEmail => StatusCode::CONFLICT,
+        IdentityErrorKind::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn status_for_authn(e: &AuthnError) -> StatusCode {
     match e {
         AuthnError::InvalidCredentials => StatusCode::UNAUTHORIZED,
@@ -144,7 +154,7 @@ fn status_for_authn(e: &AuthnError) -> StatusCode {
         AuthnError::RefreshInvalid | AuthnError::RefreshReused => StatusCode::UNAUTHORIZED,
         AuthnError::AlreadyVerified => StatusCode::CONFLICT,
         AuthnError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        AuthnError::Identity(inner) => status_for_identity(inner),
+        AuthnError::Identity(inner) => status_for_identity_kind(inner),
         AuthnError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

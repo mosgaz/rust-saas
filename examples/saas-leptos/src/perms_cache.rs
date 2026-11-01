@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(30);
 

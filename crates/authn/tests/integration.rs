@@ -17,11 +17,11 @@
 use std::sync::Arc;
 
 use audit_pg::PgAuditLogger;
+use authn::IdentityErrorKind;
 use authn::{
     Authn, AuthnError, EMAIL_VERIFICATION_TTL_HOURS, PASSWORD_RESET_TTL_HOURS,
     REFRESH_GRACE_SECONDS,
 };
-use identity::IdentityError;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -98,7 +98,7 @@ async fn register_duplicate_email_fails(pool: PgPool) {
         .await
         .expect_err("register must fail");
     assert!(
-        matches!(err, AuthnError::Identity(IdentityError::DuplicateEmail)),
+        matches!(err, AuthnError::Identity(IdentityErrorKind::DuplicateEmail)),
         "got {err:?}"
     );
 }
@@ -731,11 +731,10 @@ async fn request_password_reset_persists_row(pool: PgPool) {
         "expires_at must be ~{PASSWORD_RESET_TTL_HOURS}h in the future"
     );
 
-    let stored_hash: String =
-        sqlx::query_scalar("select token_hash from password_reset_tokens")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let stored_hash: String = sqlx::query_scalar("select token_hash from password_reset_tokens")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(stored_hash.len(), 64, "sha-256 hex");
     assert_ne!(stored_hash, raw, "raw token must not be persisted");
 }
@@ -947,10 +946,7 @@ async fn reset_password_short_password_returns_validation(pool: PgPool) {
         .await
         .expect_err("short password must be rejected");
     assert!(
-        matches!(
-            err,
-            AuthnError::Identity(IdentityError::Validation(_))
-        ),
+        matches!(err, AuthnError::Identity(IdentityErrorKind::Validation(_))),
         "got {err:?}"
     );
 
@@ -1000,12 +996,11 @@ async fn reset_password_revokes_all_refresh_tokens(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let total: i64 =
-        sqlx::query_scalar("select count(*) from refresh_tokens where user_id = $1")
-            .bind(user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let total: i64 = sqlx::query_scalar("select count(*) from refresh_tokens where user_id = $1")
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         revoked, total,
         "reset_password must revoke every refresh-token row of the user"
@@ -1069,7 +1064,10 @@ async fn revoke_all_user_tokens_revokes_every_family_of_user(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(user_revoked, user_total, "every row of the target user revoked");
+    assert_eq!(
+        user_revoked, user_total,
+        "every row of the target user revoked"
+    );
 
     let other_revoked: i64 = sqlx::query_scalar(
         "select count(*) from refresh_tokens where user_id = $1 and revoked_at is not null",
@@ -1263,4 +1261,67 @@ async fn email_verified_emits_user_email_verified(pool: PgPool) {
     assert_eq!(target_type.as_deref(), Some("user"));
     assert_eq!(*target_id, Some(user.id));
     assert_eq!(metadata, &serde_json::json!({}));
+}
+// ─── Stage 4.1: iat-vs-`password_changed_at` ────────────────────────────────
+
+/// Stage 4.1: an access token issued **before** a password reset is
+/// rejected by `verify_token` (its `iat` is older than
+/// `users.password_changed_at`). Closes the gap where a stolen access-token
+/// survived a `reset_password` for up to `access_ttl`.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_token_rejects_token_issued_before_password_change(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("vt-before-reset");
+    let user = authn.register(&email, "Password123!").await.unwrap();
+    let old_token = authn.issue_access_token(&user).unwrap();
+
+    // Both `iat` and `password_changed_at` are second-precision; 1.1s
+    // guarantees they land in different seconds.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+    authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("reset");
+
+    let err = authn
+        .verify_token(&old_token)
+        .await
+        .expect_err("token issued before password change must be rejected");
+    assert!(matches!(err, AuthnError::TokenInvalid), "got {err:?}");
+}
+
+/// Stage 4.1: an access token issued **after** a password reset is
+/// accepted. Sanity check — the new check must not break the normal flow.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn verify_token_accepts_token_issued_after_password_change(pool: PgPool) {
+    let authn = fresh(pool.clone());
+    let email = unique_email("vt-after-reset");
+    authn.register(&email, "Password123!").await.unwrap();
+
+    let raw = authn
+        .request_password_reset(&email)
+        .await
+        .unwrap()
+        .expect("known email");
+
+    let user = authn
+        .reset_password(&raw, "BrandNew123!")
+        .await
+        .expect("reset");
+
+    // Issue the token *after* the reset so `iat >= password_changed_at`
+    // (the `<=` side: same-second is accepted).
+    let fresh_token = authn.issue_access_token(&user).unwrap();
+    let verified = authn
+        .verify_token(&fresh_token)
+        .await
+        .expect("fresh token must verify")
+        .expect("user must be found");
+    assert_eq!(verified.id, user.id);
 }

@@ -31,8 +31,8 @@ pub enum IdentityError {
     DuplicateEmail,
     #[error("validation error: {0}")]
     Validation(String),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("db error: {0}")]
+    Db(String),
 }
 
 /// Full `users` row, including `password_hash`, `email_verified_at`, and
@@ -62,6 +62,12 @@ impl From<UserRecord> for AuthUser {
             email_verified: r.email_verified_at.is_some(),
             created_at: r.created_at,
         }
+    }
+}
+
+impl From<sqlx::Error> for IdentityError {
+    fn from(e: sqlx::Error) -> Self {
+        IdentityError::Db(e.to_string())
     }
 }
 
@@ -113,6 +119,34 @@ pub async fn find_by_email(
     Ok(user)
 }
 
+/// Like [`find_by_id`], but returns the full [`UserRecord`], including
+/// `password_hash`, `email_verified_at`, and `password_changed_at`.
+///
+/// Used by `authn::verify_token` (Stage 4.1) to compare the access-JWT
+/// `iat` claim with `users.password_changed_at` — a token issued before the
+/// last password change is rejected, closing the gap where a stolen
+/// access-token survived a `reset_password` for up to `access_ttl`.
+///
+/// Public because it is the only way to obtain `password_changed_at` from
+/// outside `identity`; `UserRecord` is already `pub` (with the same
+/// "internal to identity/authn" caveat).
+pub async fn find_record_by_id(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<UserRecord>, IdentityError> {
+    let user = sqlx::query_as::<_, UserRecord>(
+        r#"
+        select id, email, password_hash, email_verified_at, password_changed_at, created_at
+        from users
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(user)
+}
+
 /// Creates a user. `password_hash` must already be computed (Argon2 is in
 /// `authn`). The new user is unverified (`email_verified_at IS NULL`);
 /// `password_changed_at` defaults to `now()` via the column default from
@@ -140,7 +174,7 @@ pub async fn create_user(
         sqlx::Error::Database(db) if db.constraint() == Some("users_email_key") => {
             IdentityError::DuplicateEmail
         }
-        other => IdentityError::Db(other),
+        other => IdentityError::Db(other.to_string()),
     })
 }
 

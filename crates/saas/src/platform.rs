@@ -166,10 +166,7 @@ pub async fn provision_tenant(
 /// Requires `(tenants, list)` in `PLATFORM_DOMAIN` (Stage 3f). No pagination
 /// in Stage 3f (MVP; Stage 4 adds `limit` / `offset` — see Appendix B
 /// §IV). Read-only: no audit emission.
-pub async fn list_tenants(
-    state: &SaasState,
-    actor: &AuthUser,
-) -> Result<Vec<Tenant>, CoreError> {
+pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Tenant>, CoreError> {
     state
         .authz
         .require(actor.id, PLATFORM_DOMAIN, "tenants", "list")

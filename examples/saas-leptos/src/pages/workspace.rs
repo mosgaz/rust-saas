@@ -11,6 +11,12 @@
 //! `list_my_workspaces`) do **not** resolve — see the module doc on
 //! `pages::tenant` for the reasoning (history is readable; UI gating is
 //! convenience, backend `require` is authoritative).
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<Uuid>`
+//! for the id fields. The `IntoParam` impl for bare `Uuid` is gated behind
+//! Leptos's `nightly` feature; the `Option<Uuid>` impl works on stable.
+//! Closures unwrap with `.and_then(|p| p.field)` — or, for pairs,
+//! `p.a.zip(p.b)` to produce `Option<(A, B)>`.
 
 use domain::Document;
 use leptos::callback::Callback;
@@ -295,7 +301,7 @@ pub fn WorkspaceListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id` — single workspace page: document list,
@@ -308,7 +314,13 @@ struct WorkspaceParams {
 #[component]
 pub fn WorkspacePage() -> impl IntoView {
     let params = use_params::<WorkspaceParams>();
-    let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
+    let workspace_id = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.workspace_id)
+        })
+    };
 
     let can_write = RwSignal::new(false);
     let can_members = RwSignal::new(false);
@@ -400,15 +412,21 @@ pub fn WorkspacePage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct DocumentParams {
-    workspace_id: Uuid,
-    document_id: Uuid,
+    workspace_id: Option<Uuid>,
+    document_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id/documents/:document_id` — single document page.
 #[component]
 pub fn DocumentPage() -> impl IntoView {
     let params = use_params::<DocumentParams>();
-    let ids = move || params.with(|r| r.as_ref().ok().map(|p| (p.workspace_id, p.document_id)));
+    let ids = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.workspace_id.zip(p.document_id))
+        })
+    };
 
     let document = RwSignal::new(None::<Document>);
     let error = RwSignal::new(None::<String>);

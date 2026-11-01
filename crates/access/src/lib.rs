@@ -73,8 +73,18 @@ pub enum AccessError {
     /// Internal failure (e.g. from the authorization engine).
     #[error("internal error: {0}")]
     Internal(String),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("db error: {0}")]
+    /// Opaque DB failure. `String` (not `sqlx::Error`) so that a consumer
+    /// does not need `sqlx` in its dependency tree just to pattern-match
+    /// this variant (Stage 4.2, `COMPATIBILITY.md`). `audit-pg`
+    /// (`AuditError::Internal(String)`) is the reference shape.
+    Db(String),
+}
+
+impl From<sqlx::Error> for AccessError {
+    fn from(e: sqlx::Error) -> Self {
+        AccessError::Db(e.to_string())
+    }
 }
 
 impl From<authz::AuthzError> for AccessError {

@@ -48,6 +48,8 @@ pub mod pages;
 pub mod perms_cache;
 
 #[cfg(feature = "ssr")]
+pub mod cookie;
+#[cfg(feature = "ssr")]
 pub mod error;
 #[cfg(feature = "ssr")]
 pub mod extract;

@@ -24,8 +24,19 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **Idempotent `p`-rows (Stage 3h, ADR-0003 §2.2): `authz-casbin::grant_role` pre-checks `enforcer.has_policy(...)` before each `add_policy`, so repeated `grant_role` calls do not insert duplicate `p`-rows. Migration `20261110000001_casbin_rule_unique_idx.sql` deduplicates existing duplicates (`DELETE ... USING`) and creates a unique index as a belt-and-suspenders safety net.**
 - **Race-free owner guard (Stage 3h, ADR-0003 §2.3): `saas::member::{change_role, remove_role}` acquire a short-lived `pg_advisory_xact_lock(hashtext('owner-guard:{domain}:{role_key}'))` before the protected-last-holder guard, so two concurrent admins cannot both observe `count >= 2` and both revoke the last holder.**
 - **Client-side permissions cache (Stage 3h): `examples/saas-leptos/src/perms_cache.rs` — `PermsCache` with 30s TTL, `RwSignal<HashMap<String, (Instant, Vec<(String, String)>)>>`, `get_or_fetch` / `invalidate` / `invalidate_all`. Pages (`member.rs`, `role.rs`, `platform.rs`) read `my_permissions` through the cache and invalidate after mutations (`assign_member_role`, `remove_member_role`, `create_role`, `update_role`, `delete_role`).**
+- **Owner-sync trigger (Stage 3h, ADR-0001 §9.7): migration `20261110000002_owner_sync_trigger.sql` — `AFTER INSERT ON permissions FOR EACH ROW` trigger that adds a new `(resource, action)` to every `owner` role, `ON CONFLICT DO NOTHING`. Manual top-up in `20261108000001_platform_admin_permissions.sql` stays as a no-op for already-migrated databases.**
 - **Client route guards (Stage 3f + follow-up): `examples/saas-leptos/src/guard.rs` — `RouteGuard` enum + monolithic `GuardRoute` + standalone `RequireAuth` / `RequirePermission` / `RequireAnyPermission`. UX-only, not a security boundary; the policy lives next to `<Route>` in `lib.rs`, pages do not know about guards. SSR-correct guard and server-side middleware — Stage 4.**
 - **Second consumer (Stage 3g): `examples/axum-minimal` — pure Axum, no Leptos. Portability proof: the same `saas::*` / `authn::*` / `audit::*` public contracts and the same `resolve_active_tenant` calls in mutation handlers as `saas-leptos`. `CurrentUser` implemented as `axum::extract::FromRequestParts` — a deliberate deviation from ADR-0002 rev.2 §3.8, recorded in `handoff §16`. 11 endpoints (`/auth/{register,login,logout,refresh}`, `/tenants`, `/workspaces`, `/documents`, `/audit`); `NoopEmailSender` (no SMTP transport).**
+- **Meta-crate `rust-saas` (Stage 4.0): opt-in re-export of all eleven library crates under one Cargo entry (`features = ["ssr" | "hydrate"]`). Examples keep per-crate path deps — the Stage 3g portability proof stays explicit.**
+- **`[workspace.package]` + `COMPATIBILITY.md` (Stage 4.0): all `crates/*` share one version (`0.2.0`); SemVer policy and breaking-change log documented.**
+- **Error isolation (Stage 4.2, breaking): `Db(String)` in `AccessError` / `IdentityError` / `AuthnError` / `CoreError`; `AuthnError::Identity(IdentityErrorKind)`. Public error types no longer leak `sqlx::Error` or `IdentityError`.**
+- **Auth hardening (Stage 4.1): `authn::verify_token` rejects access JWTs whose `iat` is older than `users.password_changed_at`. A stolen access token no longer survives a password reset for up to `access_ttl`.**
+- **Cookie config (Stage 4.1b): `CookieConfig { secure, access_ttl, refresh_ttl }` — `Secure` defaults to non-loopback bind address; `COOKIE_SECURE=1|0` overrides. `SameSite=Lax`, `Max-Age` from TTL. Both examples.**
+- **CSRF (Stage 4.1c): `axum-minimal` — double-submit (`csrf` cookie + `X-CSRF-Token` header); `saas-leptos` — `Origin`/`Host` guard on top of `SameSite=Lax`. Two mechanisms because Leptos `#[server]` has no hook for a custom header.**
+- **`AuthLayer` (Stage 4.1d): server-side defense-in-depth in `axum-minimal` — 401 for anonymous, path-level permission for `POST /tenants` (`(tenants, create)`), `GET /audit` (`(audit, read)`); pass-through for body-scoped paths.**
+- **`/healthz` (Stage 4.4a): readiness probe in both examples — `200 {"status":"ok"}`, no DB hit, no auth, no CSRF cookie.**
+- **`db::migrate_with` + `audit-pg::MIGRATOR` (Stage 4.3c): additive per-crate migration set. Composition with `db::migrate()` on the same database is not supported (sqlx → `VersionMissing`).**
+- **`authz::test_support` (Stage 4.3a): `AllowAllAuthz` / `DenyAllAuthz` under feature `test-support` — consumer tests no longer need inline mocks.**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
@@ -135,6 +146,9 @@ audit-pg     -> audit, sqlx, uuid, thiserror, async-trait
 db           -> sqlx, anyhow
 domain       -> serde, uuid, chrono; sqlx (optional, ssr only);
                 `test-support` feature (test-only AuthUser constructors)
+rust-saas    -> domain, authz, audit (default);
+                + access, authz-casbin, identity, authn, saas, db, audit-pg
+                  + domain/ssr (feature `ssr`)                         (meta-crate)
 ```
 
 Forbidden edges:
@@ -406,6 +420,58 @@ Then in the browser:
 21. **Wait 15+ minutes** — auto-refresh rotates the refresh token.
 22. Rate limits: `request_email_verification` — 3/hour per email; `request_password_reset` — 5/hour per email.
 
+### Run the `saas-leptos` Docker image
+
+The image `rust-saas/saas-leptos:<tag>` is a self-contained build of the
+reference app. It **does not** run migrations or seed on its own — the
+contract is the same as the dev flow: `docker compose up -d` +
+`cargo run -p seed`, then the container.
+
+From the repository root:
+
+```bash
+# 1. Start PostgreSQL (and Mailpit) — same compose as dev.
+docker compose up -d
+
+# 2. Apply migrations and seed demo data.
+#    Seed reads DATABASE_URL from .env (default:
+#    postgres://postgres:postgres@localhost:5430/rust_saas), which maps to
+#    the `postgres` service on the compose network.
+cargo run -p seed
+
+# 3. Start the container on the compose network so it can reach
+#    postgres:5432 inside the network.
+docker run --rm -d --name saas-leptos \
+  --network rust-saas_rust_saas_net \
+  -e DATABASE_URL='postgres://postgres:postgres@postgres:5432/rust_saas' \
+  -e JWT_SECRET='change-me' \
+  -p 3395:3395 \
+  rust-saas/saas-leptos:<tag>
+```
+
+Open `http://127.0.0.1:3395` and sign in with a seed account
+(`platform-admin@example.test` / `PlatformAdmin123!`).
+
+If you skip step 2, the app boots but there are no users — `/login`
+rejects every attempt, and pages that need an actor render the anonymous
+state. Run `cargo run -p seed` and retry.
+
+The Dockerfile pins `cargo-leptos =0.3.11`, `wasm-bindgen =0.2.129`, and
+`binaryen 133` (from GitHub release — apt's `binaryen` on bookworm is 112
+and fails on modern wasm features). See `CHANGELOG.md` (Stage 4.4b) for
+why.
+
+A small fail-fast smoke test is available at
+`examples/saas-leptos/smoke.sh` — it starts the image, checks SSR +
+static assets (CSS / JS / WASM, with a `wasm < 600 KB` regression guard),
+guard routes, seed-user presence, and nine core tables, and stops the
+container. Run it from `examples/saas-leptos/`:
+
+```bash
+./smoke.sh
+# override IMAGE=<tag> to test another build
+```
+
 ### Run the `axum-minimal` example (Stage 3g)
 
 The second example is also outside the workspace and has its own manifest. It uses the same database and seed data as `saas-leptos`, so run `cargo run -p seed` once (from the repository root) before starting it.
@@ -460,6 +526,44 @@ Expected behaviours:
 
 The `axum-minimal` cookie flow (`access_token` / `refresh_token`) and the auto-refresh behaviour are identical to `saas-leptos` (same library calls, same middleware contract); only the transport (JSON vs `#[server]` RPC) and the absence of Leptos differ.
 
+### CSRF (Stage 4.1c)
+
+Two complementary mechanisms, documented side by side because the two
+examples have different transport options:
+
+- **axum-minimal** — CSRF double-submit: csrf cookie (non-HttpOnly) +
+  X-CSRF-Token header. Middleware csrf::csrf_guard rejects mutations
+  (POST/PUT/PATCH/DELETE, except /auth/{register,login,logout}) whose
+  header does not match the cookie. csrf::csrf_issue sets the cookie on
+  the first request to the router.
+- **saas-leptos** — SameSite=Lax on auth cookies plus
+  middleware::same_origin_guard on the protected router. Leptos
+  #[server] does not expose a hook to inject a custom header into every
+  RPC, so the guard compares Origin authority with Host authority for
+  mutations and rejects a mismatch. Requests without Origin (non-browser
+  clients: curl, SSR probes) pass through.
+
+Full double-submit for saas-leptos is deliberately deferred — it would
+require forking Leptos' server_fn client pipeline. Origin-check plus
+SameSite=Lax covers the same attack class. Recorded in
+internal-docs/sass-19.md §16.
+
+Smoke — axum-minimal:
+
+    # 1. First request sets the csrf cookie.
+    curl -i http://127.0.0.1:3395/tenants -c /tmp/cj.txt | grep -i 'set-cookie: csrf'
+
+    # 2. Mutation without the header -> 403 on protected routes.
+    curl -i -X POST http://127.0.0.1:3395/tenants -H 'Content-Type: application/json' -d '{"name":"Smoke"}' -b /tmp/cj.txt | head -1
+
+    # 3. Same request with the header -> 200 (or 401 if not logged in).
+    CSRF=$(awk '$6=="csrf" {print $7}' /tmp/cj.txt)
+    curl -i -X POST http://127.0.0.1:3395/tenants -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{"name":"Smoke"}' -b /tmp/cj.txt | head -1
+
+Smoke — saas-leptos:
+
+    curl -i -X POST http://127.0.0.1:3395/_server/create_tenant -H 'Origin: https://evil.example' -H 'Content-Type: application/json' -d '{}' -b /tmp/cj.txt | head -1
+    # HTTP/1.1 403 Forbidden
 ### Checking the build
 
 From the repository root:
@@ -476,7 +580,7 @@ From the repository root:
 cargo test
 ```
 
-**130 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+43 = 54; `access` 0+6 = 6; `authz-casbin` 0+11 = 11; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`).
+**131 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+44 = 55; `access` 0+6 = 6; `authz-casbin` 0+11 = 11; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
 
 Stage 3g (`axum-minimal`) does **not** change the library test counter — `crates/*` is untouched (0 migrations, 0 breaking changes, 0 new library tests). The example ships no `tests/` directory (binary-only crate; the plan marks example smoke tests optional). Its smoke coverage is the curl checklist above, which exercises the same `saas::*` / `authn::*` calls as `saas-leptos`.
 
@@ -528,28 +632,41 @@ The reference examples have small unit-test modules too (`rate_limit.rs` in both
 │   │       ├── 20261105000001_authn_email_verify.sql
 │   │       ├── 20261106000001_authn_password_reset.sql
 │   │       ├── 20261107000001_audit_log.sql
-│   │       └── 20261108000001_platform_admin_permissions.sql
+│   │       ├── 20261108000001_platform_admin_permissions.sql
+│   │       ├── 20261110000001_casbin_rule_unique_idx.sql
+│   │       └── 20261110000002_owner_sync_trigger.sql
+│   ├── rust-saas/        # Stage 4.0: meta-crate (re-exports)
 │   └── seed/
 └── examples/
     ├── saas-leptos/
     │   ├── Cargo.toml
+    │   ├── Dockerfile
+    │   ├── smoke.sh
     │   └── src/
     │       ├── auth.rs
     │       ├── email.rs
     │       ├── rate_limit.rs
     │       ├── guard.rs
+    │       ├── perms_cache.rs      # Stage 3h
+    │       ├── cookie.rs           # Stage 4.1b
+    │       ├── middleware.rs       # auto_refresh + same_origin_guard (4.1c)
     │       ├── pages/
     │       │   ├── platform.rs
     │       │   └── ...
     │       └── ...
     └── axum-minimal/          # Stage 3g: pure Axum, no Leptos
         ├── Cargo.toml
+        ├── Dockerfile
         └── src/
             ├── main.rs        # entry point, router, AppState wiring
-            ├── state.rs       # AppState { authn, saas, email, rate_limit }
+            ├── state.rs       # AppState { authn, saas, email, rate_limit, cookie }
             ├── error.rs       # AppError + IntoResponse (HTTP status mapping)
             ├── extract.rs     # CurrentUser via axum::extract::FromRequestParts
             ├── middleware.rs  # auto_refresh (protected router)
+            ├── csrf.rs        # Stage 4.1c: double-submit + csrf_guard/csrf_issue
+            ├── auth_layer.rs  # Stage 4.1d: 401 + path-level permissions
+            ├── cookie.rs      # Stage 4.1b: CookieConfig
+            ├── health.rs      # Stage 4.4a: /healthz
             ├── auth.rs        # register / login / logout / refresh handlers
             ├── tenant.rs      # list_my_tenants / create_tenant
             ├── workspace.rs   # list/create workspaces + documents (resolve)
@@ -698,7 +815,100 @@ Second consumer — pure Axum, no Leptos; the portability proof.
 - **Client route guards follow-up (done):** `examples/saas-leptos/src/guard.rs` — `RouteGuard` enum + monolithic `GuardRoute` + standalone `RequireAuth` / `RequirePermission` / `RequireAnyPermission`. All 13 private routes in `lib.rs` under `GuardRoute`; `pages/*.rs` untouched. UX-only, not a security boundary; SSR-correct guard and server-side middleware — Stage 4.
 - **Stage 3g (done): `axum-minimal`.** Second consumer on pure Axum, proving portability: `axum::Router::new()`, `axum::extract::FromRequestParts` for `CurrentUser` (deliberate deviation from ADR-0002 rev.2 §3.8), `axum-extra` cookies, `NoopEmailSender`, same `saas::*` / `authn::*` / `audit::*` calls and the same `resolve_active_tenant` in mutation handlers as `saas-leptos`. `crates/*` untouched — 0 migrations, 0 breaking changes, 124 library tests unchanged.
 - **Stage 3h (done): infra + minor.** `has_policy` pre-check in `authz-casbin::grant_role` (idempotent `p`-rows); migration `20261110000001_casbin_rule_unique_idx.sql` (dedup + unique index); `pg_advisory_xact_lock` in `saas::member::{change_role, remove_role}` (race-free owner guard); `PermsCache` in `saas-leptos` (30s TTL, invalidated after mutations). 124 → 130 tests, +1 migration.
-- Stage 4 (next): Dockerfile, CI, observability, backups, cookie `Secure`/`SameSite`, CSRF, rate limiting (distributed), RLS, E2E HTTP tests, iat-vs-`password_changed_at`, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`, SSR-correct guards in `saas-leptos`, server-side per-route middleware (defense in depth).
+- **Stage 4.0 (done): sync & cleanup.** Meta-crate `crates/rust-saas`; `[workspace.package]` + `COMPATIBILITY.md`; `delete_role_emits_role_deleted`; `PermsCache::invalidate_all()` on logout; `domain` removed from `authz-casbin`.
+- **Stage 4.1 (done): auth hardening.** `authn::verify_token` rejects pre-password-change tokens (`iat` vs `password_changed_at`). Cookie config (`CookieConfig`, `Secure`, `SameSite`, `Max-Age`). CSRF: `axum-minimal` double-submit; `saas-leptos` `Origin`/`Host` guard. `AuthLayer` in `axum-minimal`.
+- **Stage 4.2 (done, breaking): error isolation.** `Db(String)` in all public error types; `AuthnError::Identity(IdentityErrorKind)`. Documented in `COMPATIBILITY.md` (`0.2.0`).
+- **Stage 4.3 (done): isolation.** `authz::test_support` (`AllowAllAuthz` / `DenyAllAuthz`); `db::migrate_with` + `audit-pg::MIGRATOR`.
+- **Stage 4.4a (done): `/healthz`** in both examples.
+- **Stage 4.4b (partial): Dockerfile + WASM bundle.** Dockerfile for `saas-leptos` (multi-stage, non-root, `cargo-leptos =0.3.11`, binaryen 133, `wasm-bindgen =0.2.129`, `[profile.wasm-release]`). WASM: 1.7 MB (from 2.6 MB); **target 400 KB not met** — `wasm-opt` plateaus; further reduction requires removing dependencies. See `saas-19.md` §16.
+- Stage 4.5+ (open): CI, observability, backups, distributed rate limiting, RLS, E2E HTTP tests, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`, SSR-correct guards in `saas-leptos`, server-side per-route middleware (defense in depth).
+
+
+## Pluggability: what can be replaced, what cannot
+
+`rust-saas` is **not** a hexagonal framework with a port on every axis.
+It is a PostgreSQL-backed core with **two ports** (`authz`, `audit`) and
+concrete implementations elsewhere. This section is the honest contract.
+
+### Ports (traits + implementations)
+
+| Concern | Trait | Default impl | Replace without forking? |
+|---|---|---|---|
+| Authorization | `authz::AuthorizationEngine` | `authz-casbin::CasbinAuthz` | **yes** — e.g. OPA, Keycloak |
+| Audit | `audit::AuditLogger` | `audit-pg::PgAuditLogger` | **yes** — Kafka, file, OTel |
+
+### Concrete dependencies (replacement = fork)
+
+| Concern | Concrete | Replacement |
+|---|---|---|
+| Identity storage | `identity::*` (`users`) | fork `identity` + edits in `authn`, `saas` |
+| Auth mechanism | `authn::Authn` | fork `authn` + edits in `saas`, examples |
+| Role storage | `access::AccessState` (`roles`, `permissions`, `role_permissions`) | fork `access` + edits in `saas` |
+| SaaS business logic | `saas::*` (platform, tenant, workspace, invitation, member, access) | fork `saas` |
+| Database | `PgPool` everywhere | non-goal |
+
+### Composition & migrations
+
+- **Full schema** — `db::migrate` (workspace set, 12 migrations in
+  `crates/db/migrations/`). All crates share one database.
+- **Partial schema** — `db::migrate_with(pool, &[&Migrator])` against a
+  **fresh** database. Example: `db::migrate_with(&pool, &[audit_pg::MIGRATOR])`
+  creates only `users` (FK target) + `audit_log`. A consumer picks **one**
+  path per database; composition of `migrate()` and a per-crate set on the
+  same database is **not** supported (sqlx → `VersionMissing`).
+
+### Stack
+
+- Library crates do not depend on Leptos, Axum, HTTP, JWT delivery, or
+  SMTP. Both examples (`saas-leptos`, `axum-minimal`) use the same public
+  contracts; the library is unchanged by the second consumer (Stage 3g).
+- Email delivery (`EmailSender`) is example-local. CSRF is example-local.
+  Cookies are example-local. `AuthLayer` (Stage 4.1d) is example-local
+  (`axum-minimal` only — `saas-leptos` is covered by `#[server]`).
+
+## Non-goals
+
+Explicitly **out of scope** for this reference. A consumer that needs any
+of these should not treat their absence as a bug:
+
+1. **Multi-DB.** PostgreSQL only. A different backend means rewriting
+   almost every crate.
+2. **Generic DAL / repository traits over `PgPool`.** `PgPool` in public
+   signatures is deliberate.
+3. **`RoleStore` / `UserStore` / `Authn` trait / `saas` split (S1–S4).**
+   Replacement is a fork; the two ports cover the common cases.
+4. **Full hexagonal architecture.** Two ports, not "everything is a trait".
+5. **Runtime pluggability (dynamic dispatch for everything).**
+   `Arc<dyn Trait>` only for `AuthorizationEngine` and `AuditLogger`.
+6. **HTTP-framework-specific features in the library.** CSRF, cookie
+   attributes, rate limiting, IP/user-agent, email transport — all at the
+   consumer.
+7. **`no_std` / zero-copy.**
+8. **Distributed transactions / 2PC.** ADR-0003 (A-lite) records the
+   trade-off; cross-table tx is `Stage 4+` conditional on compliance
+   requirements.
+
+## Compatibility
+
+All `crates/*` share **one version** (`[workspace.package] version =
+"0.2.0"`). Consumers must pin every path / git dependency to the same
+revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change
+log.
+
+## No Node.js
+
+This project does **not** depend on Node.js in any form — not at build
+time, not in the Docker images, not in CI, not in the dev shell.
+
+Tailwind CSS 4 is built by `cargo-leptos` via a **standalone binary** that
+it downloads on first use (pinned by `LEPTOS_TAILWIND_VERSION` in the
+Dockerfile, see `examples/saas-leptos/Dockerfile`). No `npm`, no `npx`,
+no `node_modules/`.
+
+If a future tool proposes a Node dependency, it is **rejected** by default
+and must be escalated as a design change — the rule exists so a stray
+`npx` in a build script cannot silently reintroduce a toolchain we do not
+ship.
 
 ## License
 
