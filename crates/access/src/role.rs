@@ -211,8 +211,10 @@ pub async fn update_role(
         .iter()
         .map(|p| (p.resource.clone(), p.action.clone()))
         .collect();
-    let new_set: std::collections::HashSet<(String, String)> =
-        permissions.iter().map(|p| (p.resource.clone(), p.action.clone())).collect();
+    let new_set: std::collections::HashSet<(String, String)> = permissions
+        .iter()
+        .map(|p| (p.resource.clone(), p.action.clone()))
+        .collect();
     let mut added: Vec<(String, String)> = new_set.difference(&old_set).cloned().collect();
     let mut removed: Vec<(String, String)> = old_set.difference(&new_set).cloned().collect();
     added.sort();
@@ -362,7 +364,9 @@ pub async fn list_roles(
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<Role>, AccessError> {
-    Ok(list_roles_paged(state, actor, domain, i64::MAX, 0).await?.items)
+    Ok(list_roles_paged(state, actor, domain, i64::MAX, 0)
+        .await?
+        .items)
 }
 
 /// Returns a role by `(domain, role_key)`, if any.

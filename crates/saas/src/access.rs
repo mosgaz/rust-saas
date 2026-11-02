@@ -181,7 +181,12 @@ pub async fn update_role(
     for holder in holders {
         state
             .authz()
-            .grant_role(holder, &updated.domain, updated.key.as_str(), &new_permissions)
+            .grant_role(
+                holder,
+                &updated.domain,
+                updated.key.as_str(),
+                &new_permissions,
+            )
             .await?;
     }
 
@@ -280,7 +285,9 @@ pub async fn list_roles(
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<Role>, CoreError> {
-    Ok(list_roles_paged(state, actor, domain, i64::MAX, 0).await?.items)
+    Ok(list_roles_paged(state, actor, domain, i64::MAX, 0)
+        .await?
+        .items)
 }
 
 /// Lists all permissions in the reference table. Delegates to

@@ -22,8 +22,8 @@
 
 pub use audit;
 pub use authz;
-pub use rate_limiter;
 pub use domain;
+pub use rate_limiter;
 
 #[cfg(feature = "ssr")]
 pub use access;

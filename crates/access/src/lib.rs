@@ -44,12 +44,12 @@ pub use permission::list_permissions_paged;
 #[allow(deprecated)]
 pub use permission::{get_permissions_for_role, list_permissions};
 
+#[allow(deprecated)]
+pub use role::list_roles;
 pub use role::{
     create_owner_role, create_role, delete_role, delete_role_by_id, get_role, get_role_by_id,
     list_roles_paged, update_role,
 };
-#[allow(deprecated)]
-pub use role::list_roles;
 
 /// Errors produced by `access::*`.
 #[derive(Debug, thiserror::Error)]

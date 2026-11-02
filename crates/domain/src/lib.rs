@@ -148,7 +148,6 @@ pub struct Member {
     pub created_at: DateTime<Utc>,
 }
 
-
 /// A page of results from a paginated list endpoint.
 ///
 /// `total` is the total number of matching rows (for UI pagination controls);

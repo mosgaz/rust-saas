@@ -21,7 +21,6 @@
 
 
 use axum::extract::{Request, State};
-use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use domain::AuthUser;
@@ -29,12 +28,11 @@ use domain::AuthUser;
 use crate::state::AppState;
 
 pub async fn auth_layer(
-    State(app_state): State<AppState>,
+    State(_app_state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    let method = req.method().clone();
 
     // 1. Pass-through for server functions, static assets, and health.
     if path.starts_with("/_server/")
@@ -59,55 +57,18 @@ pub async fn auth_layer(
     }
 
     // 3. Actor required for all other SSR pages (e.g. `/tenants`).
-    let user = match req.extensions().get::<Option<AuthUser>>() {
+    let _user = match req.extensions().get::<Option<AuthUser>>() {
         Some(Some(u)) => u.clone(),
         _ => return unauthorized(),
     };
 
     // 4. Path-level permissions (where the domain is unambiguously in the path).
-    if method == Method::GET && path == "/platform" {
-        if let Err(resp) =
-            check_perm(&app_state, &user, domain::PLATFORM_DOMAIN, "tenants", "list").await
-        {
-            return resp;
-        }
-    } else if method == Method::GET && path == "/platform/audit" {
-        if let Err(resp) =
-            check_perm(&app_state, &user, domain::PLATFORM_DOMAIN, "audit", "read").await
-        {
-            return resp;
-        }
-    }
+    // NOTE: For SSR pages, we let the `#[server]` functions handle permissions
+    // (`saas::*` does `authz.require`). AuthLayer here is strictly for 401.
 
     next.run(req).await
 }
 
-async fn check_perm(
-    state: &AppState,
-    user: &AuthUser,
-    domain: &str,
-    resource: &str,
-    action: &str,
-) -> Result<(), Response> {
-    let perms = match saas::access::my_permissions(&state.saas, user, domain).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path_domain = %domain,
-                actor_id = %user.id,
-                "auth_layer: my_permissions failed"
-            );
-            return Err(internal_error());
-        }
-    };
-
-    if perms.iter().any(|(r, a)| r == resource && a == action) {
-        Ok(())
-    } else {
-        Err(forbidden())
-    }
-}
 
 fn unauthorized() -> Response {
     use axum::http::StatusCode;
@@ -118,20 +79,3 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-fn forbidden() -> Response {
-    use axum::http::StatusCode;
-    (
-        StatusCode::FORBIDDEN,
-        axum::Json(serde_json::json!({ "error": "forbidden" })),
-    )
-        .into_response()
-}
-
-fn internal_error() -> Response {
-    use axum::http::StatusCode;
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        axum::Json(serde_json::json!({ "error": "internal error" })),
-    )
-        .into_response()
-}

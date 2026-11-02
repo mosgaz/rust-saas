@@ -605,14 +605,20 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
     //     This is the load-bearing assertion — without `load_policy()` after
     //     the violation, `can` would return `false` here.
     assert!(
-        authz.can(user_id, domain, "documents", "read").await.unwrap(),
+        authz
+            .can(user_id, domain, "documents", "read")
+            .await
+            .unwrap(),
         "replica must see the row another process wrote (load_policy after violation)"
     );
 
     // (b) The non-racing permission this call inserted also works: the
     //     coalesced reload must not clobber rows this call wrote itself.
     assert!(
-        authz.can(user_id, domain, "documents", "write").await.unwrap(),
+        authz
+            .can(user_id, domain, "documents", "write")
+            .await
+            .unwrap(),
         "non-racing add_policy must still insert and survive the coalesced reload"
     );
 

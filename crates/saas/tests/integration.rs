@@ -2851,10 +2851,9 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     grant_platform_admin(&saas, &admin).await;
 
     let owner_key = RoleKey::parse("owner").unwrap();
-    let tenant =
-        platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
-            .await
-            .unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
     let ws = tenant::create_workspace(
         &saas,
         &admin,
@@ -2970,19 +2969,24 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     assert_eq!(p_read_after, 1, "exactly one p-row for `documents:read`");
 
     // ── audit: exactly one `role.updated`, no `member.role_*` ─────────────
-    let rows: Vec<(String, Option<Uuid>, Option<String>, Option<Uuid>, serde_json::Value)> =
-        sqlx::query_as(
-            r#"
+    let rows: Vec<(
+        String,
+        Option<Uuid>,
+        Option<String>,
+        Option<Uuid>,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        r#"
             select event_type, actor_id, target_type, target_id, metadata
             from audit_log
             order by occurred_at asc, id asc
             offset $1
             "#,
-        )
-        .bind(before_audit)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+    )
+    .bind(before_audit)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
 
     assert_eq!(
         rows.len(),
@@ -2998,8 +3002,8 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
 
     // `added` / `removed` diff. Both serialise as JSON arrays of pairs;
     // `from_value` gives a clean assertion message on mismatch.
-    let added: Vec<(String, String)> =
-        serde_json::from_value(metadata["added"].clone()).expect("metadata.added must be a JSON array");
+    let added: Vec<(String, String)> = serde_json::from_value(metadata["added"].clone())
+        .expect("metadata.added must be a JSON array");
     let removed: Vec<(String, String)> = serde_json::from_value(metadata["removed"].clone())
         .expect("metadata.removed must be a JSON array");
     assert!(
@@ -3074,10 +3078,9 @@ async fn delete_permission_unsyncs_owner_p_rows(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
 
     let owner_key = RoleKey::parse("owner").unwrap();
-    let tenant =
-        platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
-            .await
-            .unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
     let tenant_domain = domain::tenant_domain(tenant.id);
 
     // Sanity — before the DELETE:
@@ -3111,12 +3114,11 @@ async fn delete_permission_unsyncs_owner_p_rows(pool: PgPool) {
     // Delete the reference row. `role_permissions` cascades via FK; the
     // AFTER DELETE trigger (`owner_unsync_permission_after_delete`) is
     // what cleans `casbin_rule.p` for owner roles.
-    let deleted = sqlx::query(
-        "delete from permissions where resource = 'documents' and action = 'read'",
-    )
-    .execute(&pool)
-    .await
-    .expect("delete from permissions must succeed");
+    let deleted =
+        sqlx::query("delete from permissions where resource = 'documents' and action = 'read'")
+            .execute(&pool)
+            .await
+            .expect("delete from permissions must succeed");
     assert_eq!(
         deleted.rows_affected(),
         1,
@@ -3174,9 +3176,15 @@ async fn list_tenants_paged_works(pool: PgPool) {
     for i in 0..3 {
         let owner = make_user(&pool, &format!("owner_{}", i)).await;
         let owner_key = RoleKey::parse("owner").unwrap();
-        platform::provision_tenant(&saas, &admin, unique_name(&format!("T{}", i)), &owner, &owner_key)
-            .await
-            .unwrap();
+        platform::provision_tenant(
+            &saas,
+            &admin,
+            unique_name(&format!("T{}", i)),
+            &owner,
+            &owner_key,
+        )
+        .await
+        .unwrap();
     }
 
     let page1 = platform::list_tenants_paged(&saas, &admin, 2, 0)
@@ -3206,9 +3214,15 @@ async fn member_list_paged_works(pool: PgPool) {
     // Add 3 users to the tenant
     for i in 0..3 {
         let user = make_user(&pool, &format!("user_{}", i)).await;
-        saas_access::assign_role(&saas, &admin, user.id, &domain::tenant_domain(tenant.id), &owner_key)
-            .await
-            .unwrap();
+        saas_access::assign_role(
+            &saas,
+            &admin,
+            user.id,
+            &domain::tenant_domain(tenant.id),
+            &owner_key,
+        )
+        .await
+        .unwrap();
     }
 
     // Admin is also a member. Total = 4.

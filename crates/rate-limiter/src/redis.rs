@@ -1,6 +1,6 @@
-use std::time::Duration;
-use redis::{aio::ConnectionManager, Client, Script};
 use crate::RateLimiter;
+use redis::{aio::ConnectionManager, Client, Script};
+use std::time::Duration;
 
 pub struct RedisRateLimiter {
     conn: ConnectionManager,
@@ -11,7 +11,8 @@ impl RedisRateLimiter {
     pub async fn from_url(url: &str) -> Result<Self, redis::RedisError> {
         let client = Client::open(url)?;
         let conn = ConnectionManager::new(client).await?;
-        let script = Script::new(r#"
+        let script = Script::new(
+            r#"
             local now = tonumber(ARGV[1])
             local window = tonumber(ARGV[2])
             redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
@@ -25,7 +26,8 @@ impl RedisRateLimiter {
                 local retry_ms = oldest[2] and (tonumber(oldest[2]) + window - now) or 0
                 return -math.max(1, math.ceil(retry_ms / 1000))
             end
-        "#);
+        "#,
+        );
         Ok(Self { conn, script })
     }
 }

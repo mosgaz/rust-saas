@@ -84,11 +84,7 @@ impl PgAuditLogger {
     /// example uses `LIMIT_MAX = 200`). Rows are ordered by
     /// `(occurred_at DESC, id DESC)` so that ties (same-microsecond rows,
     /// e.g. `change_role`'s three events) are stable across calls.
-    pub async fn list_paged(
-        &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Page<AuditRow>, AuditError> {
+    pub async fn list_paged(&self, limit: i64, offset: i64) -> Result<Page<AuditRow>, AuditError> {
         let total: i64 = sqlx::query_scalar("select count(*) from audit_log")
             .fetch_one(&self.pool)
             .await
