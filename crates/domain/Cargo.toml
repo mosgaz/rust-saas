@@ -2,6 +2,8 @@
 name = "domain"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "Shared business types and authorization domain name helpers"
 
 [dependencies]

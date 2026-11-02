@@ -1,0 +1,92 @@
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "wasm32-unknown-unknown" },
+]
+all-features = true
+
+[advisories]
+version = 2
+ignore = ["RUSTSEC-2026-0249"]
+yanked = "deny"
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "CC0-1.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+# Frontend (examples only).
+[[bans.deny]]
+name = "leptos"
+
+[[bans.deny]]
+name = "leptos_axum"
+
+[[bans.deny]]
+name = "leptos_router"
+
+[[bans.deny]]
+name = "leptos_meta"
+
+# HTTP (examples only).
+[[bans.deny]]
+name = "axum"
+
+[[bans.deny]]
+name = "axum-extra"
+
+[[bans.deny]]
+name = "tower-http"
+
+[[bans.deny]]
+name = "hyper"
+
+[[bans.deny]]
+name = "reqwest"
+
+# SMTP (examples only).
+[[bans.deny]]
+name = "lettre"
+
+# Casbin — only authz-casbin and sqlx-adapter.
+[[bans.deny]]
+name = "casbin"
+wrappers = ["authz-casbin", "sqlx-adapter"]
+
+[[bans.deny]]
+name = "sqlx-adapter"
+wrappers = ["authz-casbin"]
+
+# JWT + Argon2 — only authn.
+[[bans.deny]]
+name = "jsonwebtoken"
+wrappers = ["authn"]
+
+[[bans.deny]]
+name = "argon2"
+wrappers = ["authn"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

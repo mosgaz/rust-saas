@@ -2,6 +2,8 @@
 name = "rust-saas"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "Meta-crate: re-exports the rust-saas library crates under a single Cargo entry (Stage 4.0)"
 
 [dependencies]

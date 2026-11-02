@@ -463,7 +463,7 @@ why.
 
 A small fail-fast smoke test is available at
 `examples/saas-leptos/smoke.sh` — it starts the image, checks SSR +
-static assets (CSS / JS / WASM, with a `wasm < 600 KB` regression guard),
+static assets (CSS / JS / WASM, with a `wasm < 2 MB` regression guard),
 guard routes, seed-user presence, and nine core tables, and stops the
 container. Run it from `examples/saas-leptos/`:
 
@@ -580,7 +580,7 @@ From the repository root:
 cargo test
 ```
 
-**131 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+44 = 55; `access` 0+6 = 6; `authz-casbin` 0+11 = 11; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
+**137 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 15+38 = 53; `saas` 11+46 = 57; `access` 0+6 = 6; `authz-casbin` 0+12 = 12; `audit` 3+0 = 3; `audit-pg` 0+6 = 6. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
 
 Stage 3g (`axum-minimal`) does **not** change the library test counter — `crates/*` is untouched (0 migrations, 0 breaking changes, 0 new library tests). The example ships no `tests/` directory (binary-only crate; the plan marks example smoke tests optional). Its smoke coverage is the curl checklist above, which exercises the same `saas::*` / `authn::*` calls as `saas-leptos`.
 

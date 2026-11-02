@@ -17,6 +17,8 @@ members = [
 exclude = ["examples/*"]
 
 [workspace.package]
+publish = false
+license = "MIT"
 version = "0.2.0"
 edition = "2021"
 

@@ -8,6 +8,20 @@ Every crate in `crates/` shares one version (enforced by
 `[workspace.package]`); consumers must pin all crates to the same
 revision.
 
+## [Unreleased]
+
+### Stage 4.6 — CI, tooling, and documentation
+- Added `rust-toolchain.toml` (pinned to `1.98`), `.github/workflows/ci.yml` (test, check, deny, docker), `deny.toml` (licenses, bans, advisories), `CONTRIBUTING.md`, `SECURITY.md`.
+- Added `publish = false` to all internal crates to simplify wildcard dependency checks.
+- Updated `smoke.sh` WASM guard to 2 MB (since the current bundle is 1.7 MB).
+
+### Stage 4.5 — Security fixes and RBAC sync
+- **§4.21 Fix:** `saas::access::update_role` now resyncs `casbin_rule.p` for all holders. Removed permissions are revoked; added permissions are granted. No `member.role_*` flood emitted.
+- **§4.22 Fix:** `authz-casbin::grant_role` now catches unique constraint violations (cross-process race) and returns `Ok(())`, preventing 500s in multi-replica deployments.
+- **§4.23 Fix:** Added `20261111000001_owner_sync_delete_trigger.sql` (`AFTER DELETE ON permissions`) to clean up orphaned `casbin_rule.p` rows for owner roles.
+- **Data integrity:** `identity::update_password_tx` uses `clock_timestamp()` instead of `now()` (fixes test flake and tightens the `iat`-vs-`password_changed_at` window).
+- Added `added` / `removed` diff to `role.updated` audit metadata.
+
 ## [0.2.0] - 2026-11-01
 
 ### Stage 4.4b — Dockerfile + WASM bundle (Dockerfile done; WASM optimization partial)
