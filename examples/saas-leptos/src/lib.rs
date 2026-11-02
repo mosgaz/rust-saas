@@ -56,8 +56,6 @@ pub mod extract;
 #[cfg(feature = "ssr")]
 pub mod middleware;
 #[cfg(feature = "ssr")]
-pub mod rate_limit;
-#[cfg(feature = "ssr")]
 pub mod state;
 
 use leptos::prelude::*;

@@ -18,6 +18,7 @@ saas = { path = "../../crates/saas", optional = true }
 db = { path = "../../crates/db", optional = true }
 audit = { path = "../../crates/audit", optional = true }
 audit-pg = { path = "../../crates/audit-pg", optional = true }
+rate-limiter = { path = "../../crates/rate-limiter", features = ["redis"], optional = true }
 
 leptos = { version = "0.8" }
 leptos_meta = { version = "0.8" }
@@ -75,6 +76,7 @@ ssr = [
     "dep:db",
     "dep:audit",
     "dep:audit-pg",
+    "dep:rate-limiter",
     "dep:axum",
     "dep:axum-extra",
     "dep:cookie",

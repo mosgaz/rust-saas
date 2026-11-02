@@ -23,6 +23,7 @@ saas = { path = "../../crates/saas" }
 db = { path = "../../crates/db" }
 audit = { path = "../../crates/audit" }
 audit-pg = { path = "../../crates/audit-pg" }
+rate-limiter = { path = "../../crates/rate-limiter", features = ["redis"] }
 
 # Axum stack (no Leptos).
 axum = "0.8"

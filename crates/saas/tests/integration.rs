@@ -1,3 +1,4 @@
+#![allow(deprecated, clippy::type_complexity)]
 //! Integration tests for `saas` against a real PostgreSQL + `authz-casbin`.
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
@@ -3159,4 +3160,67 @@ async fn delete_permission_unsyncs_owner_p_rows(pool: PgPool) {
         1,
         "unrelated `documents:write` p-row must survive the trigger"
     );
+}
+
+// ─── Stage 4.8: Pagination ─────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "../db/migrations")]
+async fn list_tenants_paged_works(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    // Create 3 tenants
+    for i in 0..3 {
+        let owner = make_user(&pool, &format!("owner_{}", i)).await;
+        let owner_key = RoleKey::parse("owner").unwrap();
+        platform::provision_tenant(&saas, &admin, unique_name(&format!("T{}", i)), &owner, &owner_key)
+            .await
+            .unwrap();
+    }
+
+    let page1 = platform::list_tenants_paged(&saas, &admin, 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.total, 3);
+    assert_eq!(page1.items.len(), 2);
+
+    let page2 = platform::list_tenants_paged(&saas, &admin, 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.total, 3);
+    assert_eq!(page2.items.len(), 1);
+}
+
+#[sqlx::test(migrations = "../db/migrations")]
+async fn member_list_paged_works(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+
+    // Add 3 users to the tenant
+    for i in 0..3 {
+        let user = make_user(&pool, &format!("user_{}", i)).await;
+        saas_access::assign_role(&saas, &admin, user.id, &domain::tenant_domain(tenant.id), &owner_key)
+            .await
+            .unwrap();
+    }
+
+    // Admin is also a member. Total = 4.
+    let page1 = member::list_paged(&saas, &admin, MemberScope::Tenant(tenant.id), 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.total, 4);
+    assert_eq!(page1.items.len(), 2);
+
+    let page2 = member::list_paged(&saas, &admin, MemberScope::Tenant(tenant.id), 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.total, 4);
+    assert_eq!(page2.items.len(), 2);
 }

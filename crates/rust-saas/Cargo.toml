@@ -17,6 +17,7 @@ identity = { path = "../identity", optional = true }
 authn = { path = "../authn", optional = true }
 saas = { path = "../saas", optional = true }
 db = { path = "../db", optional = true }
+rate-limiter = { path = "../rate-limiter" }
 audit-pg = { path = "../audit-pg", optional = true }
 
 [features]
@@ -32,3 +33,4 @@ ssr = [
     "dep:audit-pg",
 ]
 hydrate = []
+rate-limiter-redis = ["rate-limiter/redis"]

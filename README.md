@@ -37,6 +37,8 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **`/healthz` (Stage 4.4a): readiness probe in both examples — `200 {"status":"ok"}`, no DB hit, no auth, no CSRF cookie.**
 - **`db::migrate_with` + `audit-pg::MIGRATOR` (Stage 4.3c): additive per-crate migration set. Composition with `db::migrate()` on the same database is not supported (sqlx → `VersionMissing`).**
 - **`authz::test_support` (Stage 4.3a): `AllowAllAuthz` / `DenyAllAuthz` under feature `test-support` — consumer tests no longer need inline mocks.**
+- **Pagination (Stage 4.8): `domain::Page<T>` + `list_*_paged` across `access`, `saas`, `audit-pg`. Offset-based (`?limit=&offset=`); old `list_*` are deprecated but remain for compatibility.**
+- **Distributed rate limiter (Stage 4.8): `crates/rate-limiter` with `RateLimiter` trait, `InMemoryRateLimiter` (default), and `RedisRateLimiter` (feature `redis`). Examples use `Arc<dyn RateLimiter>`; `REDIS_URL` toggles Redis.**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
@@ -144,6 +146,7 @@ authz        -> uuid, thiserror, async-trait
 audit        -> serde, uuid, thiserror, async-trait, chrono, serde_json
 audit-pg     -> audit, sqlx, uuid, thiserror, async-trait
 db           -> sqlx, anyhow
+rate-limiter -> async-trait, uuid, tracing, redis (optional)
 domain       -> serde, uuid, chrono; sqlx (optional, ssr only);
                 `test-support` feature (test-only AuthUser constructors)
 rust-saas    -> domain, authz, audit (default);
@@ -245,7 +248,7 @@ Example permissions and demo roles:
 | Email verification | SHA-256 (`sha2`) over a random raw token; raw token not persisted; 24-hour TTL, single-active per user |
 | Password reset | SHA-256 (`sha2`) over a random raw token; raw token not persisted; 1-hour TTL, single-active per user, one-shot |
 | Email delivery | `lettre` (async SMTP, tokio1-rustls, 10s timeout) in `saas-leptos`; `NoopEmailSender` in `axum-minimal`; Mailpit for local dev |
-| Rate limiting | In-memory sliding-window (`SimpleRateLimiter` in both examples; not distributed) |
+| Rate limiting | Distributed sliding-window (`RateLimiter` trait; `InMemoryRateLimiter` default, `RedisRateLimiter` via feature) |
 | Invitation tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Refresh tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Styling | Tailwind CSS v4 (in `saas-leptos`) |
@@ -580,7 +583,7 @@ From the repository root:
 cargo test
 ```
 
-**137 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 15+38 = 53; `saas` 11+46 = 57; `access` 0+6 = 6; `authz-casbin` 0+12 = 12; `audit` 3+0 = 3; `audit-pg` 0+6 = 6. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
+**165 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 15+38 = 53; `saas` 11+46 = 57; `access` 0+6 = 6; `authz-casbin` 0+12 = 12; `audit` 3+0 = 3; `audit-pg` 0+6 = 6. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
 
 Stage 3g (`axum-minimal`) does **not** change the library test counter — `crates/*` is untouched (0 migrations, 0 breaking changes, 0 new library tests). The example ships no `tests/` directory (binary-only crate; the plan marks example smoke tests optional). Its smoke coverage is the curl checklist above, which exercises the same `saas::*` / `authn::*` calls as `saas-leptos`.
 

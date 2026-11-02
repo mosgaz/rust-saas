@@ -48,7 +48,7 @@ use uuid::Uuid;
 use saas_leptos::build_app;
 use saas_leptos::cookie::CookieConfig;
 use saas_leptos::email::NoopEmailSender;
-use saas_leptos::rate_limit::SimpleRateLimiter;
+use rate_limiter::RateLimiter;
 use saas_leptos::state::AppState;
 
 // ─── Setup ─────────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
             .expect("saas builder"),
     );
     let email: Arc<dyn saas_leptos::email::EmailSender> = Arc::new(NoopEmailSender);
-    let rate_limit = Arc::new(SimpleRateLimiter::new());
+    let rate_limit: Arc<dyn RateLimiter> = Arc::new(rate_limiter::InMemoryRateLimiter::new());
     let cookie = test_cookie_config();
 
     let state = AppState {
@@ -499,12 +499,53 @@ async fn register_rate_limiter_blocks_after_three(pool: PgPool) {
     for i in 0..3 {
         state
             .rate_limit
-            .try_acquire(&email, 3, window)
+            .try_acquire(&email, 3, window).await
             .unwrap_or_else(|_| panic!("attempt {i} must be under the limit"));
     }
     let retry_after = state
         .rate_limit
-        .try_acquire(&email, 3, window)
+        .try_acquire(&email, 3, window).await
         .expect_err("4th attempt must be rejected");
     assert!(retry_after > 0 && retry_after <= 3600);
+}
+
+// ─── Pagination (Stage 4.8) ────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn pagination_via_state(pool: PgPool) {
+    let (_, state) = setup_app(pool).await;
+    let admin_email = format!("admin-{}@test.local", Uuid::new_v4());
+    let admin = state.authn.register(&admin_email, "Password123!").await.unwrap();
+    grant_platform_admin(&state, admin.id).await;
+
+    let owner_email = format!("owner-{}@test.local", Uuid::new_v4());
+    let owner = state.authn.register(&owner_email, "Password123!").await.unwrap();
+    let owner_key = access::RoleKey::parse("owner").unwrap();
+
+    // Create 3 tenants
+    for i in 0..3 {
+        saas::platform::provision_tenant(
+            &state.saas,
+            &admin,
+            format!("Acme-{}-{}", Uuid::new_v4(), i),
+            &owner,
+            &owner_key,
+        ).await.unwrap();
+    }
+
+    // Page 1: limit 2, offset 0
+    let page1 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 0).await.unwrap();
+    assert_eq!(page1.total, 3);
+    assert_eq!(page1.items.len(), 2);
+
+    // Page 2: limit 2, offset 2
+    let page2 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 2).await.unwrap();
+    assert_eq!(page2.total, 3);
+    assert_eq!(page2.items.len(), 1);
+
+    // Audit pagination: limit 1, offset 0
+    let logger = audit_pg::PgAuditLogger::from_pool(state.saas.pool().clone());
+    let audit_page = logger.list_paged(1, 0).await.unwrap();
+    assert!(audit_page.total >= 3);
+    assert_eq!(audit_page.items.len(), 1);
 }

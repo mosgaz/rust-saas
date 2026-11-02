@@ -20,7 +20,7 @@ use ::audit::AuditLogger;
 use audit_pg::PgAuditLogger;
 use authz::AuthorizationEngine;
 use axum_minimal::email::NoopEmailSender;
-use axum_minimal::rate_limit::SimpleRateLimiter;
+use rate_limiter::RateLimiter;
 use axum_minimal::state::AppState;
 use axum_minimal::{cookie, build_app};
 
@@ -96,7 +96,14 @@ async fn main() -> anyhow::Result<()> {
     // \u2500\u2500 Email transport + rate limiter \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     // SMTP out of scope for 3g \u2014 `NoopEmailSender` only.
     let email: Arc<dyn axum_minimal::email::EmailSender> = Arc::new(NoopEmailSender);
-    let rate_limit = Arc::new(SimpleRateLimiter::new());
+    let rate_limit: Arc<dyn RateLimiter> = match std::env::var("REDIS_URL") {
+        Ok(url) if !url.trim().is_empty() => Arc::new(
+            rate_limiter::RedisRateLimiter::from_url(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to Redis: {e}"))?,
+        ),
+        _ => Arc::new(rate_limiter::InMemoryRateLimiter::new()),
+    };
 
     // Stage 4.1b: cookie policy (Secure/SameSite/Max-Age).
     let cookie_cfg = Arc::new(cookie::CookieConfig::from_env(&bind_addr));

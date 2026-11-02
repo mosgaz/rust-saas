@@ -148,6 +148,19 @@ pub struct Member {
     pub created_at: DateTime<Utc>,
 }
 
+
+/// A page of results from a paginated list endpoint.
+///
+/// `total` is the total number of matching rows (for UI pagination controls);
+/// `limit` and `offset` echo the request. Stage 4.8 (ADR-0005).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 pub const PLATFORM_DOMAIN: &str = "platform";
 
 /// Casbin domain for a tenant.

@@ -18,6 +18,7 @@ use audit::AuditLogger;
 use audit_pg::PgAuditLogger;
 #[cfg(feature = "ssr")]
 use authz::AuthorizationEngine;
+use rate_limiter::RateLimiter;
 #[cfg(feature = "ssr")]
 use leptos::config::get_configuration;
 
@@ -127,7 +128,14 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-    let rate_limit = Arc::new(saas_leptos::rate_limit::SimpleRateLimiter::new());
+    let rate_limit: Arc<dyn RateLimiter> = match std::env::var("REDIS_URL") {
+        Ok(url) if !url.trim().is_empty() => Arc::new(
+            rate_limiter::RedisRateLimiter::from_url(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to Redis: {e}"))?,
+        ),
+        _ => Arc::new(rate_limiter::InMemoryRateLimiter::new()),
+    };
 
     let app_state = saas_leptos::state::AppState {
         authn: authn.clone(),

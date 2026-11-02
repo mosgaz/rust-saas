@@ -8,6 +8,7 @@ description = "PostgreSQL implementation of the audit::AuditLogger trait (audit_
 
 [dependencies]
 audit = { path = "../audit" }
+domain = { path = "../domain" }
 
 sqlx.workspace = true
 uuid.workspace = true

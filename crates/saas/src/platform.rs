@@ -43,12 +43,13 @@
 //!   `metadata`).
 //! - `suspend_tenant` → `tenant.suspended` (only on transition).
 //! - `activate_tenant` → `tenant.activated` (only on transition).
+//!
 //! All emissions are best-effort via `SaasState::audit_or_warn`; a failed
 //! write does not fail the business operation (ADR-0004 §2.4).
 
 use ::access::RoleKey;
 use audit::{events, AuditEvent};
-use domain::{AuthUser, Tenant, TenantStatus, PLATFORM_DOMAIN};
+use domain::{AuthUser, Page, Tenant, TenantStatus, PLATFORM_DOMAIN};
 use uuid::Uuid;
 
 use crate::{CoreError, SaasState};
@@ -161,23 +162,52 @@ pub async fn provision_tenant(
     Ok(tenant)
 }
 
-/// Lists every tenant on the platform, newest first.
+/// Lists every tenant on the platform, newest first, with pagination.
 ///
-/// Requires `(tenants, list)` in `PLATFORM_DOMAIN` (Stage 3f). No pagination
-/// in Stage 3f (MVP; Stage 4 adds `limit` / `offset` — see Appendix B
-/// §IV). Read-only: no audit emission.
-pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Tenant>, CoreError> {
+/// Requires `(tenants, list)` in `PLATFORM_DOMAIN` (Stage 3f).
+/// Read-only: no audit emission.
+pub async fn list_tenants_paged(
+    state: &SaasState,
+    actor: &AuthUser,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Tenant>, CoreError> {
     state
         .authz
         .require(actor.id, PLATFORM_DOMAIN, "tenants", "list")
         .await?;
 
-    let tenants = sqlx::query_as::<_, Tenant>(
-        "select id, name, status, created_at from tenants order by created_at desc",
+    let total: i64 = sqlx::query_scalar("select count(*) from tenants")
+        .fetch_one(&state.pool)
+        .await?;
+
+    let items = sqlx::query_as::<_, Tenant>(
+        r#"
+        select id, name, status, created_at
+        from tenants
+        order by created_at desc
+        limit $1 offset $2
+        "#,
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
-    Ok(tenants)
+
+    Ok(Page {
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+/// Lists every tenant on the platform, newest first.
+///
+/// **Deprecated:** use [`list_tenants_paged`] with `(i64::MAX, 0)` for "all rows".
+#[deprecated(note = "use list_tenants_paged(..., i64::MAX, 0) for 'all rows'")]
+pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Tenant>, CoreError> {
+    Ok(list_tenants_paged(state, actor, i64::MAX, 0).await?.items)
 }
 
 /// Suspends a tenant (`tenants.status = 'suspended'`).

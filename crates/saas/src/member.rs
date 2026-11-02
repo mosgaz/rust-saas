@@ -63,7 +63,7 @@ use std::collections::HashMap;
 
 use ::access::RoleKey;
 use audit::{events, AuditEvent};
-use domain::{AuthUser, Member};
+use domain::{AuthUser, Member, Page};
 use sqlx::types::chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -115,44 +115,67 @@ impl MemberScope {
 ///
 /// Order: `(members, list)` → SQL join → group by `user_id`. Rows come
 /// sorted by user email; roles within one user are sorted by `role_key`.
-pub async fn list(
+pub async fn list_paged(
     state: &SaasState,
     actor: &AuthUser,
     scope: MemberScope,
-) -> Result<Vec<Member>, CoreError> {
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Member>, CoreError> {
     let domain_str = scope.domain();
     state
         .authz
         .require(actor.id, &domain_str, "members", "list")
         .await?;
 
-    // Safe: `table` / `scope_column` come from a closed enum, never user
-    // input. `scope_id()` is bound via `$1`.
-    let sql = format!(
-        r#"
-        select u.id, u.email, m.role, u.created_at
-        from {table} m
-        join users u on u.id = m.user_id
-        where m.{scope_column} = $1
-        order by u.email, m.role
-        "#,
+    let total: i64 = sqlx::query_scalar(&format!(
+        "select count(distinct user_id) from {table} where {scope_column} = $1",
         table = scope.table(),
         scope_column = scope.scope_column(),
-    );
+    ))
+    .bind(scope.scope_id())
+    .fetch_one(state.pool())
+    .await?;
 
-    let rows: Vec<(Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(&sql)
+    let user_ids: Vec<Uuid> = sqlx::query_scalar(&format!(
+        "select m.user_id from {table} m join users u on u.id = m.user_id where m.{scope_column} = $1 group by m.user_id, u.email order by u.email limit $2 offset $3",
+        table = scope.table(),
+        scope_column = scope.scope_column(),
+    ))
+    .bind(scope.scope_id())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(state.pool())
+    .await?;
+
+    let rows: Vec<(Uuid, String, String, DateTime<Utc>)> = if user_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(&format!(
+            r#"
+            select u.id, u.email, m.role, u.created_at
+            from {table} m
+            join users u on u.id = m.user_id
+            where m.{scope_column} = $1 and m.user_id = ANY($2)
+            order by u.email, m.role
+            "#,
+            table = scope.table(),
+            scope_column = scope.scope_column(),
+        ))
         .bind(scope.scope_id())
+        .bind(&user_ids)
         .fetch_all(state.pool())
-        .await?;
+        .await?
+    };
 
-    let mut members: Vec<Member> = Vec::new();
+    let mut items: Vec<Member> = Vec::new();
     let mut index: HashMap<Uuid, usize> = HashMap::new();
     for (user_id, email, role, created_at) in rows {
         if let Some(&i) = index.get(&user_id) {
-            members[i].roles.push(role);
+            items[i].roles.push(role);
         } else {
-            index.insert(user_id, members.len());
-            members.push(Member {
+            index.insert(user_id, items.len());
+            items.push(Member {
                 user_id,
                 email,
                 roles: vec![role],
@@ -160,7 +183,21 @@ pub async fn list(
             });
         }
     }
-    Ok(members)
+    Ok(Page {
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+#[deprecated(note = "use list_paged(..., i64::MAX, 0) for 'all rows'")]
+pub async fn list(
+    state: &SaasState,
+    actor: &AuthUser,
+    scope: MemberScope,
+) -> Result<Vec<Member>, CoreError> {
+    Ok(list_paged(state, actor, scope, i64::MAX, 0).await?.items)
 }
 
 /// Replaces `old_role_key` with `new_role_key` for `user_id` in `scope`.

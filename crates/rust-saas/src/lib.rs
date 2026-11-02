@@ -22,6 +22,7 @@
 
 pub use audit;
 pub use authz;
+pub use rate_limiter;
 pub use domain;
 
 #[cfg(feature = "ssr")]

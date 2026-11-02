@@ -13,9 +13,9 @@
 //! 1. If `invitation.email IS NULL` (link), no extra checks.
 //! 2. If `invitation.email IS NOT NULL`:
 //!    a. `actor.email_verified == false` → [`CoreError::EmailNotVerified`]
-//!       (verified-first: an unverified address is not proof of ownership).
+//!    (verified-first: an unverified address is not proof of ownership).
 //!    b. `!actor.email.eq_ignore_ascii_case(invitation.email)` →
-//!       [`CoreError::Forbidden`] (case-insensitive; see Appendix B §2.32).
+//!    [`CoreError::Forbidden`] (case-insensitive; see Appendix B §2.32).
 //!
 //! The check runs after the `SELECT ... FOR UPDATE` lookup and before
 //! `used_count` is incremented, so a rejected accept does not consume a use.
@@ -189,9 +189,9 @@ pub async fn check_invitation(
 ///    `None` → [`CoreError::NotFound`].
 /// 2. **Stage 3c:** if `invitation.email IS NOT NULL` (addressed):
 ///    a. `actor.email_verified == false` → [`CoreError::EmailNotVerified`]
-///       (verified-first, see §«Решения A»).
+///    (verified-first, see §«Решения A»).
 ///    b. `!actor.email.eq_ignore_ascii_case(inv.email)` →
-///       [`CoreError::Forbidden`] (case-insensitive, §«Решения C»).
+///    [`CoreError::Forbidden`] (case-insensitive, §«Решения C»).
 ///    Both checks run **before** `used_count` is incremented, so a
 ///    rejected accept does not consume a use.
 /// 3. **Stage 3f:** [`ensure_tenant_active`] on the invitation's tenant

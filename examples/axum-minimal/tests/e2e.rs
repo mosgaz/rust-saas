@@ -31,7 +31,7 @@ use axum::Router;
 use axum_minimal::build_app;
 use axum_minimal::cookie::CookieConfig;
 use axum_minimal::email::NoopEmailSender;
-use axum_minimal::rate_limit::SimpleRateLimiter;
+use rate_limiter::RateLimiter;
 use axum_minimal::state::AppState;
 use http_body_util::BodyExt;
 use sqlx::PgPool;
@@ -79,7 +79,7 @@ async fn setup_app(pool: PgPool) -> (Router, Arc<AppState>) {
             .expect("saas builder"),
     );
     let email: Arc<dyn axum_minimal::email::EmailSender> = Arc::new(NoopEmailSender);
-    let rate_limit = Arc::new(SimpleRateLimiter::new());
+    let rate_limit: Arc<dyn RateLimiter> = Arc::new(rate_limiter::InMemoryRateLimiter::new());
     let cookie = test_cookie_config();
 
     let state = Arc::new(AppState {
@@ -518,7 +518,7 @@ async fn audit_requires_platform_audit_read(pool: PgPool) {
     let resp = get_with_jar(&router, "/audit?limit=10", &jar).await;
     assert_eq!(resp.status(), StatusCode::OK, "platform admin must see audit");
     let json = body_json(resp).await;
-    assert!(json.is_array(), "audit body must be a JSON array: {json:?}");
+    assert!(json["items"].is_array(), "audit body must be a Page with items array: {json:?}");
 }
 
 // ─── Rate limiting ─────────────────────────────────────────────────────────
@@ -576,4 +576,52 @@ async fn register_rate_limited_at_4_per_hour(pool: PgPool) {
         .parse()
         .expect("Retry-After is an integer number of seconds");
     assert!(n > 0 && n <= 3600, "Retry-After out of range: {n}");
+}
+
+// ─── Pagination (Stage 4.8) ────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn pagination_limits_and_offsets_tenants(pool: PgPool) {
+    let (router, state) = setup_app(pool).await;
+    let email = unique_email();
+    let (jar, user_id) = register_and_get_jar(&router, &email).await;
+    grant_platform_admin(&state, user_id).await;
+
+    // Create 2 tenants
+    for i in 0..2 {
+        let resp = post_json_with_csrf(
+            &router,
+            "/tenants",
+            &jar,
+            serde_json::json!({ "name": format!("Acme {}", i) }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Page 1: limit=1, offset=0
+    let resp = get_with_jar(&router, "/tenants?limit=1&offset=0", &jar).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page1 = body_json(resp).await;
+    assert_eq!(page1["total"], 2);
+    assert_eq!(page1["items"].as_array().unwrap().len(), 1);
+    let id1 = page1["items"][0]["id"].as_str().unwrap().to_string();
+
+    // Page 2: limit=1, offset=1
+    let resp = get_with_jar(&router, "/tenants?limit=1&offset=1", &jar).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page2 = body_json(resp).await;
+    assert_eq!(page2["total"], 2);
+    assert_eq!(page2["items"].as_array().unwrap().len(), 1);
+    let id2 = page2["items"][0]["id"].as_str().unwrap().to_string();
+
+    assert_ne!(id1, id2, "items on different pages must be distinct");
+
+    // Clamp: limit=1000 should clamp to 200 (and return both tenants)
+    let resp = get_with_jar(&router, "/tenants?limit=1000", &jar).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page3 = body_json(resp).await;
+    assert_eq!(page3["limit"], 200);
+    assert_eq!(page3["total"], 2);
+    assert_eq!(page3["items"].as_array().unwrap().len(), 2);
 }

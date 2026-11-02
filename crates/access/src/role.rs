@@ -27,7 +27,7 @@
 //! `access::delete_role_by_id`, which is also audit-silent).
 
 use audit::{events, AuditEvent};
-use domain::AuthUser;
+use domain::{AuthUser, Page};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -310,14 +310,21 @@ pub async fn delete_role(
 /// 1. `require(actor.id, domain, "roles", "list")`.
 /// 2. `SELECT roles WHERE domain = $1 ORDER BY key`.
 /// 3. For each, load `permissions` via `role_permissions`.
-pub async fn list_roles(
+pub async fn list_roles_paged(
     state: &AccessState,
     actor: &AuthUser,
     domain: &str,
-) -> Result<Vec<Role>, AccessError> {
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Role>, AccessError> {
     state
         .authz()
         .require(actor.id, domain, "roles", "list")
+        .await?;
+
+    let total: i64 = sqlx::query_scalar("select count(*) from roles where domain = $1")
+        .bind(domain)
+        .fetch_one(state.pool())
         .await?;
 
     let rows: Vec<RoleRow> = sqlx::query_as(
@@ -326,18 +333,36 @@ pub async fn list_roles(
         from roles
         where domain = $1
         order by key
+        limit $2 offset $3
         "#,
     )
     .bind(domain)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(state.pool())
     .await?;
 
-    let mut out = Vec::with_capacity(rows.len());
+    let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let permissions = get_permissions_for_role_id(state.pool(), row.id).await?;
-        out.push(row.into_role(permissions));
+        items.push(row.into_role(permissions));
     }
-    Ok(out)
+
+    Ok(Page {
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+#[deprecated(note = "use list_roles_paged(..., i64::MAX, 0) for 'all rows'")]
+pub async fn list_roles(
+    state: &AccessState,
+    actor: &AuthUser,
+    domain: &str,
+) -> Result<Vec<Role>, AccessError> {
+    Ok(list_roles_paged(state, actor, domain, i64::MAX, 0).await?.items)
 }
 
 /// Returns a role by `(domain, role_key)`, if any.

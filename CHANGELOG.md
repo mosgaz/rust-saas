@@ -10,6 +10,15 @@ revision.
 
 ## [Unreleased]
 
+### Stage 4.8 — Pagination + distributed rate limiter
+- Added `domain::Page<T>` for pagination.
+- Added `list_*_paged` to `access`, `saas`, and `audit-pg`. Old `list_*` functions are marked `#[deprecated]`.
+- Added `crates/rate-limiter`: `RateLimiter` trait, `InMemoryRateLimiter` (default), `RedisRateLimiter` (feature `redis`).
+- Replaced `SimpleRateLimiter` in examples with `Arc<dyn RateLimiter>`.
+- Added Redis to `docker-compose.yml` and CI.
+- Updated UI (`platform.rs`) to support Prev/Next pagination.
+- Bumped version to `0.2.1` (patch).
+
 ### Stage 4.6 — CI, tooling, and documentation
 - Added `rust-toolchain.toml` (pinned to `1.98`), `.github/workflows/ci.yml` (test, check, deny, docker), `deny.toml` (licenses, bans, advisories), `CONTRIBUTING.md`, `SECURITY.md`.
 - Added `publish = false` to all internal crates to simplify wildcard dependency checks.

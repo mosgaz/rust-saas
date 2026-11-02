@@ -46,6 +46,27 @@ jobs:
           JWT_SECRET: test-secret
         run: cargo test --workspace
 
+
+  test-redis:
+    name: Test Redis Rate Limiter
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test rate-limiter with Redis
+        run: cargo test -p rate-limiter --features redis
+
   check-examples:
     name: Check Examples
     runs-on: ubuntu-latest
@@ -82,6 +103,16 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -98,6 +129,7 @@ jobs:
       - name: E2E axum-minimal
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+          REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
 
       # `saas-leptos` server modules are `#[cfg(feature = "ssr")]`; the
@@ -106,6 +138,7 @@ jobs:
       - name: E2E saas-leptos
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+          REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr --test e2e
 
   deny:

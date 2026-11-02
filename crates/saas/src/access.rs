@@ -28,7 +28,7 @@
 
 use ::access::{Permission, Role, RoleKey};
 use audit::{events, AuditEvent};
-use domain::AuthUser;
+use domain::{AuthUser, Page};
 use uuid::Uuid;
 
 use crate::{CoreError, SaasState};
@@ -260,23 +260,46 @@ pub async fn delete_role(
     Ok(())
 }
 
+/// Lists roles in `domain`. Delegates to `access::list_roles_paged`.
+pub async fn list_roles_paged(
+    state: &SaasState,
+    actor: &AuthUser,
+    domain: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Role>, CoreError> {
+    ::access::list_roles_paged(state.access(), actor, domain, limit, offset)
+        .await
+        .map_err(Into::into)
+}
+
 /// Lists roles in `domain`. Delegates to `access::list_roles`.
+#[deprecated(note = "use list_roles_paged(..., i64::MAX, 0) for 'all rows'")]
 pub async fn list_roles(
     state: &SaasState,
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<Role>, CoreError> {
-    ::access::list_roles(state.access(), actor, domain)
+    Ok(list_roles_paged(state, actor, domain, i64::MAX, 0).await?.items)
+}
+
+/// Lists all permissions in the reference table. Delegates to
+/// `access::list_permissions_paged`.
+pub async fn list_permissions_paged(
+    state: &SaasState,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Permission>, CoreError> {
+    ::access::list_permissions_paged(state.access(), limit, offset)
         .await
         .map_err(Into::into)
 }
 
 /// Lists all permissions in the reference table. Delegates to
 /// `access::list_permissions`.
+#[deprecated(note = "use list_permissions_paged(..., i64::MAX, 0) for 'all rows'")]
 pub async fn list_permissions(state: &SaasState) -> Result<Vec<Permission>, CoreError> {
-    ::access::list_permissions(state.access())
-        .await
-        .map_err(Into::into)
+    Ok(list_permissions_paged(state, i64::MAX, 0).await?.items)
 }
 
 /// Returns the `(resource, action)` pairs that `actor` is effectively
@@ -297,9 +320,10 @@ pub async fn my_permissions(
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<(String, String)>, CoreError> {
-    let reference = ::access::list_permissions(state.access())
+    let reference = ::access::list_permissions_paged(state.access(), i64::MAX, 0)
         .await
-        .map_err(CoreError::from)?;
+        .map_err(CoreError::from)?
+        .items;
 
     let mut out = Vec::with_capacity(reference.len());
     for Permission {

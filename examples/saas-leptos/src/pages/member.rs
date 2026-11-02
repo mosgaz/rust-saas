@@ -60,9 +60,10 @@ pub async fn list_members(domain: String) -> Result<Vec<Member>, ServerFnError> 
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
     let scope = parse_scope(&domain)?;
-    saas::member::list(&state.saas, &user, scope)
+    let page = saas::member::list_paged(&state.saas, &user, scope, i64::MAX, 0)
         .await
-        .map_err(crate::error::core_error_to_server_fn)
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(page.items)
 }
 
 /// Returns the actor's effective permissions in `domain`.

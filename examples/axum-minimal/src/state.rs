@@ -27,7 +27,7 @@ use saas::SaasState;
 
 use crate::cookie::CookieConfig;
 use crate::email::EmailSender;
-use crate::rate_limit::SimpleRateLimiter;
+use rate_limiter::RateLimiter;
 
 /// Process-wide state, cloned into every request handler.
 ///
@@ -54,7 +54,7 @@ pub struct AppState {
     /// In-memory rate limiter; used by `POST /auth/register`
     /// (3 / 1 h per email). Process-local; not distributed (see
     /// `rate_limit.rs`).
-    pub rate_limit: Arc<SimpleRateLimiter>,
+    pub rate_limit: Arc<dyn RateLimiter>,
 
     /// Cookie policy (Secure/SameSite/Max-Age) resolved from env at startup
     /// (Stage 4.1b). Shared with `middleware::auto_refresh` and the auth
@@ -80,7 +80,7 @@ impl axum::extract::FromRef<AppState> for Arc<dyn EmailSender> {
     }
 }
 
-impl axum::extract::FromRef<AppState> for Arc<SimpleRateLimiter> {
+impl axum::extract::FromRef<AppState> for Arc<dyn RateLimiter> {
     fn from_ref(state: &AppState) -> Self {
         state.rate_limit.clone()
     }

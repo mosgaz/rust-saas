@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let editor_key = RoleKey::parse("editor")?;
     let viewer_key = RoleKey::parse("viewer")?;
 
-    let roles = saas_access::list_roles(&state, &tenant_owner, &ws_domain).await?;
+    let roles = saas_access::list_roles_paged(&state, &tenant_owner, &ws_domain, i64::MAX, 0).await?.items;
 
     // Create custom roles if they don't exist yet. `saas_access::create_role`
     // goes through `access::create_role` (which emits `role.created` when

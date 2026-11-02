@@ -45,6 +45,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::pagination::PaginationQuery;
 use crate::extract::CurrentUser;
 use crate::state::AppState;
 
@@ -53,12 +54,20 @@ use crate::state::AppState;
 /// Lists workspaces the current user is a member of. Read-only; no
 /// `resolve_active_tenant`.
 pub async fn list_my_workspaces(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     current: CurrentUser,
+    Query(q): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let user = current.require()?;
-    let workspaces = saas::workspace::list_memberships(&state.saas, &user).await?;
-    Ok(Json(workspaces))
+    let _user = current.require()?;
+    let items = saas::workspace::list_memberships(&_state.saas, &_user).await?;
+    let (limit, offset) = q.clamp();
+    let total = items.len() as i64;
+    let items: Vec<_> = items
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok(Json(domain::Page { items, total, limit, offset }))
 }
 
 // ─── POST /workspaces ───────────────────────────────────────────────────────

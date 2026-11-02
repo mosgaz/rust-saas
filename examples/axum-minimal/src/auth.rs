@@ -108,7 +108,7 @@ pub async fn register(
     // 1. Rate limit.
     if let Err(retry_after) = state
         .rate_limit
-        .try_acquire(&body.email, 3, Duration::from_secs(3600))
+        .try_acquire(&body.email, 3, Duration::from_secs(3600)).await
     {
         return Err(AppError::rate_limited(retry_after));
     }

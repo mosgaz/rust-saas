@@ -28,6 +28,7 @@
 //! consumers can pick pagination/filtering for their own storage).
 
 use audit::{AuditError, AuditEvent, AuditLogger};
+use domain::Page;
 use serde::{Deserialize, Serialize};
 use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -83,8 +84,17 @@ impl PgAuditLogger {
     /// example uses `LIMIT_MAX = 200`). Rows are ordered by
     /// `(occurred_at DESC, id DESC)` so that ties (same-microsecond rows,
     /// e.g. `change_role`'s three events) are stable across calls.
-    pub async fn list(&self, limit: i64) -> Result<Vec<AuditRow>, AuditError> {
-        sqlx::query_as::<_, AuditRow>(
+    pub async fn list_paged(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Page<AuditRow>, AuditError> {
+        let total: i64 = sqlx::query_scalar("select count(*) from audit_log")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AuditError::Internal(e.to_string()))?;
+
+        let items = sqlx::query_as::<_, AuditRow>(
             r#"
             select
                 id,
@@ -97,13 +107,26 @@ impl PgAuditLogger {
                 metadata
             from audit_log
             order by occurred_at desc, id desc
-            limit $1
+            limit $1 offset $2
             "#,
         )
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| AuditError::Internal(e.to_string()))
+        .map_err(|e| AuditError::Internal(e.to_string()))?;
+
+        Ok(Page {
+            items,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    #[deprecated(note = "use list_paged(..., i64::MAX, 0) for 'all rows'")]
+    pub async fn list(&self, limit: i64) -> Result<Vec<AuditRow>, AuditError> {
+        Ok(self.list_paged(limit, 0).await?.items)
     }
 }
 

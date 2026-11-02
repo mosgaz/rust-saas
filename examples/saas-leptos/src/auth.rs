@@ -288,7 +288,7 @@ pub async fn request_email_verification() -> Result<EmailResult, ServerFnError> 
 
     if let Err(retry_after) = state
         .rate_limit
-        .try_acquire(&user.email, 3, Duration::from_secs(3600))
+        .try_acquire(&user.email, 3, Duration::from_secs(3600)).await
     {
         return Err(crate::error::rate_limited_error(retry_after));
     }
@@ -350,7 +350,7 @@ pub async fn request_password_reset(email: String) -> Result<(), ServerFnError> 
 
     if let Err(retry_after) = state
         .rate_limit
-        .try_acquire(&email, 5, Duration::from_secs(3600))
+        .try_acquire(&email, 5, Duration::from_secs(3600)).await
     {
         return Err(crate::error::rate_limited_error(retry_after));
     }

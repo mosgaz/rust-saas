@@ -28,7 +28,7 @@ pub mod error;
 pub mod extract;
 pub mod health;
 pub mod middleware;
-pub mod rate_limit;
+pub mod pagination;
 pub mod state;
 pub mod tenant;
 pub mod workspace;
