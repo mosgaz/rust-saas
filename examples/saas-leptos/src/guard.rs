@@ -114,17 +114,11 @@ pub fn GuardRoute(guard: RouteGuard, children: ChildrenFn) -> impl IntoView {
     let children = StoredValue::new(children);
     let guard = StoredValue::new(guard);
 
-    let session = RwSignal::new(None::<Option<SessionUser>>);
-    let perms: RwSignal<Option<Result<Vec<(String, String)>, String>>> = RwSignal::new(None);
-    let error = RwSignal::new(None::<String>);
-
     let navigate = use_navigate();
     let location = use_location();
     let params_t = use_params::<TenantIdParams>();
     let params_w = use_params::<WorkspaceIdParams>();
 
-    // Domain for the permission check. `None` for Public/Auth (no permission
-    // check) or for a Tenant/Workspace route whose id failed to parse.
     let domain_memo = Memo::new(move |_| {
         let g = guard.get_value();
         match g {
@@ -145,112 +139,78 @@ pub fn GuardRoute(guard: RouteGuard, children: ChildrenFn) -> impl IntoView {
         }
     });
 
-    // Auth check (skipped for Public).
+    let session = Resource::new(|| (), |_| async move { who_am_i().await });
+
+    let perms = Resource::new(
+        move || domain_memo.get(),
+        |domain| async move {
+            match domain {
+                Some(d) => my_permissions(d).await,
+                None => Ok(Vec::new()),
+            }
+        },
+    );
+
     Effect::new(move |_| {
-        let g = guard.get_value();
-        if matches!(&g, RouteGuard::Public) {
+        if matches!(guard.get_value(), RouteGuard::Public) {
             return;
         }
-        let nav = navigate.clone();
-        let loc = location.clone();
-        spawn_local(async move {
-            match who_am_i().await {
-                Ok(Some(u)) => session.set(Some(Some(u))),
-                Ok(None) => {
-                    let path = loc.pathname.get_untracked();
-                    if !path.is_empty() {
-                        let _ = crate::auth::set_return_url(path).await;
-                    }
-                    nav("/login", Default::default());
-                    session.set(Some(None));
-                }
-                Err(e) => error.set(Some(e.to_string())),
+        if let Some(Ok(None)) = session.get() {
+            let path = location.pathname.get_untracked();
+            let nav = navigate.clone();
+            if !path.is_empty() {
+                spawn_local(async move {
+                    let _ = crate::auth::set_return_url(path).await;
+                });
             }
-        });
-    });
-
-    // Permission check (skipped for Public/Auth or when domain is None).
-    Effect::new(move |_| {
-        let Some(d) = domain_memo.get() else {
-            return;
-        };
-        spawn_local(async move {
-            match my_permissions(d).await {
-                Ok(p) => perms.set(Some(Ok(p))),
-                Err(e) => perms.set(Some(Err(e.to_string()))),
-            }
-        });
+            nav("/login", Default::default());
+        }
     });
 
     view! {
-        {move || {
-            if let Some(e) = error.get() {
-                return view! { <p class="text-red-400">{e}</p> }.into_any();
-            }
-
-            let g = guard.get_value();
-
-            if matches!(&g, RouteGuard::Public) {
-                return children.with_value(|c| c());
-            }
-
-            match session.get() {
-                None => view! {
-                    <p class="text-neutral-400">"Loading…"</p>
+        <Suspense fallback=|| view! { <p class="text-neutral-400">"Loading…"</p> }>
+            {move || {
+                let g = guard.get_value();
+                if matches!(g, RouteGuard::Public) {
+                    return children.with_value(|c| c());
                 }
-                .into_any(),
-                Some(None) => view! {
-                    <p class="text-neutral-400">"Redirecting to /login…"</p>
-                }
-                .into_any(),
-                Some(Some(_)) => {
-                    if matches!(&g, RouteGuard::Auth) {
-                        return children.with_value(|c| c());
-                    }
-                    if domain_memo.get().is_none() {
-                        return view! {
-                            <p class="text-red-400">"Invalid id in the URL."</p>
+                match session.get() {
+                    None => view! { <p class="text-neutral-400">"Loading…"</p> }.into_any(),
+                    Some(Err(e)) => view! { <p class="text-red-400">{e.to_string()}</p> }.into_any(),
+                    Some(Ok(None)) => view! {
+                        <div class="p-8 text-center">
+                            <h1 class="text-2xl font-bold text-red-400">"401 — Unauthorized"</h1>
+                            <p class="mt-2 text-neutral-400">"Please log in to view this page."</p>
+                            <a class="btn mt-4 inline-block" href="/login">"Login"</a>
+                        </div>
+                    }.into_any(),
+                    Some(Ok(Some(_))) => {
+                        if matches!(g, RouteGuard::Auth) {
+                            return children.with_value(|c| c());
                         }
-                        .into_any();
-                    }
-                    match perms.get() {
-                        None => view! {
-                            <p class="text-neutral-400">"Checking permissions…"</p>
-                        }
-                        .into_any(),
-                        Some(Err(e)) => view! {
-                            <p class="text-red-400">{e}</p>
-                        }
-                        .into_any(),
-                        Some(Ok(p)) => {
-                            let ok = match &g {
-                                RouteGuard::Platform { resource, action } => p
-                                    .iter()
-                                    .any(|(r, a)| r.as_str() == *resource && a.as_str() == *action),
-                                RouteGuard::Tenant { resource, action } => p
-                                    .iter()
-                                    .any(|(r, a)| r.as_str() == *resource && a.as_str() == *action),
-                                RouteGuard::TenantAny(req) => req.iter().any(|(rr, ra)| {
-                                    p.iter().any(|(r, a)| r.as_str() == *rr && a.as_str() == *ra)
-                                }),
-                                RouteGuard::Workspace { resource, action } => p
-                                    .iter()
-                                    .any(|(r, a)| r.as_str() == *resource && a.as_str() == *action),
-                                RouteGuard::WorkspaceAny(req) => req.iter().any(|(rr, ra)| {
-                                    p.iter().any(|(r, a)| r.as_str() == *rr && a.as_str() == *ra)
-                                }),
-                                _ => false,
-                            };
-                            if ok {
-                                children.with_value(|c| c())
-                            } else {
-                                forbidden_view()
+                        match perms.get() {
+                            None => view! { <p class="text-neutral-400">"Checking permissions…"</p> }.into_any(),
+                            Some(Err(e)) => view! { <p class="text-red-400">{e.to_string()}</p> }.into_any(),
+                            Some(Ok(p)) => {
+                                let ok = match &g {
+                                    RouteGuard::Platform { resource, action } => p.iter().any(|(r, a)| r.as_str() == *resource && a.as_str() == *action),
+                                    RouteGuard::Tenant { resource, action } => p.iter().any(|(r, a)| r.as_str() == *resource && a.as_str() == *action),
+                                    RouteGuard::TenantAny(req) => req.iter().any(|(rr, ra)| p.iter().any(|(r, a)| r.as_str() == *rr && a.as_str() == *ra)),
+                                    RouteGuard::Workspace { resource, action } => p.iter().any(|(r, a)| r.as_str() == *resource && a.as_str() == *action),
+                                    RouteGuard::WorkspaceAny(req) => req.iter().any(|(rr, ra)| p.iter().any(|(r, a)| r.as_str() == *rr && a.as_str() == *ra)),
+                                    _ => false,
+                                };
+                                if ok {
+                                    children.with_value(|c| c())
+                                } else {
+                                    forbidden_view()
+                                }
                             }
                         }
                     }
                 }
-            }
-        }}
+            }}
+        </Suspense>
     }
 }
 

@@ -10,6 +10,14 @@ revision.
 
 ## [Unreleased]
 
+### Stage 4.9 — SSR-correct guards + AuthLayer
+- `GuardRoute` rewritten to use `Resource`/`Suspense` (SSR now renders content or 401/403, not "Loading...").
+- Added `examples/saas-leptos/src/auth_layer.rs` (defense in depth: 401 anonymous, path-level permissions for `/platform` and `/platform/audit`).
+- Wired `auth_layer` into `build_app` in `saas-leptos`.
+- `crates/*` unchanged (`0.2.1`).
+- Tests: +3 in `saas-leptos/tests/e2e.rs` (`guarded_route_renders_ssr_content`, `auth_layer_blocks_unauthorized_ssr`, `auth_layer_blocks_forbidden_ssr`). **165 → 172**.
+- ADR-0006 records the design.
+
 ### Stage 4.8 — Pagination + distributed rate limiter
 - Added `domain::Page<T>` for pagination.
 - Added `list_*_paged` to `access`, `saas`, and `audit-pg`. Old `list_*` functions are marked `#[deprecated]`.

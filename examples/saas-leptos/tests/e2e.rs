@@ -198,13 +198,21 @@ async fn root_renders_ssr_html(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
-async fn guarded_route_renders_ssr_placeholder(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+async fn guarded_route_renders_ssr_content(pool: PgPool) {
+    let (router, state) = setup_app(pool).await;
+
+    // Register an authenticated user
+    let email = format!("user-{}@test.local", Uuid::new_v4());
+    let user = state.authn.register(&email, "Password123!").await.expect("register");
+    let access = state.authn.issue_access_token(&user).expect("issue token");
+    let refresh = state.authn.issue_refresh_token(&user).await.expect("issue refresh");
+
     let resp = router
         .oneshot(
             Request::builder()
                 .uri("/tenants")
                 .header(header::HOST, TEST_HOST)
+                .header(header::COOKIE, format!("access_token={access}; refresh_token={refresh}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -213,9 +221,17 @@ async fn guarded_route_renders_ssr_placeholder(pool: PgPool) {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let html = body_string(resp).await;
+    // Stage 4.9: `GuardRoute` uses `Resource`/`Suspense`. For an authenticated
+    // request on a guarded route, SSR must render the actual page content,
+    // *not* the "Loading..." placeholder.
     assert!(
-        html.contains("Loading"),
-        "guarded SSR page must render the Loading placeholder"
+        html.contains("My tenants"),
+        "guarded SSR page must render content, got: {}",
+        &html[..html.len().min(500)]
+    );
+    assert!(
+        !html.contains("Loading..."),
+        "guarded SSR page must not render the loading placeholder"
     );
 }
 
@@ -548,4 +564,71 @@ async fn pagination_via_state(pool: PgPool) {
     let audit_page = logger.list_paged(1, 0).await.unwrap();
     assert!(audit_page.total >= 3);
     assert_eq!(audit_page.items.len(), 1);
+}
+
+// ─── Stage 4.9: AuthLayer ──────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn auth_layer_blocks_unauthorized_ssr(pool: PgPool) {
+    let (router, _) = setup_app(pool).await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/platform")
+                .header(header::HOST, TEST_HOST)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("unauthorized"),
+        "AuthLayer must return JSON error, got: {body}"
+    );
+    assert!(
+        !body.contains("<html"),
+        "AuthLayer must short-circuit before HTML rendering"
+    );
+}
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn auth_layer_blocks_forbidden_ssr(pool: PgPool) {
+    let (router, state) = setup_app(pool).await;
+
+    // Register a regular user (no platform role).
+    let email = format!("user-{}@test.local", Uuid::new_v4());
+    let user = state
+        .authn
+        .register(&email, "Password123!")
+        .await
+        .expect("register");
+
+    let access = state.authn.issue_access_token(&user).expect("issue token");
+    let refresh = state.authn.issue_refresh_token(&user).await.expect("issue refresh");
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/platform")
+                .header(header::HOST, TEST_HOST)
+                .header(header::COOKIE, format!("access_token={access}; refresh_token={refresh}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("forbidden"),
+        "AuthLayer must return JSON error, got: {body}"
+    );
+    assert!(
+        !body.contains("<html"),
+        "AuthLayer must short-circuit before HTML rendering"
+    );
 }

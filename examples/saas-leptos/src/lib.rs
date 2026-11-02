@@ -48,6 +48,8 @@ pub mod pages;
 pub mod perms_cache;
 
 #[cfg(feature = "ssr")]
+pub mod auth_layer;
+#[cfg(feature = "ssr")]
 pub mod cookie;
 #[cfg(feature = "ssr")]
 pub mod error;
@@ -395,6 +397,10 @@ pub fn build_app(app_state: crate::state::AppState) -> axum::Router {
                 move || crate::shell(opts.clone())
             },
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::auth_layer::auth_layer,
+        ))
         .route_layer(from_fn_with_state(
             (authn, cookie_cfg),
             crate::middleware::auto_refresh,
