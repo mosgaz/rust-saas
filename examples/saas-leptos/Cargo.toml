@@ -115,3 +115,20 @@ lto = true
 codegen-units = 1
 
 [workspace]
+
+[dev-dependencies]
+# Stage 4.7: `#[sqlx::test]` for isolated per-test DBs.
+# `tokio` is already in [dependencies] as optional (ssr); pull the macro
+# runtime explicitly so `#[tokio::test]` works in tests.
+sqlx = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full", "macros"] }
+# Stage 4.7: `tower::ServiceExt::oneshot` for in-process router calls.
+tower = { version = "0.5", features = ["util"] }
+# Stage 4.7: read `Response` body as bytes.
+http-body-util = "0.1"
+
+[[test]]
+name = "e2e"
+# All server modules (`state`, `extract`, `middleware`, `auth`, …) are
+# `#[cfg(feature = "ssr")]`; the test target needs the SSR build.
+required-features = ["ssr"]

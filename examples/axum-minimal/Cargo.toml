@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Minimal Axum consumer of the rust-saas library (portability proof, Stage 3g)"
 
+[lib]
+# Stage 4.7: expose `build_app` to `tests/e2e.rs`. `rlib` only —
+# `axum-minimal` has no wasm/cdylib target.
+crate-type = ["rlib"]
+
 [dependencies]
 # Library crates — same public contracts as `saas-leptos`; `crates/*` untouched.
 # `domain` is built with the `ssr` feature so its `sqlx::FromRow` / `sqlx::Type`
@@ -41,3 +46,10 @@ anyhow = "1"
 
 # Independent workspace: second consumer example, not part of the library.
 [workspace]
+[dev-dependencies]
+# Stage 4.7: `#[sqlx::test]` for isolated per-test DBs.
+sqlx = { version = "0.8", features = ["macros"] }
+# Stage 4.7: `tower::ServiceExt::oneshot` for in-process router calls.
+tower = { version = "0.5", features = ["util"] }
+# Stage 4.7: read `Response` body as bytes (JSON assertions).
+http-body-util = "0.1"

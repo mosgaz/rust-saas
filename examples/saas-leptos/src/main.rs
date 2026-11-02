@@ -1,3 +1,14 @@
+//! `saas-leptos` entry point.
+//!
+//! Thin binary: env → `AppState` → `axum::serve(build_app(state))`.
+//! Everything else (handlers, middleware, router assembly) lives in
+//! `lib.rs::build_app`, which is what `tests/e2e.rs` drives in-process via
+//! `tower::ServiceExt::oneshot` (Stage 4.7).
+//!
+//! Kept `#[cfg(feature = "ssr")]` on `main` so `cargo check --features
+//! hydrate` on the host (without `ssr`) compiles an empty binary — the
+//! SSR wiring needs `axum`, `authn`, `saas`, `db`, all `ssr`-only.
+
 #[cfg(feature = "ssr")]
 use std::sync::Arc;
 
@@ -8,13 +19,7 @@ use audit_pg::PgAuditLogger;
 #[cfg(feature = "ssr")]
 use authz::AuthorizationEngine;
 #[cfg(feature = "ssr")]
-use axum::Router;
-#[cfg(feature = "ssr")]
 use leptos::config::get_configuration;
-#[cfg(feature = "ssr")]
-use leptos_axum::{generate_route_list, LeptosRoutes};
-#[cfg(feature = "ssr")]
-use tower_http::trace::TraceLayer;
 
 #[cfg(feature = "ssr")]
 #[tokio::main]
@@ -73,8 +78,6 @@ async fn main() -> anyhow::Result<()> {
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
 
-    // Stage 3e: real audit logger. Shared by `AccessState`, `Authn`, and
-    // `SaasState` — one pool, one logger, one `audit_log` table.
     let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
     let access = Arc::new(
@@ -99,8 +102,6 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
     );
 
-    // Stage 3b: email transport. `SmtpEmailSender` when `SMTP_URL` is set;
-    // `NoopEmailSender` otherwise (logs a warning, returns Disabled).
     let base_url = std::env::var("BASE_URL")
         .ok()
         .map(|s| s.trim().to_string())
@@ -137,56 +138,7 @@ async fn main() -> anyhow::Result<()> {
         cookie: cookie_cfg.clone(),
     };
 
-    // Stage 4.4a: readiness probe. Inline (not a separate module) so
-    // it does not leak into the `hydrate` build (axum is optional and
-    // only enabled under `ssr`).
-    async fn healthz() -> impl axum::response::IntoResponse {
-        (
-            axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!({ "status": "ok" })),
-        )
-    }
-
-    let routes = generate_route_list(saas_leptos::App);
-
-    // Auth-scoping (ADR-0002): SSR pages and Leptos `_server/*` handlers go
-    // through `auto_refresh`; static files and the 404 fallback do not.
-    let protected: Router<saas_leptos::state::AppState> = Router::new()
-        .leptos_routes_with_context(
-            &app_state,
-            routes,
-            {
-                let state = app_state.clone();
-                move || leptos::prelude::provide_context(state.clone())
-            },
-            {
-                let opts = leptos_options.clone();
-                move || saas_leptos::shell(opts.clone())
-            },
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            (authn, cookie_cfg),
-            saas_leptos::middleware::auto_refresh,
-        ))
-        // Stage 4.1c: reject cross-origin mutations on /_server/* and SSR
-        // pages. SameSite=Lax on auth cookies is the first line; the
-        // Origin/Host check covers top-level navigations that Lax permits.
-        .route_layer(axum::middleware::from_fn(
-            saas_leptos::middleware::same_origin_guard,
-        ));
-
-    let public: Router<saas_leptos::state::AppState> = Router::new()
-        .route("/healthz", axum::routing::get(healthz))
-        .fallback(
-            leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(
-                saas_leptos::shell,
-            ),
-        );
-
-    let router = protected
-        .merge(public)
-        .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+    let router = saas_leptos::build_app(app_state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
