@@ -29,7 +29,7 @@
 //! replay of the same raw token returns [`AuthnError::TokenInvalid`], so a
 //! reset URL that leaks via browser history or `Referer` cannot overwrite
 //! the freshly rotated password. In a single transaction it rewrites
-//! `users.password_hash` and `users.password_changed_at = now()` (via
+//! `users.password_hash` and `users.password_changed_at = clock_timestamp()` (via
 //! `identity::update_password_tx`), expires every outstanding reset token
 //! for the user, and revokes every refresh-token family
 //! ([`RevokeReason::PasswordReset`]). Access JWTs issued before the change
@@ -860,7 +860,7 @@ impl Authn {
     /// 5. `SELECT id FROM users ... FOR UPDATE` — row-lock the user,
     ///    serializing with concurrent reset attempts.
     /// 6. `identity::update_password_tx` — `password_hash = $1`,
-    ///    `password_changed_at = now()`.
+    ///    `password_changed_at = clock_timestamp()`.
     /// 7. `UPDATE password_reset_tokens SET used_at = now() WHERE user_id
     ///    = $1 AND used_at IS NULL` — expire the consumed token **and**
     ///    every other outstanding reset token of the user.

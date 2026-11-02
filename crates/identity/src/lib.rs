@@ -15,9 +15,10 @@
 //! Stage 3d: `users.password_changed_at` is the source of truth for "when
 //! was the password last set". `UserRecord` carries it; `update_password_tx`
 //! is the only writer that mutates `password_hash`, and it updates
-//! `password_changed_at = now()` in the same statement. Stage 4 will use it
-//! to invalidate access tokens issued before a password change (iat-vs-
-//! `password_changed_at`); Stage 3d only maintains it.
+//! `password_changed_at = clock_timestamp()` in the same statement (Stage 4.5a
+//! extension — see the `update_password_tx` doc-comment for why not `now()`).
+//! Stage 4 uses it to invalidate access tokens issued before a password
+//! change (iat-vs-`password_changed_at`); Stage 3d only maintains it.
 
 use domain::AuthUser;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -215,13 +216,36 @@ pub async fn upsert_user(
 
 /// Updates a user's password inside a caller-supplied transaction (Stage 3d).
 ///
-/// Sets `password_hash = $1` and `password_changed_at = now()` in a single
-/// `UPDATE`. The caller (`authn::reset_password`) is responsible for
-/// revoking refresh tokens and expiring outstanding reset tokens in the
-/// same transaction; this function writes only the `users` row, preserving
-/// the §2.9 single-writer invariant (`identity` writes `users`; `authn`
-/// orchestrates the transaction via this helper — the same pattern as
-/// `verify_email` writing `email_verified_at`).
+/// Sets `password_hash = $1` and `password_changed_at = clock_timestamp()`
+/// in a single `UPDATE`. The caller (`authn::reset_password`) is
+/// responsible for revoking refresh tokens and expiring outstanding reset
+/// tokens in the same transaction; this function writes only the `users`
+/// row, preserving the §2.9 single-writer invariant (`identity` writes
+/// `users`; `authn` orchestrates the transaction via this helper — the
+/// same pattern as `verify_email` writing `email_verified_at`).
+///
+/// **`clock_timestamp()`, not `now()` (Stage 4.5a extension).** `now()`
+/// in PostgreSQL returns the transaction-start time
+/// (`transaction_timestamp()`), not the time the `UPDATE` actually runs.
+/// Using it here creates two problems:
+///
+/// 1. **Test flake** (`authn/tests/integration.rs::reset_password_marks_token_used_and_changes_password`).
+///    The test sleeps 20 ms between register and reset, then asserts
+///    `password_changed_at` moved forward. With `now()`, a `reset_password`
+///    transaction that started before the sleep (e.g. SQLx pool scheduling
+///    under parallel test load) lands `T1 <= T0`, and the assertion fails
+///    intermittently.
+/// 2. **Security gap for the Stage 4.1 `iat`-vs-`password_changed_at` check.**
+///    If an access JWT is issued between `BEGIN` and the `UPDATE` inside
+///    `reset_password`, its `iat` is in `[T_BEGIN, T_UPDATE]`, and
+///    `password_changed_at = T_BEGIN` would let the token survive the
+///    reset. `clock_timestamp()` makes `password_changed_at` strictly
+///    greater than any token issued before the `UPDATE` statement itself.
+///
+/// Both are closed by the single substitution. No schema change
+/// (`clock_timestamp()` returns `timestamptz`, same as `now()`); outside
+/// behaviour of `reset_password` is unchanged apart from the narrower
+/// window.
 ///
 /// Returns [`IdentityError::NotFound`] if no row matches `user_id`; in
 /// `authn::reset_password` the user id comes from a reset token that was
@@ -235,7 +259,7 @@ pub async fn update_password_tx(
     let updated = sqlx::query(
         r#"
         update users
-        set password_hash = $1, password_changed_at = now()
+        set password_hash = $1, password_changed_at = clock_timestamp()
         where id = $2
         "#,
     )

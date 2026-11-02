@@ -143,6 +143,19 @@ pub async fn create_role(
 ///    `immutable=true` ([`AccessError::Immutable`]).
 /// 4. `UPDATE roles` + replace `role_permissions` in one transaction.
 /// 5. Commit; emit `role.updated` (Stage 3e).
+///
+/// **Forensic metadata (Stage 4.5a+).** `role.updated` carries
+/// `added` / `removed` — the `(resource, action)` diff vs the role's
+/// previous permissions, sorted for deterministic output. Reconstruction
+/// of "who had permission X on date T" joins `role.updated` (Day N) with
+/// `member.role_assigned` (Day M). **No** `member.role_*` events are
+/// emitted for existing holders: the *role definition* changed, not the
+/// membership — emitting `member.role_assigned` for a user who already
+/// held the role would be semantically false, and N events per bulk
+/// `update_role` would be audit flood, not signal. The canonical path
+/// for membership changes is `saas::access::{assign_role, revoke_role}`
+/// and `saas::member::change_role`; `update_role` stays role-scoped.
+/// (See Appendix B §2.62 — decision recorded when 4.5a shipped.)
 pub async fn update_role(
     state: &AccessState,
     actor: &AuthUser,
@@ -185,6 +198,26 @@ pub async fn update_role(
 
     let permissions = get_permissions_for_role_id(state.pool(), role_id).await?;
 
+    // Stage 4.5a+: diff vs the permissions the role had *before* this
+    // update. Closes the forensic gap: "who had `documents:read` on date T?"
+    // is answerable by temporal-joining `role.updated` (Day N) with
+    // `member.role_assigned` (Day M) — without replaying `casbin_rule`.
+    //
+    // `role.permissions` is the pre-update set (from `fetch_role` above);
+    // `permissions` is the post-update set. Both sorted for deterministic
+    // metadata (tests assert exact arrays).
+    let old_set: std::collections::HashSet<(String, String)> = role
+        .permissions
+        .iter()
+        .map(|p| (p.resource.clone(), p.action.clone()))
+        .collect();
+    let new_set: std::collections::HashSet<(String, String)> =
+        permissions.iter().map(|p| (p.resource.clone(), p.action.clone())).collect();
+    let mut added: Vec<(String, String)> = new_set.difference(&old_set).cloned().collect();
+    let mut removed: Vec<(String, String)> = old_set.difference(&new_set).cloned().collect();
+    added.sort();
+    removed.sort();
+
     state
         .audit_or_warn(AuditEvent {
             event_type: events::ROLE_UPDATED.into(),
@@ -196,6 +229,8 @@ pub async fn update_role(
                 "domain": role.domain,
                 "key": role.key.as_str(),
                 "name": name,
+                "added": added,
+                "removed": removed,
             }),
         })
         .await;
@@ -214,6 +249,17 @@ pub async fn update_role(
 
 /// Deletes a role.
 ///
+/// **DO NOT CALL DIRECTLY.** This is a **low-level** helper. It deletes
+/// only the `roles` row (`role_permissions` cascades via FK) and leaves
+/// orphan `casbin_rule` (`g`+`p`) and `*_members.role` rows — a partial
+/// delete that the audit log then cannot represent accurately. Use
+/// `saas::access::delete_role(state, actor, role_id)`, which performs the
+/// canonical 6-step cleanup (`protected` check → `require` → `purge_role`
+/// → `DELETE *_members` → `delete_role_by_id`) and emits `role.deleted`.
+/// The only sanctioned direct caller is `saas::access::delete_role`
+/// itself; tests may call this function to construct a known-broken state
+/// (see `access/tests/integration.rs`).
+///
 /// Order:
 /// 1. Load the role (its `domain` decides the `require` scope).
 /// 2. `require(actor.id, role.domain, "roles", "delete")`.
@@ -221,10 +267,9 @@ pub async fn update_role(
 /// 4. `DELETE roles` (cascades `role_permissions`).
 ///
 /// Residual `casbin_rule` and `*_members.role` rows for the deleted
-/// `role_key` remain at the `access` layer; `saas::access::delete_role`
-/// handles their cleanup via [`crate::delete_role_by_id`] +
-/// `authz.purge_role` + `DELETE *_members` (Stage 2d). Consumers that call
-/// this function directly are responsible for that cleanup themselves.
+/// `role_key` remain; `saas::access::delete_role` handles their cleanup
+/// via `authz.purge_role` + `DELETE *_members` + `delete_role_by_id`
+/// (Stage 2d, idempotent — retry-safe).
 ///
 /// **Stage 3e (decision A):** this function does **not** emit
 /// `role.deleted`. The canonical emission point is
