@@ -6,7 +6,12 @@ and one revision**. Do not mix, for example, `access 0.1.0` with `saas
 version at the source; consumers must pin every path / git dependency to
 the same tag.
 
-**Current version:** `0.2.2` (`Cargo.toml` → `[workspace.package]`).
+**Current version:** `0.3.0` (unreleased — Phase A / Stage 5.0 is
+in progress; `Cargo.toml` → `[workspace.package]` reflects `0.3.0` so a
+consumer who pulls `main` sees cargo's incompatibility warning
+immediately, but the `v0.3.0` tag is applied only after Phase A's DoD
+(`# Stage 5 — план реализации.txt` §4.A9) is closed). See the `0.3.0`
+section below.
 
 ## Versioning policy
 
@@ -113,3 +118,100 @@ as a tag; `0.2.2` is the first tagged release after `0.2.0`.
 - `rate_limiter::SimpleRateLimiter` — alias for `InMemoryRateLimiter`.
 
 **Why.** Stage 4.8 closes the two production-readiness blockers from `saas-21.md` §4: unbounded `list_*` (UI freeze on large datasets) and per-process rate limiting (multi-replica bypass). Additive API keeps `0.2.x` compatible; `0.2.1` is a patch bump per `COMPATIBILITY.md` policy.
+
+
+### 0.3.0 — Stage 5.0 (Phase A, in progress)
+
+Breaking changes and new API introduced across `crates/*` in Phase A
+(`crates/db/migrations/20261130*`, A1.4, A2.2a, A2.2c). Phase A's DoD
+(`# Stage 5 — план реализации.txt` §4.A9) is **not** yet closed; this
+entry documents what has already landed on `main` under `0.3.0`.
+
+**New public API (additive):**
+
+- `authz::AuthorizationEngine::reload_in_memory() -> Result<(), AuthzError>` —
+  refresh in-memory policy after an external `INSERT INTO casbin_rule`
+  (e.g. the `owner_sync` trigger). No-op for engines without in-memory
+  state.
+- `authz::AuthzError::ReloadError(String)` — new variant.
+- `access::AccessError::UnknownResourceType { name }` — new variant
+  (`add_action` fail-fast).
+- `access::AccessError::ScopeMismatch { name, existing, requested }` —
+  new variant (`bootstrap_resource_type`).
+- `access::registry` module: `ResourceType`, `ResourceScope`,
+  `bootstrap_resource_type`, `bootstrap_resource_types`,
+  `bootstrap_all_core`, `register_resource_type`, `add_action`,
+  `list_resource_types`.
+- `saas::SaasBuilder::without_access()` — build a `SaasState` without
+  `AccessState`. `authz` is still required.
+- `saas::tenant::create_workspace(actor, tenant_id, name)` — new 4-arg
+  form (no owner, no `access::*`).
+- `saas::platform::{resolve_tenant, resolve_workspace,
+  resolve_active_workspace, is_tenant_member, is_workspace_member}` +
+  `ActiveWorkspace` newtype (re-exported at the crate root alongside
+  `ActiveTenant`).
+
+**Breaking:**
+
+1. **`authz::AuthorizationEngine::reload_in_memory()`** — every impl
+   must implement it (`Ok(())` for engines without in-memory state).
+   `AllowAllAuthz` / `DenyAllAuthz` from `authz::test_support` already
+   ship it; a consumer's custom impl needs one more method.
+
+2. **`access::AccessError` gained two variants** (`UnknownResourceType`
+   and `ScopeMismatch`). Any `match` on `AccessError` is now
+   non-exhaustive. Both new variants map to HTTP 400 (validation) in
+   the reference examples — a caller passing bad config, not a
+   business-rule violation. Same for `saas::CoreError` (its
+   `From<AccessError>` maps both to `CoreError::Validation`).
+
+3. **`saas::SaasState::access()`** — signature changed from
+   `&AccessState` to `Result<&AccessState, CoreError>`. Every call site
+   needs `?` (or `.expect(..)` in tests). Returns
+   `CoreError::Internal("RBAC not configured…")` on a
+   `without_access()` build.
+
+4. **`saas::SaasBuilder::build()`** — behaviour change. Before:
+   required `with_access(..)`. Now: requires *either*
+   `with_access(..)` *or* `without_access()`, or fails with
+   `Internal("access state is required…")`. A builder that already
+   called `with_access(..)` is unaffected (the check passes).
+
+5. **`saas::tenant::create_workspace`** — signature split. The old
+   6-arg form (`actor, tenant_id, name, owner, owner_role_key`) is
+   renamed to `create_workspace_with_owner`. The old name now refers
+   to a new 4-arg form (`actor, tenant_id, name`) that does not assign
+   an owner and does not require `AccessState`. Consumers who want
+   owner assignment on creation use `create_workspace_with_owner`.
+
+**Migration.**
+
+- **`without_access()` users.** None yet (this is the first release
+  with the method). New consumers that want RBAC-disabled builds must
+  supply their own `AuthorizationEngine` impl (e.g. `AlwaysAllow` in
+  ~5 lines) and call `without_access()` after `with_authz(..)`.
+
+- **`create_workspace` call sites.** Rename to
+  `create_workspace_with_owner` (mechanical; 20 call sites in this
+  repo, a consumer sees the same).
+
+- **`state.access()` call sites.** Add `?` (or `.expect(..)` in
+  tests). Mechanical; 21 call sites in this repo.
+
+- **Exhaustive `match` on `AccessError` / `AuthzError` / `CoreError`.**
+  Add arms for the new variants. The reference examples
+  (`examples/*/src/error.rs`) already do.
+
+- **Database.** New migrations
+  (`20261130000001_resource_types.sql`,
+  `20261130000002_owner_sync_casbin.sql`,
+  `20261130000003_legacy_import_and_fk.sql`) must be applied. Consumer
+  databases that predate this set and contain custom
+  `permissions.resource` values (`course`, `deal`, …) get them
+  auto-imported as `custom:legacy`; `resource:manage` is added and
+  propagated to `platform` owner by the fixed trigger. A running
+  replica still needs `authz.reload_in_memory()` after the migration
+  to see the new permissions — the standard practice is
+  `migrate_composed` before process start (once A3 lands; currently
+  the only supported path is the workspace-wide `db::migrate`).
+
