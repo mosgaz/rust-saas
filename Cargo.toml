@@ -20,7 +20,7 @@ exclude = ["examples/*"]
 [workspace.package]
 publish = false
 license = "MIT"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 
 [workspace.dependencies]

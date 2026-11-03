@@ -6,7 +6,7 @@ and one revision**. Do not mix, for example, `access 0.1.0` with `saas
 version at the source; consumers must pin every path / git dependency to
 the same tag.
 
-**Current version:** `0.2.1` (`Cargo.toml` → `[workspace.package]`).
+**Current version:** `0.2.2` (`Cargo.toml` → `[workspace.package]`).
 
 ## Versioning policy
 
@@ -71,6 +71,31 @@ just to pattern-match an error, nor to depend on `identity` just to
 handle a login failure. `audit-pg` (`AuditError::Internal(String)`)
 already followed this pattern; Stage 4.2 applies it to the remaining
 error types.
+
+### 0.2.2 — Stage 4.9 + 4.10 (SSR-correct guards, AuthLayer, observability)
+
+**Additive** public API (no breaking changes; `0.2.0` / `0.2.1`
+contracts preserved):
+
+- `#[instrument]` spans on mutation paths in `authn`, `saas::platform`,
+  `saas::member`, `access::role`. Fields: `operation`, `actor_id`, plus
+  `domain` / `role_key` / `tenant_id` / `user_id` where relevant.
+  Secrets and PII are `skip`ped (no observable change in public API
+  or error types).
+- `crates/*` unchanged at the API level; Stage 4.9 and 4.10 are
+  consumer-local changes (`/readyz`, `/metrics`, `auth_layer`,
+  `GuardRoute` on `Resource`/`Suspense`) plus additive `tracing`
+  instrumentation.
+
+**Why.** Stage 4.9 closed two UX defects (SSR placeholder / CLS for
+guarded routes; no defense-in-depth middleware in `saas-leptos`).
+Stage 4.10 closed production-readiness (deep `/readyz`, `tracing`
+spans, Prometheus `/metrics`). Both are non-breaking; patch bump
+per `COMPATIBILITY.md` policy.
+
+**Note.** This entry also covers the `0.2.1` release (Stage 4.8): the
+`0.2.1` version was declared in `COMPATIBILITY.md` but not published
+as a tag; `0.2.2` is the first tagged release after `0.2.0`.
 
 ### 0.2.1 — Stage 4.8 (pagination + distributed rate limiter)
 

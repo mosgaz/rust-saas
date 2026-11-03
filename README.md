@@ -849,7 +849,14 @@ Second consumer — pure Axum, no Leptos; the portability proof.
 - **Stage 4.3 (done): isolation.** `authz::test_support` (`AllowAllAuthz` / `DenyAllAuthz`); `db::migrate_with` + `audit-pg::MIGRATOR`.
 - **Stage 4.4a (done): `/healthz`** in both examples.
 - **Stage 4.4b (partial): Dockerfile + WASM bundle.** Dockerfile for `saas-leptos` (multi-stage, non-root, `cargo-leptos =0.3.11`, binaryen 133, `wasm-bindgen =0.2.129`, `[profile.wasm-release]`). WASM: 1.7 MB (from 2.6 MB); **target 400 KB not met** — `wasm-opt` plateaus; further reduction requires removing dependencies. See `saas-19.md` §16.
-- Stage 4.5+ (open): CI, observability, backups, distributed rate limiting, RLS, E2E HTTP tests, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`, SSR-correct guards in `saas-leptos`, server-side per-route middleware (defense in depth).
+- **Stage 4 CLOSED (4.0–4.11).** Security fixes, CI, E2E HTTP tests, pagination,
+  distributed rate limiter, SSR-correct guards, AuthLayer, observability, close-out.
+- **Stage 5 (open):** RLS (Postgres row-level security), cursor-based pagination,
+  OTel OTLP / distributed tracing, SSO (OIDC), 2FA (TOTP), cleanup TTL tables
+  (`refresh_tokens`, `email_verifications`, `password_reset_tokens`), outbox pattern
+  for audit, audit retention/immutability, distributed single-flight refresh,
+  escape hatch `_or_platform_admin`, `SaasBuilder::without_access`, UI pagination
+  for `member`/`role` pages, SSR-correct guards for `DocumentPage`/`RoleFormPage`.
 
 
 ## Pluggability: what can be replaced, what cannot
@@ -919,7 +926,7 @@ of these should not treat their absence as a bug:
 ## Compatibility
 
 All `crates/*` share **one version** (`[workspace.package] version =
-"0.2.0"`). Consumers must pin every path / git dependency to the same
+"0.2.2"`). Consumers must pin every path / git dependency to the same
 revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change
 log.
 

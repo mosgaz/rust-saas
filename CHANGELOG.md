@@ -8,7 +8,7 @@ Every crate in `crates/` shares one version (enforced by
 `[workspace.package]`); consumers must pin all crates to the same
 revision.
 
-## [Unreleased]
+## [0.2.2] - 2026-11-03
 
 ### Stage 4.10 — Observability
 - Added `GET /readyz` (deep probe) to both examples: `SELECT 1` against
@@ -37,6 +37,8 @@ revision.
 - Tests: +3 in `saas-leptos/tests/e2e.rs` (`guarded_route_renders_ssr_content`, `auth_layer_blocks_unauthorized_ssr`, `auth_layer_blocks_forbidden_ssr`). **165 → 172**.
 - ADR-0006 records the design.
 
+## [0.2.1] - 2026-11-03
+
 ### Stage 4.8 — Pagination + distributed rate limiter
 - Added `domain::Page<T>` for pagination.
 - Added `list_*_paged` to `access`, `saas`, and `audit-pg`. Old `list_*` functions are marked `#[deprecated]`.
@@ -45,6 +47,21 @@ revision.
 - Added Redis to `docker-compose.yml` and CI.
 - Updated UI (`platform.rs`) to support Prev/Next pagination.
 - Bumped version to `0.2.1` (patch).
+
+### Stage 4.7 — E2E HTTP tests
+- Extracted `build_app(state)` from `main.rs` to `lib.rs` in both examples;
+  `main.rs` is now a thin binary (env → `AppState` → `axum::serve`).
+- Added `examples/axum-minimal/tests/e2e.rs` (11 in-process tests via
+  `tower::ServiceExt::oneshot` + `#[sqlx::test]`): smoke, auth flow,
+  tenant+workspace, CSRF, suspension, audit access, rate limiting.
+- Added `examples/saas-leptos/tests/e2e.rs` (12 tests, `[[test]]
+  required-features = ["ssr"]`): SSR + `same_origin_guard` over HTTP;
+  auth/tenant/suspension/audit/rate-limit through `state.*` (Leptos
+  `#[server]` URL is not addressable — Appendix B §IV.48).
+- `.github/workflows/ci.yml`: new job `e2e-examples` (postgres:16-alpine
+  service, `cargo test --manifest-path examples/*/Cargo.toml
+  [--features ssr] --test e2e`).
+- Tests: 137 → 160.
 
 ### Stage 4.6 — CI, tooling, and documentation
 - Added `rust-toolchain.toml` (pinned to `1.98`), `.github/workflows/ci.yml` (test, check, deny, docker), `deny.toml` (licenses, bans, advisories), `CONTRIBUTING.md`, `SECURITY.md`.
