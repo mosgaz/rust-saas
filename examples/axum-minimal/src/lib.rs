@@ -49,6 +49,17 @@ pub use state::AppState;
 /// Layer order on the protected router (outermost first; note that
 /// `.route_layer` calls run in **reverse** of the order written):
 /// `csrf_guard` \u2192 `auto_refresh` \u2192 `auth_layer` \u2192 handler.
+/// `GET /metrics` — Prometheus exposition format (Stage 4.10).
+///
+/// Public on purpose: Prometheus-scraper не имеет сессии; в теле —
+/// только числовые counters/histograms (никакого PII). Consumer, которому
+/// нужна аутентификация, оборачивает роут в свой middleware.
+async fn metrics(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    state.prometheus.render()
+}
+
 pub fn build_app(app_state: Arc<AppState>) -> Router {
     let protected: Router<Arc<AppState>> = Router::new()
         .route("/auth/refresh", post(auth::refresh))
@@ -81,6 +92,8 @@ pub fn build_app(app_state: Arc<AppState>) -> Router {
 
     let public: Router<Arc<AppState>> = Router::new()
         .route("/healthz", get(health::healthz))
+        .route("/readyz", get(health::readyz))
+        .route("/metrics", get(metrics))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout));

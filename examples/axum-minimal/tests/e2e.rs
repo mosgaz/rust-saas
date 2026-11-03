@@ -23,6 +23,7 @@
 #![allow(dead_code)] // Some helpers are used by later steps.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -32,6 +33,7 @@ use axum_minimal::build_app;
 use axum_minimal::cookie::CookieConfig;
 use axum_minimal::email::NoopEmailSender;
 use rate_limiter::RateLimiter;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use axum_minimal::state::AppState;
 use http_body_util::BodyExt;
 use sqlx::PgPool;
@@ -39,6 +41,25 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 // ─── Setup ─────────────────────────────────────────────────────────────────
+
+/// Process-wide Prometheus recorder (Stage 4.10). `metrics` global
+/// recorder can only be set once per process; `#[sqlx::test]` runs
+/// multiple tests in one process, so we install it in a `OnceLock`
+/// and reuse the handle everywhere.
+static PROMETHEUS: OnceLock<PrometheusHandle> = OnceLock::new();
+
+fn prometheus_handle() -> PrometheusHandle {
+    PROMETHEUS
+        .get_or_init(|| {
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            // Ignore the error: a previous test may have already installed
+            // a recorder; the handle is the same.
+            let _ = metrics::set_global_recorder(recorder);
+            handle
+        })
+        .clone()
+}
 
 fn test_cookie_config() -> Arc<CookieConfig> {
     let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("static SocketAddr");
@@ -88,6 +109,7 @@ async fn setup_app(pool: PgPool) -> (Router, Arc<AppState>) {
         email,
         rate_limit,
         cookie,
+        prometheus: prometheus_handle(),
     });
     let router = build_app(state.clone());
     (router, state)
@@ -144,6 +166,16 @@ async fn body_json(resp: Response) -> serde_json::Value {
         .expect("collect body")
         .to_bytes();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+async fn body_string(resp: Response) -> String {
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn unique_email() -> String {
@@ -624,4 +656,59 @@ async fn pagination_limits_and_offsets_tenants(pool: PgPool) {
     assert_eq!(page3["limit"], 200);
     assert_eq!(page3["total"], 2);
     assert_eq!(page3["items"].as_array().unwrap().len(), 2);
+}
+
+// ─── Stage 4.10: /readyz + /metrics ────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn readyz_returns_200(pool: PgPool) {
+    let (router, _) = setup_app(pool).await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["checks"]["db"], "ok");
+    // REDIS_URL может быть задан (Stage 4.8: docker-compose + .env) —
+    // тогда "ok"; если нет — "not_configured". Failure только "down".
+    let redis = json["checks"]["redis"].as_str().unwrap_or("");
+    assert!(
+        redis == "ok" || redis == "not_configured",
+        "redis check must be ok/not_configured, got: {redis:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn metrics_returns_prometheus_format(pool: PgPool) {
+    let (router, _) = setup_app(pool).await;
+    // Unique marker — proves the recorder is wired and the handler
+    // renders it. Name is unique across tests.
+    metrics::counter!("e2e_readyz_marker").increment(1);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("e2e_readyz_marker"),
+        "expected marker metric, got: {}",
+        &body[..body.len().min(300)]
+    );
+    assert!(body.contains("# TYPE"), "expected Prometheus exposition format");
 }

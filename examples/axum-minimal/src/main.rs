@@ -23,6 +23,7 @@ use axum_minimal::email::NoopEmailSender;
 use rate_limiter::RateLimiter;
 use axum_minimal::state::AppState;
 use axum_minimal::{cookie, build_app};
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -108,12 +109,19 @@ async fn main() -> anyhow::Result<()> {
     // Stage 4.1b: cookie policy (Secure/SameSite/Max-Age).
     let cookie_cfg = Arc::new(cookie::CookieConfig::from_env(&bind_addr));
 
+    // Stage 4.10: install the Prometheus recorder once per process.
+    // `install_recorder` is a global singleton — a second call panics.
+    // `main.rs` is the only install site for the binary; `tests/e2e.rs`
+    // uses `metrics::try_recorder()` + `build_recorder()` (idempotent).
+    let prometheus = PrometheusBuilder::new().install_recorder()?;
+
     let app_state = Arc::new(AppState {
         authn: authn.clone(),
         saas,
         email,
         rate_limit,
         cookie: cookie_cfg,
+        prometheus,
     });
 
     let router = build_app(app_state);

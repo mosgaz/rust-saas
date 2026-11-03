@@ -367,6 +367,44 @@ async fn healthz() -> impl axum::response::IntoResponse {
 ///   404). No middleware: static assets must not pay for JWT verification.
 ///
 /// `TraceLayer` covers the merged router.
+/// `GET /readyz` — readiness probe (Stage 4.10).
+///
+/// `saas-leptos` не имеет прямой `redis`-зависимости (`rate-limiter`
+/// инкапсулирует её); поэтому `redis` всегда `"not_configured"` —
+/// reference consumer полагается на `InMemoryRateLimiter`.
+/// `/readyz` здесь проверяет только БД. Полный deep-probe с PING
+/// Redis — в `examples/axum-minimal/src/health.rs`.
+#[cfg(feature = "ssr")]
+async fn readyz(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let db = match sqlx::query_scalar::<_, i32>("select 1")
+        .fetch_one(state.saas.pool())
+        .await
+    {
+        Ok(1) => "ok",
+        _ => "down",
+    };
+    let ok = db == "ok";
+    let status = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status, axum::Json(serde_json::json!({
+        "status": if ok { "ok" } else { "fail" },
+        "checks": { "db": db, "redis": "not_configured" },
+    })))
+}
+
+/// `GET /metrics` — Prometheus exposition format (Stage 4.10).
+///
+/// Public on purpose: Prometheus-scraper не имеет сессии; в теле —
+/// только числовые counters/histograms (никакого PII).
+#[cfg(feature = "ssr")]
+async fn metrics(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+) -> impl axum::response::IntoResponse {
+    state.prometheus.render()
+}
+
 #[cfg(feature = "ssr")]
 pub fn build_app(app_state: crate::state::AppState) -> axum::Router {
     use axum::middleware::from_fn;
@@ -405,6 +443,8 @@ pub fn build_app(app_state: crate::state::AppState) -> axum::Router {
 
     let public: Router<crate::state::AppState> = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .fallback(file_and_error_handler::<crate::state::AppState, _>(
             crate::shell,
         ));

@@ -60,6 +60,8 @@ use domain::AuthUser;
 use leptos::prelude::*;
 
 use crate::email::EmailResult;
+#[cfg(feature = "ssr")]
+use metrics::counter;
 
 #[cfg(feature = "ssr")]
 use axum::http::HeaderValue;
@@ -146,11 +148,16 @@ pub async fn register(
 ) -> Result<(AuthUser, EmailResult), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
 
-    let user = state
-        .authn
-        .register(&email, &password)
-        .await
-        .map_err(crate::error::authn_error_to_server_fn)?;
+    let user = match state.authn.register(&email, &password).await {
+        Ok(u) => {
+            counter!("register_total", "status" => "success").increment(1);
+            u
+        }
+        Err(e) => {
+            counter!("register_total", "status" => "failed").increment(1);
+            return Err(crate::error::authn_error_to_server_fn(e));
+        }
+    };
 
     let access = state
         .authn
@@ -198,11 +205,16 @@ pub async fn register(
 pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
 
-    let user = state
-        .authn
-        .login(&email, &password)
-        .await
-        .map_err(crate::error::authn_error_to_server_fn)?;
+    let user = match state.authn.login(&email, &password).await {
+        Ok(u) => {
+            counter!("login_total", "status" => "success").increment(1);
+            u
+        }
+        Err(e) => {
+            counter!("login_total", "status" => "failed").increment(1);
+            return Err(crate::error::authn_error_to_server_fn(e));
+        }
+    };
 
     let access = state
         .authn

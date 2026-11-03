@@ -30,6 +30,7 @@ use audit::{events, AuditEvent};
 use domain::{AuthUser, Page};
 use sqlx::PgPool;
 use uuid::Uuid;
+use tracing::instrument;
 
 use crate::{AccessError, AccessState, Permission, Role, RoleKey};
 
@@ -71,6 +72,15 @@ impl RoleRow {
 ///    failure).
 ///
 /// `key` must be a valid [`RoleKey`].
+#[instrument(
+    skip(state, actor, name, description, permissions),
+    fields(
+        operation = "create_role",
+        actor_id = %actor.id,
+        domain = %domain,
+        key = %key.as_str(),
+    ),
+)]
 pub async fn create_role(
     state: &AccessState,
     actor: &AuthUser,
@@ -156,6 +166,14 @@ pub async fn create_role(
 /// for membership changes is `saas::access::{assign_role, revoke_role}`
 /// and `saas::member::change_role`; `update_role` stays role-scoped.
 /// (See Appendix B §2.62 — decision recorded when 4.5a shipped.)
+#[instrument(
+    skip(state, actor, name, description, permissions),
+    fields(
+        operation = "update_role",
+        actor_id = %actor.id,
+        role_id = %role_id,
+    ),
+)]
 pub async fn update_role(
     state: &AccessState,
     actor: &AuthUser,
@@ -278,6 +296,7 @@ pub async fn update_role(
 /// `saas::access::delete_role` — the 6-step cleanup path. Auditing here
 /// would report a "delete" that leaves orphan `casbin_rule` and
 /// `*_members` rows — misleading.
+#[instrument(skip(state, actor), fields(operation = "delete_role", actor_id = %actor.id, role_id = %role_id))]
 pub async fn delete_role(
     state: &AccessState,
     actor: &AuthUser,

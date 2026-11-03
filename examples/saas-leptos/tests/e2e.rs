@@ -35,6 +35,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -49,9 +50,27 @@ use saas_leptos::build_app;
 use saas_leptos::cookie::CookieConfig;
 use saas_leptos::email::NoopEmailSender;
 use rate_limiter::RateLimiter;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use saas_leptos::state::AppState;
 
 // ─── Setup ─────────────────────────────────────────────────────────────────
+
+/// Process-wide Prometheus recorder (Stage 4.10). `metrics` global
+/// recorder can only be set once per process; `#[sqlx::test]` runs
+/// multiple tests in one process, so we install it in a `OnceLock`
+/// and reuse the handle everywhere.
+static PROMETHEUS: OnceLock<PrometheusHandle> = OnceLock::new();
+
+fn prometheus_handle() -> PrometheusHandle {
+    PROMETHEUS
+        .get_or_init(|| {
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _ = metrics::set_global_recorder(recorder);
+            handle
+        })
+        .clone()
+}
 
 fn test_cookie_config() -> Arc<CookieConfig> {
     let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("static SocketAddr");
@@ -103,6 +122,7 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
         email,
         rate_limit,
         cookie,
+        prometheus: prometheus_handle(),
     };
     let router = build_app(state.clone());
     (router, state)
@@ -568,4 +588,53 @@ async fn pagination_via_state(pool: PgPool) {
 
 // ─── Stage 4.9: AuthLayer ──────────────────────────────────────────────────
 
+// ─── Stage 4.10: /readyz + /metrics ────────────────────────────────────
 
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn readyz_returns_200(pool: PgPool) {
+    let (router, _) = setup_app(pool).await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .header(header::HOST, TEST_HOST)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["checks"]["db"], "ok");
+    // saas-leptos всегда возвращает not_configured (rate-limiter
+    // инкапсулирует redis; deep-probe для Redis — в axum-minimal).
+    assert_eq!(json["checks"]["redis"], "not_configured");
+}
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn metrics_returns_prometheus_format(pool: PgPool) {
+    let (router, _) = setup_app(pool).await;
+    metrics::counter!("e2e_leptos_marker").increment(1);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header(header::HOST, TEST_HOST)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("e2e_leptos_marker"),
+        "expected marker metric, got: {}",
+        &body[..body.len().min(300)]
+    );
+    assert!(body.contains("# TYPE"), "expected Prometheus exposition format");
+}

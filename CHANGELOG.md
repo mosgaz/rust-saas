@@ -10,6 +10,25 @@ revision.
 
 ## [Unreleased]
 
+### Stage 4.10 — Observability
+- Added `GET /readyz` (deep probe) to both examples: `SELECT 1` against
+  the DB; Redis `PING` when `REDIS_URL` is set (`axum-minimal`);
+  `200 {"status":"ok","checks":{...}}` or `503`. `/healthz` stays
+  liveness-only (no DB). `saas-leptos` reports `redis: "not_configured"`
+  (no direct `redis` dep; `rate-limiter` encapsulates it).
+- Added `#[instrument]` spans on auth / platform / member / role
+  mutations (`authn`, `saas::platform`, `saas::member`, `access::role`).
+  Secrets and PII are `skip`ped; `operation` + `actor_id` are recorded.
+- Added Prometheus metrics in both examples: `metrics` +
+  `metrics-exporter-prometheus`; `/metrics` public on the public router.
+  Counters: `login_total{status}`, `register_total{status}`.
+- `crates/*` unchanged (`0.2.1`).
+- Tests: +2 in `axum-minimal/tests/e2e.rs`, +2 in
+  `saas-leptos/tests/e2e.rs` (`readyz_returns_200`,
+  `metrics_returns_prometheus_format`). **172 → 174** (bin-сборка:
+  unit/integration считаются отдельно в финальном `cargo test`).
+- ADR-0007 records the design.
+
 ### Stage 4.9 — SSR-correct guards + AuthLayer
 - `GuardRoute` rewritten to use `Resource`/`Suspense` (SSR now renders content or 401/403, not "Loading...").
 - Added `examples/saas-leptos/src/auth_layer.rs` (defense in depth: 401 anonymous, path-level permissions for `/platform` and `/platform/audit`).

@@ -66,6 +66,7 @@ use audit::{events, AuditEvent};
 use domain::{AuthUser, Member, Page};
 use sqlx::types::chrono::{DateTime, Utc};
 use uuid::Uuid;
+use tracing::instrument;
 
 use crate::{access as saas_access, CoreError, SaasState};
 
@@ -225,6 +226,16 @@ pub async fn list(
 /// over-permissioned (both roles); recoverable idempotently by retrying
 /// `change_role`. Known A-lite limitation (handoff §16). The advisory
 /// lock closes only the *owner guard* race, not the atomicity window.
+#[instrument(
+    skip(state, actor),
+    fields(
+        operation = "change_role",
+        actor_id = %actor.id,
+        user_id = %user_id,
+        from_role = %old_role_key.as_str(),
+        to_role = %new_role_key.as_str(),
+    ),
+)]
 pub async fn change_role(
     state: &SaasState,
     actor: &AuthUser,
@@ -299,6 +310,15 @@ pub async fn change_role(
 /// Does **not** emit `member.role_changed` — this is a revoke, not a swap
 /// (decision B). The audit trail already contains `member.role_revoked`
 /// from the inner `revoke_role`.
+#[instrument(
+    skip(state, actor),
+    fields(
+        operation = "remove_role",
+        actor_id = %actor.id,
+        user_id = %user_id,
+        role = %role_key.as_str(),
+    ),
+)]
 pub async fn remove_role(
     state: &SaasState,
     actor: &AuthUser,

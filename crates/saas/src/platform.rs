@@ -51,6 +51,7 @@ use ::access::RoleKey;
 use audit::{events, AuditEvent};
 use domain::{AuthUser, Page, Tenant, TenantStatus, PLATFORM_DOMAIN};
 use uuid::Uuid;
+use tracing::instrument;
 
 use crate::{CoreError, SaasState};
 
@@ -92,6 +93,10 @@ pub async fn create_tenant(
 ///
 /// Emits `tenant.created` (Stage 3e) after the transaction commits; the
 /// target is the new tenant, the actor is `actor` (not `owner`).
+#[instrument(
+    skip(state, actor, name),
+    fields(actor_id = %actor.id, owner_id = %owner.id, role_key = %owner_role_key.as_str()),
+)]
 pub async fn provision_tenant(
     state: &SaasState,
     actor: &AuthUser,
@@ -223,6 +228,7 @@ pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Ten
 /// blocked by [`crate::invitation::create_invitation`] (defense in depth)
 /// and by [`crate::invitation::accept_invitation`] (both check
 /// `status = 'active'` on the invitation's tenant).
+#[instrument(skip(state, actor), fields(operation = "suspend_tenant", actor_id = %actor.id))]
 pub async fn suspend_tenant(
     state: &SaasState,
     actor: &AuthUser,
@@ -281,6 +287,7 @@ pub async fn suspend_tenant(
 /// `PLATFORM_DOMAIN`; emits `tenant.activated` only on a transition
 /// (`suspended` → `active`); idempotent no-op returns the row with no
 /// emission; `NotFound` if the tenant does not exist.
+#[instrument(skip(state, actor), fields(operation = "activate_tenant", actor_id = %actor.id))]
 pub async fn activate_tenant(
     state: &SaasState,
     actor: &AuthUser,
@@ -382,6 +389,7 @@ impl std::ops::Deref for ActiveTenant {
 /// are: `create_workspace`, `create_document`, `create_role`,
 /// `update_role`, `delete_role`, `assign_role`, `remove_role`,
 /// `create_invitation`.
+#[instrument(skip(state, actor), fields(operation = "resolve_active_tenant", actor_id = %actor.id))]
 pub async fn resolve_active_tenant(
     state: &SaasState,
     actor: &AuthUser,

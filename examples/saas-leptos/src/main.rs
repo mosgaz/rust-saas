@@ -18,9 +18,12 @@ use audit::AuditLogger;
 use audit_pg::PgAuditLogger;
 #[cfg(feature = "ssr")]
 use authz::AuthorizationEngine;
+#[cfg(feature = "ssr")]
 use rate_limiter::RateLimiter;
 #[cfg(feature = "ssr")]
 use leptos::config::get_configuration;
+#[cfg(feature = "ssr")]
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 #[cfg(feature = "ssr")]
 #[tokio::main]
@@ -137,6 +140,10 @@ async fn main() -> anyhow::Result<()> {
         _ => Arc::new(rate_limiter::InMemoryRateLimiter::new()),
     };
 
+    // Stage 4.10: install the Prometheus recorder once per process.
+    // `install_recorder` is a global singleton — a second call panics.
+    let prometheus = PrometheusBuilder::new().install_recorder()?;
+
     let app_state = saas_leptos::state::AppState {
         authn: authn.clone(),
         saas,
@@ -144,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         email,
         rate_limit,
         cookie: cookie_cfg.clone(),
+        prometheus,
     };
 
     let router = saas_leptos::build_app(app_state);

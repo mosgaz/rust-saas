@@ -37,6 +37,9 @@ tower-http = { version = "0.6", features = ["trace"] }
 # Shared utilities.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+redis = { version = "0.27", features = ["tokio-comp"] }
 dotenvy = "0.15"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -54,3 +57,4 @@ sqlx = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 # Stage 4.7: read `Response` body as bytes (JSON assertions).
 http-body-util = "0.1"
+metrics = "0.24"

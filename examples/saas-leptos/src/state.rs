@@ -6,6 +6,8 @@ use authn::Authn;
 #[cfg(feature = "ssr")]
 use leptos::prelude::LeptosOptions;
 #[cfg(feature = "ssr")]
+use metrics_exporter_prometheus::PrometheusHandle;
+#[cfg(feature = "ssr")]
 use saas::SaasState;
 
 #[cfg(feature = "ssr")]
@@ -34,6 +36,10 @@ pub struct AppState {
     /// (Stage 4.1b). Shared with `middleware::auto_refresh` and the auth
     /// handlers in `src/auth.rs`.
     pub cookie: Arc<CookieConfig>,
+    /// Prometheus recorder handle (Stage 4.10). Set once in `main.rs` /
+    /// `tests/e2e.rs` via `PrometheusBuilder::build_recorder()`;
+    /// `/metrics` renders it.
+    pub prometheus: PrometheusHandle,
 }
 
 #[cfg(feature = "ssr")]
