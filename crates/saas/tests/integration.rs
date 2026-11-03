@@ -3248,3 +3248,129 @@ async fn member_list_paged_works(pool: PgPool) {
     assert_eq!(page2.total, 4);
     assert_eq!(page2.items.len(), 2);
 }
+
+
+// ─── Stage 5.0-A2.2d: new create_workspace / without_access ──────────────
+
+/// Stage 5.0-A2.2d: `tenant::create_workspace` (4-arg, no owner) must
+/// insert the workspace but **not** create an owner role, **not** write
+/// `workspace_members`, and **not** write any `casbin_rule` g-row for
+/// the workspace domain. Those are `create_workspace_with_owner`'s job;
+/// the bare form is a pure "require + insert + audit" call.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_workspace_without_owner_does_not_assign(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+
+    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Bare"))
+        .await
+        .expect("create_workspace must succeed");
+    assert_eq!(ws.tenant_id, tenant.id);
+
+    let members: i64 =
+        sqlx::query_scalar("select count(*) from workspace_members where workspace_id = $1")
+            .bind(ws.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        members, 0,
+        "bare create_workspace must not write workspace_members"
+    );
+
+    let owner_roles: i64 =
+        sqlx::query_scalar("select count(*) from roles where domain = $1 and key = 'owner'")
+            .bind(domain::workspace_domain(ws.id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        owner_roles, 0,
+        "bare create_workspace must not create owner role"
+    );
+
+    let g_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype = 'g' and v2 = $1",
+    )
+    .bind(domain::workspace_domain(ws.id))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        g_rows, 0,
+        "bare create_workspace must not write casbin g-rows"
+    );
+}
+
+/// Stage 5.0-A2.2d (blocker B9 end-to-end): a `SaasState` built with
+/// `.without_access()` can still create a bare workspace — only the
+/// RBAC methods fail. This is the whole point of `without_access`: a
+/// consumer without a roles table can still use `create_tenant` /
+/// `create_workspace` / `create_document`, provided they wire some
+/// `AuthorizationEngine` impl (here, a real `CasbinAuthz` because the
+/// test already has one; a consumer would use e.g. `AlwaysAllow`).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_workspace_works_without_access(pool: PgPool) {
+    // Phase 1: set up tenant + owner-membership through a regular
+    // (RBAC-enabled) state. `provision_tenant` on `no_rbac` below would
+    // fail — it needs `access` for owner-role assignment.
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner = make_user(&pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
+            .await
+            .unwrap();
+
+    // Phase 2: build a no-RBAC state sharing the same pool. The fresh
+    // `CasbinAuthz::from_pool` reloads from `casbin_rule`, so the
+    // owner's g-row (written in phase 1) is visible — otherwise
+    // `create_workspace`'s `authz.require` would fail for a different
+    // reason and the test would be less honest.
+    let casbin: Arc<dyn AuthorizationEngine> = Arc::new(
+        CasbinAuthz::from_pool(pool.clone())
+            .await
+            .expect("casbin init"),
+    );
+    let no_rbac = SaasBuilder::new(pool.clone())
+        .with_authz(casbin)
+        .without_access()
+        .build()
+        .expect("build without_access");
+
+    // `create_workspace` (4-arg, no owner) works — only `authz.require`
+    // + SQL, no `access::*`.
+    let ws = tenant::create_workspace(&no_rbac, &owner, tenant.id, unique_name("Bare"))
+        .await
+        .expect("create_workspace must work without access");
+    assert_eq!(ws.tenant_id, tenant.id);
+
+    // `provision_tenant` on the same state fails — it needs `access`
+    // for owner-role assignment.
+    match platform::provision_tenant(
+        &no_rbac,
+        &admin,
+        unique_name("ShouldFail"),
+        &owner,
+        &owner_key,
+    )
+    .await
+    {
+        Err(CoreError::Internal(msg)) => {
+            assert!(
+                msg.contains("RBAC not configured"),
+                "unexpected message: {msg}"
+            );
+        }
+        Err(other) => panic!("expected Internal(\"RBAC not configured\"), got {other:?}"),
+        Ok(_) => panic!("provision_tenant must fail without access"),
+    }
+}
