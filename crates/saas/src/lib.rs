@@ -58,7 +58,9 @@ pub mod invitation;
 pub mod member;
 
 pub mod platform;
-pub use platform::{resolve_active_tenant, ActiveTenant};
+pub use platform::{
+    resolve_active_tenant, resolve_active_workspace, ActiveTenant, ActiveWorkspace,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
