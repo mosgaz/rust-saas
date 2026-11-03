@@ -46,9 +46,14 @@
 //! ADR-0003 A-lite concerns `saas` + `access` + `authz-casbin` boundaries,
 //! not intra-database SQL.
 
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use crate::AccessError;
+use authz::AuthorizationEngine;
+use domain::AuthUser;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+
+use crate::{AccessError, AccessState};
 
 /// Scope of a resource type.
 ///
@@ -167,10 +172,228 @@ impl ResourceType {
     }
 }
 
-// `bootstrap_*`, `register_resource_type`, `add_action`, `list_resource_types`
-// land in Stage 5.0-A1.5b (the type-only step above is A1.5a). Keeping them
-// out of this module for now keeps the compiler check focused: `FromRow` /
-// `TryFrom<String>` derivation must work before any DB call is written.
+// ─── Bootstrap API (Stage 5.0-A1.5b) ───────────────────────────────────────
+
+/// Declare one new resource type. Idempotent.
+///
+/// Equivalent to [`bootstrap_resource_types`] with a one-element slice.
+pub async fn bootstrap_resource_type(
+    pool: &PgPool,
+    authz: &Arc<dyn AuthorizationEngine>,
+    resource: &ResourceType,
+) -> Result<(), AccessError> {
+    bootstrap_resource_types(pool, authz, std::slice::from_ref(resource)).await
+}
+
+/// Declare N new resource types in one transaction, with one in-memory
+/// reload at the end.
+///
+/// Per-type merge (idempotent):
+/// - `default_actions` — array-union with the existing value, sorted.
+/// - `metadata` — jsonb-merge (`existing || new`); new keys override.
+/// - `scope` — **not** updated. A mismatch against the existing row
+///   aborts the whole batch with [`AccessError::ScopeMismatch`].
+/// - `description` — overwritten only if the incoming value is non-empty;
+///   an empty string never clobbers an existing description. (First-time
+///   inserts take the incoming value as-is.)
+///
+/// Every `(name, action)` from `default_actions` is also inserted into
+/// `permissions` (`ON CONFLICT DO NOTHING`); the A1.2 trigger then
+/// propagates it to `role_permissions` and `casbin_rule.p` for every
+/// `owner` role in every domain, inside the same transaction.
+///
+/// After `COMMIT`: `authz.reload_in_memory()` — one call, after the
+/// transaction has committed. A reload before commit would sync a
+/// pre-commit view into memory.
+pub async fn bootstrap_resource_types(
+    pool: &PgPool,
+    authz: &Arc<dyn AuthorizationEngine>,
+    resources: &[ResourceType],
+) -> Result<(), AccessError> {
+    // Pre-flight: reject scope changes *before* opening the transaction.
+    // Two passes would be needed inside the tx anyway (scope is a PK
+    // column and cannot be changed via `ON CONFLICT DO UPDATE`); doing it
+    // outside keeps the error path free of rollbacks.
+    for r in resources {
+        if let Some(existing) =
+            sqlx::query_scalar::<_, String>("select scope from resource_types where name = $1")
+                .bind(&r.name)
+                .fetch_optional(pool)
+                .await?
+        {
+            if existing != r.scope.as_str() {
+                return Err(AccessError::ScopeMismatch {
+                    name: r.name.clone(),
+                    existing,
+                    requested: r.scope.as_str().to_string(),
+                });
+            }
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+
+    for r in resources {
+        sqlx::query(
+            r#"
+            insert into resource_types (name, scope, default_actions, metadata, description)
+            values ($1, $2, $3, $4, $5)
+            on conflict (name) do update set
+                default_actions = (
+                    select array_agg(distinct x order by x)
+                    from unnest(resource_types.default_actions || excluded.default_actions) as x
+                ),
+                metadata = resource_types.metadata || excluded.metadata,
+                description = case
+                    when excluded.description = '' then resource_types.description
+                    else excluded.description
+                end
+            "#,
+        )
+        .bind(&r.name)
+        .bind(r.scope.as_str())
+        .bind(&r.default_actions)
+        .bind(&r.metadata)
+        .bind(&r.description)
+        .execute(&mut *tx)
+        .await?;
+
+        for action in &r.default_actions {
+            sqlx::query(
+                r#"
+                insert into permissions (resource, action, description)
+                values ($1, $2, '')
+                on conflict (resource, action) do nothing
+                "#,
+            )
+            .bind(&r.name)
+            .bind(action)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
+
+    // A1.4: refresh in-memory enforcer after the commit. Exactly one call
+    // per batch, regardless of how many types/actions it declared.
+    authz.reload_in_memory().await?;
+
+    Ok(())
+}
+
+/// Idempotently re-declare the 8 core types (and their actions) that ship
+/// with the A1.1 migration.
+///
+/// Called by `saas-axum`'s `AxumAppStateBuilder::build` (A4.2) so that a
+/// consumer that skipped the `main.rs` bootstrap path still gets the core
+/// types registered. Safe to call on every process start.
+pub async fn bootstrap_all_core(
+    pool: &PgPool,
+    authz: &Arc<dyn AuthorizationEngine>,
+) -> Result<(), AccessError> {
+    let core = [
+        ResourceType::platform("tenant", &["create", "list", "manage"])
+            .with_description("Tenant containers"),
+        ResourceType::tenant("workspace", &["create", "read"])
+            .with_description("Workspaces inside a tenant"),
+        ResourceType::workspace("document", &["read", "write"])
+            .with_description("Documents in a workspace"),
+        ResourceType::tenant("member", &["list", "manage"])
+            .with_description("Members (tenant/workspace domains)"),
+        ResourceType::tenant("invitation", &["create", "list", "revoke"])
+            .with_description("Invitations (tenant/workspace domains)"),
+        ResourceType::tenant("role", &["create", "delete", "grant", "list", "manage"])
+            .with_description("Roles (tenant/workspace domains)"),
+        ResourceType::platform("audit", &["read"]).with_description("Audit log"),
+        ResourceType::platform("resource", &["manage"])
+            .with_description("Resource registry itself"),
+    ];
+    bootstrap_resource_types(pool, authz, &core).await
+}
+
+/// Runtime, permission-checked variant of [`bootstrap_resource_type`].
+///
+/// Requires `(resource, manage)` in `PLATFORM_DOMAIN`. Intended for an
+/// admin UI that lets a privileged user register resource types from the
+/// running application (vs `bootstrap_*` which is a `main.rs` startup
+/// call with no actor).
+pub async fn register_resource_type(
+    state: &AccessState,
+    actor: &AuthUser,
+    resource: &ResourceType,
+) -> Result<(), AccessError> {
+    state
+        .authz()
+        .require(actor.id, domain::PLATFORM_DOMAIN, "resource", "manage")
+        .await?;
+    bootstrap_resource_type(state.pool(), state.authz(), resource).await
+}
+
+/// Add a single action to an already-declared resource type.
+///
+/// Fail-fast: if `resource_name` is not in `resource_types`, returns
+/// [`AccessError::UnknownResourceType`] before touching `permissions`
+/// (avoiding a raw FK violation from the A1.3 constraint).
+///
+/// Requires `(resource, manage)` in `PLATFORM_DOMAIN`.
+pub async fn add_action(
+    state: &AccessState,
+    actor: &AuthUser,
+    resource_name: &str,
+    action: &str,
+) -> Result<(), AccessError> {
+    state
+        .authz()
+        .require(actor.id, domain::PLATFORM_DOMAIN, "resource", "manage")
+        .await?;
+
+    let exists: bool = sqlx::query_scalar(
+        "select exists(select 1 from resource_types where name = $1)",
+    )
+    .bind(resource_name)
+    .fetch_one(state.pool())
+    .await?;
+
+    if !exists {
+        return Err(AccessError::UnknownResourceType {
+            name: resource_name.to_string(),
+        });
+    }
+
+    sqlx::query(
+        r#"
+        insert into permissions (resource, action, description)
+        values ($1, $2, '')
+        on conflict (resource, action) do nothing
+        "#,
+    )
+    .bind(resource_name)
+    .bind(action)
+    .execute(state.pool())
+    .await?;
+
+    state.authz().reload_in_memory().await?;
+
+    Ok(())
+}
+
+/// List every declared resource type, ordered by `name`.
+///
+/// No `actor` — the reference is not sensitive (same exemption as
+/// `list_permissions`; §5 p.5).
+pub async fn list_resource_types(pool: &PgPool) -> Result<Vec<ResourceType>, AccessError> {
+    let rows = sqlx::query_as::<_, ResourceType>(
+        r#"
+        select name, scope, default_actions, description, metadata
+        from resource_types
+        order by name
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
 
 #[cfg(test)]
 mod tests {
