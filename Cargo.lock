@@ -452,6 +452,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "sqlx",
+ "uuid",
 ]
 
 [[package]]
@@ -1654,6 +1655,7 @@ name = "rust-saas"
 version = "0.3.0"
 dependencies = [
  "access",
+ "anyhow",
  "audit",
  "audit-pg",
  "authn",
@@ -1664,6 +1666,7 @@ dependencies = [
  "identity",
  "rate-limiter",
  "saas",
+ "sqlx",
 ]
 
 [[package]]
