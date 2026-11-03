@@ -115,6 +115,16 @@ impl From<AccessError> for CoreError {
             AccessError::InvalidRoleKey(s) => CoreError::Validation(s),
             AccessError::RoleNotFound(_) => CoreError::NotFound,
             AccessError::PermissionNotFound(_, _) => CoreError::NotFound,
+            AccessError::UnknownResourceType { name } => {
+                CoreError::Validation(format!("unknown resource type: {name}"))
+            }
+            AccessError::ScopeMismatch {
+                name,
+                existing,
+                requested,
+            } => CoreError::Validation(format!(
+                "resource scope mismatch for `{name}`: existing={existing}, requested={requested}"
+            )),
             AccessError::Protected => CoreError::Forbidden,
             AccessError::Immutable => CoreError::Forbidden,
             AccessError::Validation(s) => CoreError::Validation(s),
