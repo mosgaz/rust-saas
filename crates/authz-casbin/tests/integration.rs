@@ -576,6 +576,81 @@ async fn reload_in_memory_picks_up_external_p_row(pool: PgPool) {
     );
 }
 
+// ─── Stage 5.0-A1.2: owner_sync trigger writes casbin_rule.p ──────────────
+
+/// Stage 5.0-A1.2 (blocker B3): the `owner_sync_permission` trigger must
+/// write both `role_permissions` **and** `casbin_rule.p`.
+///
+/// Before A1.2 the trigger wrote `role_permissions` only. Consequence: a
+/// new `(resource, action)` inserted into `permissions` (e.g. by
+/// `bootstrap_resource_type`, A1.5) was visible to `role_permissions` but
+/// **invisible** to `authz.can` / `authz.require` for owner roles — until
+/// the process restarted. This test pins both sides:
+///
+/// 1. **Backfill**: on a fresh DB, every `owner` role has one `casbin_rule.p`
+///    row per existing `permissions` row (17 as of Stage 4 close-out).
+/// 2. **Trigger**: a new `INSERT INTO permissions` produces exactly one
+///    `casbin_rule.p` row for the platform owner (and for any other
+///    owner role in any domain — we only inspect `platform` for brevity;
+///    the backfill covers the cross-domain case).
+///
+/// In-memory `Enforcer` staleness after the trigger fires is a separate
+/// concern covered by `reload_in_memory_picks_up_external_p_row`
+/// (Stage 5.0-A1.4); this test reads `casbin_rule` directly.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn owner_sync_trigger_writes_casbin_rule_p(pool: PgPool) {
+    // (1) Backfill: platform owner has a `p`-row for every existing permission.
+    let perms_total: i64 = sqlx::query_scalar("select count(*) from permissions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let owner_p_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule \
+         where ptype = 'p' and v0 = 'owner' and v1 = 'platform'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner_p_rows, perms_total,
+        "A1.2 backfill: platform owner must have one p-row per existing permission \
+         (perms_total={perms_total}, owner_p_rows={owner_p_rows})"
+    );
+
+    // (2) Trigger: a NEW `(resource, action)` gets a `p`-row.
+    sqlx::query(
+        "insert into permissions (resource, action, description) \
+         values ('test_resource', 'test_action', 'A1.2 regression probe')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert into permissions must succeed");
+
+    let rp_rows: i64 = sqlx::query_scalar(
+        "select count(*) from role_permissions rp \
+         join roles r on r.id = rp.role_id \
+         where r.key = 'owner' and r.domain = 'platform' \
+           and rp.resource = 'test_resource' and rp.action = 'test_action'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rp_rows, 1, "trigger must write role_permissions");
+
+    let p_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule \
+         where ptype = 'p' and v0 = 'owner' and v1 = 'platform' \
+           and v2 = 'test_resource' and v3 = 'test_action'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        p_rows, 1,
+        "trigger must write casbin_rule.p (the A1.2 / B3 fix)"
+    );
+}
+
 // ─── Stage 4.5b: cross-process race on `grant_role` ────────────────────────
 
 /// Stage 4.5b: a cross-process unique violation on `casbin_rule_unique_idx`
