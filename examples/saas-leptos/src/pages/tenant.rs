@@ -64,7 +64,7 @@ pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace
         .map_err(crate::error::core_error_to_server_fn)?;
     let tenant_id = active.id;
 
-    saas::tenant::create_workspace(&state.saas, &user, tenant_id, name, &user, &owner_key)
+    saas::tenant::create_workspace_with_owner(&state.saas, &user, tenant_id, name, &user, &owner_key)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -183,10 +183,10 @@ pub fn TenantPage() -> impl IntoView {
                     let has = |r: &str, a: &str| {
                         perms.iter().any(|(pr, pa)| pr == r && pa == a)
                     };
-                    can_create_workspace.set(has("workspaces", "create"));
-                    can_members.set(has("members", "list"));
-                    can_roles.set(has("roles", "list"));
-                    can_invitations.set(has("invitations", "list"));
+                    can_create_workspace.set(has("workspace", "create"));
+                    can_members.set(has("member", "list"));
+                    can_roles.set(has("role", "list"));
+                    can_invitations.set(has("invitation", "list"));
                 }
                 Err(_) => {
                     can_create_workspace.set(false);

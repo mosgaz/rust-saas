@@ -1,4 +1,4 @@
--- Add `(members, list)` to the permission reference table and grant it to
+-- Add `(member, list)` to the permission reference table and grant it to
 -- every existing `owner` role across all domains (ADR-0001 §3.2).
 --
 -- `create_owner_role` copies the whole reference table at role-creation time,
@@ -8,15 +8,15 @@
 -- and any tenant/workspace owner created by `seed` / `provision_tenant` /
 -- `create_workspace`) need an explicit top-up — hence the second `insert`.
 --
--- The top-up is targeted: only the new `(members, list)` pair is inserted for
+-- The top-up is targeted: only the new `(member, list)` pair is inserted for
 -- `roles.key = 'owner'`. `on conflict do nothing` keeps it idempotent if the
 -- migration ever runs against a partially-synced database.
 
 insert into permissions (resource, action, description) values
-    ('members', 'list', 'List members (tenant/workspace domain)');
+    ('member', 'list', 'List members (tenant/workspace domain)');
 
 insert into role_permissions (role_id, resource, action)
-select r.id, 'members', 'list'
+select r.id, 'member', 'list'
 from roles r
 where r.key = 'owner'
 on conflict do nothing;

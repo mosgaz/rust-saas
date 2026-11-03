@@ -165,7 +165,7 @@ revision.
   cookies plus this Origin check covers the same attack class. (Stage 4.1c)
 - `examples/axum-minimal/auth_layer.rs`: server-side defense-in-depth —
   401 for anonymous, path-level permission for `POST /tenants`
-  (`(tenants, create)`) and `GET /audit` (`(audit, read)`); pass-through
+  (`(tenant, create)`) and `GET /audit` (`(audit, read)`); pass-through
   for body-scoped paths (`POST /workspaces`, `POST /documents`) where
   the scope id must be read from the body. (Stage 4.1d)
 

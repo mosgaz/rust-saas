@@ -1,7 +1,7 @@
 //! Role and permission wrappers over the `access` crate.
 //!
 //! Invariant (§5 p.5): every mutation service calls
-//! `authz.require(actor.id, domain, "roles", "<action>")` first.
+//! `authz.require(actor.id, domain, "role", "<action>")` first.
 //!
 //! `assign_role` and `revoke_role` update the `casbin_rule` (via
 //! `authz.grant_role`/`revoke_role`) and the `*_members` bookkeeping tables in
@@ -45,7 +45,7 @@ pub async fn create_role(
     permissions: &[(String, String)],
 ) -> Result<Role, CoreError> {
     ::access::create_role(
-        state.access(),
+        state.access()?,
         actor,
         domain,
         key,
@@ -117,7 +117,7 @@ pub async fn update_role(
     // `grant_role` calls that follow. A `NotFound` here matches what
     // `access::update_role` would return — no behavioural difference, just
     // an earlier error.
-    let existing = ::access::get_role_by_id(state.access(), role_id)
+    let existing = ::access::get_role_by_id(state.access()?, role_id)
         .await
         .map_err(CoreError::from)?
         .ok_or(CoreError::NotFound)?;
@@ -153,7 +153,7 @@ pub async fn update_role(
     // 2. Update `roles` + `role_permissions`; `role.updated` fires inside
     //    `access::update_role` (with the `added` / `removed` diff).
     let updated = ::access::update_role(
-        state.access(),
+        state.access()?,
         actor,
         role_id,
         name,
@@ -199,7 +199,7 @@ pub async fn update_role(
 /// 1. `access::get_role_by_id(role_id)` — obtain `domain`, `key`,
 ///    `protected` (no `actor`, §5 p.5).
 /// 2. Reject `protected=true` ([`CoreError::Forbidden`]).
-/// 3. `require(actor.id, role.domain, "roles", "delete")`.
+/// 3. `require(actor.id, role.domain, "role", "delete")`.
 /// 4. `authz.purge_role(domain, key)` — deletes all `g`-rows (`user →
 ///    role_key → domain`) and `p`-rows (`role_key → domain → resource →
 ///    action`) for this role in this domain.
@@ -220,7 +220,7 @@ pub async fn delete_role(
     actor: &AuthUser,
     role_id: Uuid,
 ) -> Result<(), CoreError> {
-    let role = ::access::get_role_by_id(state.access(), role_id)
+    let role = ::access::get_role_by_id(state.access()?, role_id)
         .await
         .map_err(CoreError::from)?
         .ok_or(CoreError::NotFound)?;
@@ -231,7 +231,7 @@ pub async fn delete_role(
 
     state
         .authz()
-        .require(actor.id, &role.domain, "roles", "delete")
+        .require(actor.id, &role.domain, "role", "delete")
         .await?;
 
     state
@@ -241,7 +241,7 @@ pub async fn delete_role(
 
     delete_members_by_domain(state, &role.domain, role.key.as_str()).await?;
 
-    ::access::delete_role_by_id(state.access(), role_id)
+    ::access::delete_role_by_id(state.access()?, role_id)
         .await
         .map_err(CoreError::from)?;
 
@@ -273,7 +273,7 @@ pub async fn list_roles_paged(
     limit: i64,
     offset: i64,
 ) -> Result<Page<Role>, CoreError> {
-    ::access::list_roles_paged(state.access(), actor, domain, limit, offset)
+    ::access::list_roles_paged(state.access()?, actor, domain, limit, offset)
         .await
         .map_err(Into::into)
 }
@@ -297,7 +297,7 @@ pub async fn list_permissions_paged(
     limit: i64,
     offset: i64,
 ) -> Result<Page<Permission>, CoreError> {
-    ::access::list_permissions_paged(state.access(), limit, offset)
+    ::access::list_permissions_paged(state.access()?, limit, offset)
         .await
         .map_err(Into::into)
 }
@@ -327,7 +327,7 @@ pub async fn my_permissions(
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<(String, String)>, CoreError> {
-    let reference = ::access::list_permissions_paged(state.access(), i64::MAX, 0)
+    let reference = ::access::list_permissions_paged(state.access()?, i64::MAX, 0)
         .await
         .map_err(CoreError::from)?
         .items;
@@ -351,7 +351,7 @@ pub async fn my_permissions(
 /// Assigns `role_key` to `user_id` in `domain`.
 ///
 /// Order:
-/// 1. `require(actor.id, domain, "roles", "grant")`.
+/// 1. `require(actor.id, domain, "role", "grant")`.
 /// 2. `::access::get_permissions_for_role(domain, role_key)` to fetch `p`-rows.
 /// 3. `INSERT` into `tenant_members` / `workspace_members` (bookkeeping).
 /// 4. `authz.grant_role(user_id, domain, role_key, permissions)`.
@@ -365,10 +365,10 @@ pub async fn assign_role(
 ) -> Result<(), CoreError> {
     state
         .authz()
-        .require(actor.id, domain, "roles", "grant")
+        .require(actor.id, domain, "role", "grant")
         .await?;
 
-    let permissions = ::access::get_permissions_for_role(state.access(), domain, role_key)
+    let permissions = ::access::get_permissions_for_role(state.access()?, domain, role_key)
         .await
         .map_err(CoreError::from)?;
 
@@ -436,7 +436,7 @@ pub async fn assign_role(
 /// Revokes `role_key` from `user_id` in `domain`.
 ///
 /// Order:
-/// 1. `require(actor.id, domain, "roles", "grant")`.
+/// 1. `require(actor.id, domain, "role", "grant")`.
 /// 2. `DELETE` from `tenant_members` / `workspace_members`.
 /// 3. `authz.revoke_role(user_id, domain, role_key)`.
 /// 4. Emit `member.role_revoked` (Stage 3e; target: user).
@@ -449,7 +449,7 @@ pub async fn revoke_role(
 ) -> Result<(), CoreError> {
     state
         .authz()
-        .require(actor.id, domain, "roles", "grant")
+        .require(actor.id, domain, "role", "grant")
         .await?;
 
     match parse_domain(domain) {

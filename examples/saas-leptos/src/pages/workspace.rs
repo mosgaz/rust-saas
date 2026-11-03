@@ -337,10 +337,10 @@ pub fn WorkspacePage() -> impl IntoView {
                     let has = |r: &str, a: &str| {
                         perms.iter().any(|(pr, pa)| pr == r && pa == a)
                     };
-                    can_write.set(has("documents", "write"));
-                    can_members.set(has("members", "list"));
-                    can_roles.set(has("roles", "list"));
-                    can_invitations.set(has("invitations", "list"));
+                    can_write.set(has("document", "write"));
+                    can_members.set(has("member", "list"));
+                    can_roles.set(has("role", "list"));
+                    can_invitations.set(has("invitation", "list"));
                 }
                 Err(_) => {
                     can_write.set(false);

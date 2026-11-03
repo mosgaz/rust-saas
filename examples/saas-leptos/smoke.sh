@@ -129,7 +129,7 @@ ok "seed user present (platform-admin@example.test)"
 
 missing=$(docker exec "$PG_CTR" psql -U "$PG_USER" -d "$PG_DB" -tAc "
   select t from unnest(array[
-    'users','tenants','workspaces','documents','invitations',
+    'users','tenants', 'workspaces','documents','invitations',
     'roles','permissions','casbin_rule','audit_log'
   ]) t
   where to_regclass('public.'||t) is null" 2>/dev/null || true)

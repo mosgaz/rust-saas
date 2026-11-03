@@ -16,7 +16,7 @@
 //! `authz.grant_role` + `tenant_members` row).
 //!
 //! **Platform admin is not a superuser.** `list_tenants`, `suspend_tenant`,
-//! and `activate_tenant` require `(tenants, list|manage)` in
+//! and `activate_tenant` require `(tenant, list|manage)` in
 //! `PLATFORM_DOMAIN`; they do **not** grant the actor any role inside the
 //! target tenant (ADR-0002, handoff §2).
 //!
@@ -25,7 +25,7 @@
 //! (`Forbidden` if the actor is not a tenant member, `TenantSuspended` if
 //! the tenant's status is not `active`, `NotFound` if the tenant does not
 //! exist). Membership is checked via `EXISTS tenant_members` — not
-//! `authz.require(tenants, read)` — so that workspace-only roles
+//! `authz.require(tenant, read)` — so that workspace-only roles
 //! (`editor`/`viewer`) can pass (ADR-0002 rev.2 §2.4). `#[server]`
 //! functions in the example call this before any mutation of tenant-scoped
 //! resources (ADR-0002 §3); reads do not resolve.
@@ -49,7 +49,7 @@
 
 use ::access::RoleKey;
 use audit::{events, AuditEvent};
-use domain::{AuthUser, Page, Tenant, TenantStatus, PLATFORM_DOMAIN};
+use domain::{AuthUser, Page, Tenant, TenantStatus, Workspace, PLATFORM_DOMAIN};
 use uuid::Uuid;
 use tracing::instrument;
 
@@ -65,7 +65,7 @@ pub async fn create_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "create")
         .await?;
 
     let tenant = sqlx::query_as::<_, Tenant>(
@@ -106,7 +106,7 @@ pub async fn provision_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "create")
         .await?;
 
     let mut tx = state.pool.begin().await?;
@@ -120,12 +120,12 @@ pub async fn provision_tenant(
 
     let domain_str = domain::tenant_domain(tenant.id);
 
-    ::access::create_owner_role(state.access(), &domain_str)
+    ::access::create_owner_role(state.access()?, &domain_str)
         .await
         .map_err(CoreError::from)?;
 
     let permissions =
-        ::access::get_permissions_for_role(state.access(), &domain_str, owner_role_key)
+        ::access::get_permissions_for_role(state.access()?, &domain_str, owner_role_key)
             .await
             .map_err(CoreError::from)?;
 
@@ -169,7 +169,7 @@ pub async fn provision_tenant(
 
 /// Lists every tenant on the platform, newest first, with pagination.
 ///
-/// Requires `(tenants, list)` in `PLATFORM_DOMAIN` (Stage 3f).
+/// Requires `(tenant, list)` in `PLATFORM_DOMAIN` (Stage 3f).
 /// Read-only: no audit emission.
 pub async fn list_tenants_paged(
     state: &SaasState,
@@ -179,7 +179,7 @@ pub async fn list_tenants_paged(
 ) -> Result<Page<Tenant>, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "list")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "list")
         .await?;
 
     let total: i64 = sqlx::query_scalar("select count(*) from tenants")
@@ -217,7 +217,7 @@ pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Ten
 
 /// Suspends a tenant (`tenants.status = 'suspended'`).
 ///
-/// Requires `(tenants, manage)` in `PLATFORM_DOMAIN`. Idempotent: emits
+/// Requires `(tenant, manage)` in `PLATFORM_DOMAIN`. Idempotent: emits
 /// `tenant.suspended` only on a transition (`active` → `suspended`); a
 /// no-op call on an already-suspended tenant returns the row unchanged and
 /// emits nothing. `NotFound` if the tenant does not exist.
@@ -236,7 +236,7 @@ pub async fn suspend_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "manage")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "manage")
         .await?;
 
     let updated = sqlx::query_as::<_, Tenant>(
@@ -283,7 +283,7 @@ pub async fn suspend_tenant(
 
 /// Activates a suspended tenant (`tenants.status = 'active'`).
 ///
-/// Symmetric to [`suspend_tenant`]: requires `(tenants, manage)` in
+/// Symmetric to [`suspend_tenant`]: requires `(tenant, manage)` in
 /// `PLATFORM_DOMAIN`; emits `tenant.activated` only on a transition
 /// (`suspended` → `active`); idempotent no-op returns the row with no
 /// emission; `NotFound` if the tenant does not exist.
@@ -295,7 +295,7 @@ pub async fn activate_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "manage")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "manage")
         .await?;
 
     let updated = sqlx::query_as::<_, Tenant>(
@@ -370,8 +370,8 @@ impl std::ops::Deref for ActiveTenant {
 ///
 /// Order (ADR-0002 rev.2 §2.4; decision A):
 /// 1. Membership check: `EXISTS (SELECT 1 FROM tenant_members WHERE
-///    tenant_id = $1 AND user_id = $2)`. **Not** `authz.require(tenants,
-///    read)` — an `editor`/`viewer` with no `(tenants, read)` permission in
+///    tenant_id = $1 AND user_id = $2)`. **Not** `authz.require(tenant,
+///    read)` — an `editor`/`viewer` with no `(tenant, read)` permission in
 ///    the tenant domain would otherwise be unable to load pages that
 ///    legitimately mutate their workspace. Membership is the right
 ///    precondition for "can I act in this tenant?".
@@ -421,3 +421,169 @@ pub async fn resolve_active_tenant(
 
     Ok(ActiveTenant(tenant))
 }
+
+/// A workspace whose parent tenant's `status = 'active'`, as resolved by
+/// [`resolve_active_workspace`].
+///
+/// Symmetric to [`ActiveTenant`]: type-level guarantee that the parent
+/// tenant is active. `into_inner` unwraps the newtype; `Deref` gives
+/// field access.
+#[derive(Debug, Clone)]
+pub struct ActiveWorkspace(Workspace);
+
+impl ActiveWorkspace {
+    /// Consumes the newtype, returning the wrapped [`Workspace`].
+    pub fn into_inner(self) -> Workspace {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ActiveWorkspace {
+    type Target = Workspace;
+    fn deref(&self) -> &Workspace {
+        &self.0
+    }
+}
+
+/// Resolves a tenant that the actor is a member of — **without** checking
+/// `status`.
+///
+/// Read path only: a suspended tenant must still allow its members to
+/// read (`list_*`, `get_*`, `my_permissions`, `revoke_invitation`).
+/// Mutations use [`resolve_active_tenant`] instead.
+///
+/// Order:
+/// 1. `EXISTS tenant_members` → non-member is [`CoreError::Forbidden`].
+/// 2. `SELECT tenants` → missing is [`CoreError::NotFound`].
+pub async fn resolve_tenant(
+    state: &SaasState,
+    actor: &AuthUser,
+    tenant_id: Uuid,
+) -> Result<Tenant, CoreError> {
+    let is_member: bool = sqlx::query_scalar(
+        "select exists (select 1 from tenant_members where tenant_id = $1 and user_id = $2)",
+    )
+    .bind(tenant_id)
+    .bind(actor.id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    if !is_member {
+        return Err(CoreError::Forbidden);
+    }
+
+    sqlx::query_as::<_, Tenant>("select id, name, status, created_at from tenants where id = $1")
+        .bind(tenant_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(CoreError::NotFound)
+}
+
+/// Resolves a workspace that the actor is a member of — **without**
+/// checking the parent tenant's status.
+///
+/// Read path only. Mutations use [`resolve_active_workspace`].
+///
+/// Order:
+/// 1. `EXISTS workspace_members` → non-member is [`CoreError::Forbidden`].
+/// 2. `SELECT workspaces` → missing is [`CoreError::NotFound`].
+pub async fn resolve_workspace(
+    state: &SaasState,
+    actor: &AuthUser,
+    workspace_id: Uuid,
+) -> Result<Workspace, CoreError> {
+    let is_member: bool = sqlx::query_scalar(
+        "select exists (select 1 from workspace_members where workspace_id = $1 and user_id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(actor.id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    if !is_member {
+        return Err(CoreError::Forbidden);
+    }
+
+    sqlx::query_as::<_, Workspace>(
+        "select id, tenant_id, name, created_at from workspaces where id = $1",
+    )
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(CoreError::NotFound)
+}
+
+/// Resolves a workspace whose parent tenant is active.
+///
+/// Symmetric to [`resolve_active_tenant`] but for workspace scope. The
+/// workspace has no `status` of its own — the check goes through
+/// `workspaces.tenant_id → tenants.status`. Composed from
+/// [`resolve_workspace`] + one `SELECT tenants`.
+///
+/// Order:
+/// 1. [`resolve_workspace`] — membership + row (`Forbidden` / `NotFound`).
+/// 2. `SELECT tenants.status` — parent gone → `NotFound` (defensive; FK
+///    should cascade).
+/// 3. `status != 'active'` → [`CoreError::TenantSuspended`].
+#[instrument(
+    skip(state, actor),
+    fields(operation = "resolve_active_workspace", actor_id = %actor.id),
+)]
+pub async fn resolve_active_workspace(
+    state: &SaasState,
+    actor: &AuthUser,
+    workspace_id: Uuid,
+) -> Result<ActiveWorkspace, CoreError> {
+    let ws = resolve_workspace(state, actor, workspace_id).await?;
+
+    let status: Option<TenantStatus> =
+        sqlx::query_scalar("select status from tenants where id = $1")
+            .bind(ws.tenant_id)
+            .fetch_optional(&state.pool)
+            .await?;
+
+    match status {
+        Some(TenantStatus::Active) => Ok(ActiveWorkspace(ws)),
+        Some(TenantStatus::Suspended) => Err(CoreError::TenantSuspended),
+        None => Err(CoreError::NotFound),
+    }
+}
+
+/// Returns `true` iff `user_id` is a member of `tenant_id`.
+///
+/// Read-only helper for consumer-side UI gating. **Not** a security check
+/// — mutations still go through `resolve_active_tenant` /
+/// `resolve_active_workspace` / `authz.require`.
+pub async fn is_tenant_member(
+    state: &SaasState,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<bool, CoreError> {
+    let exists: bool = sqlx::query_scalar(
+        "select exists (select 1 from tenant_members where tenant_id = $1 and user_id = $2)",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(exists)
+}
+
+/// Returns `true` iff `user_id` is a member of `workspace_id`.
+///
+/// Same caveat as [`is_tenant_member`] — UI gating only.
+pub async fn is_workspace_member(
+    state: &SaasState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+) -> Result<bool, CoreError> {
+    let exists: bool = sqlx::query_scalar(
+        "select exists (select 1 from workspace_members where workspace_id = $1 and user_id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(exists)
+}
+

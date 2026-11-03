@@ -39,3 +39,42 @@ pub use db;
 pub use identity;
 #[cfg(feature = "ssr")]
 pub use saas;
+
+/// Applies the workspace-wide migration set (`crates/db/migrations/`).
+///
+/// Thin wrapper over [`db::migrate`]; the name is the
+/// `saas-external-02.md` §5.2 quick-start entry point for an Axum
+/// consumer with **no** custom migrations.
+///
+/// ```ignore
+/// let pool = db::connect(&url).await?;
+/// rust_saas::migrate_all(&pool).await?;
+/// ```
+#[cfg(feature = "ssr")]
+pub async fn migrate_all(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    db::migrate_composed(pool, &[]).await
+}
+
+/// Applies the workspace-wide migration set **plus** one consumer
+/// migrator.
+///
+/// The consumer migrator must:
+/// - use versions **greater than** `db::MIGRATOR`'s max (see
+///   [`db::CONSUMER_VERSION_FLOOR`], `90000000000000`);
+/// - not reuse any rust-saas version (collision is a hard error).
+///
+/// See [`db::migrate_composed`] for the full contract.
+///
+/// ```ignore
+/// static MY_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+///
+/// let pool = db::connect(&url).await?;
+/// rust_saas::migrate_extended(&pool, &MY_MIGRATOR).await?;
+/// ```
+#[cfg(feature = "ssr")]
+pub async fn migrate_extended(
+    pool: &sqlx::PgPool,
+    consumer: &sqlx::migrate::Migrator,
+) -> anyhow::Result<()> {
+    db::migrate_composed(pool, &[consumer]).await
+}

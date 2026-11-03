@@ -23,7 +23,7 @@
 //! Stage 3f adds the "Platform admin + tenant suspend" section:
 //! `resolve_active_tenant` (member + active → `Ok(ActiveTenant)`; member +
 //! suspended → `TenantSuspended`; non-member → `Forbidden`),
-//! `list_tenants` (requires `(tenants, list)` in `PLATFORM_DOMAIN`),
+//! `list_tenants` (requires `(tenant, list)` in `PLATFORM_DOMAIN`),
 //! `suspend_tenant` / `activate_tenant` (idempotent; emit `tenant.suspended`
 //! / `tenant.activated` only on a transition), and
 //! `invitation::{create, accept}_invitation` rejecting on a suspended
@@ -140,9 +140,13 @@ async fn make_user_with_email(pool: &PgPool, email: &str, verified: bool) -> Aut
 /// Grants `platform` owner to the given user.
 async fn grant_platform_admin(state: &SaasState, user: &AuthUser) {
     let owner_key = RoleKey::parse("owner").unwrap();
-    let perms = ::access::get_permissions_for_role(state.access(), "platform", &owner_key)
-        .await
-        .unwrap();
+    let perms = ::access::get_permissions_for_role(
+        state.access().expect("access"),
+        "platform",
+        &owner_key,
+    )
+    .await
+    .unwrap();
     state
         .authz()
         .grant_role(user.id, "platform", "owner", &perms)
@@ -185,7 +189,7 @@ async fn create_tenant_creates_row_without_membership(pool: PgPool) {
         .can(
             admin.id,
             &domain::tenant_domain(tenant.id),
-            "workspaces",
+            "workspace",
             "create",
         )
         .await
@@ -234,7 +238,7 @@ async fn provision_tenant_grants_owner_and_membership(pool: PgPool) {
         .can(
             owner.id,
             &domain::tenant_domain(tenant.id),
-            "workspaces",
+            "workspace",
             "create",
         )
         .await
@@ -246,7 +250,7 @@ async fn provision_tenant_grants_owner_and_membership(pool: PgPool) {
         .can(
             admin.id,
             &domain::tenant_domain(tenant.id),
-            "workspaces",
+            "workspace",
             "create",
         )
         .await
@@ -268,7 +272,7 @@ async fn create_workspace_grants_owner_and_membership(pool: PgPool) {
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -294,7 +298,7 @@ async fn create_workspace_grants_owner_and_membership(pool: PgPool) {
         .can(
             admin.id,
             &domain::workspace_domain(ws.id),
-            "documents",
+            "document",
             "write",
         )
         .await
@@ -314,7 +318,7 @@ async fn platform_admin_cannot_create_document_without_workspace_role(pool: PgPo
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &owner,
         tenant.id,
@@ -342,7 +346,7 @@ async fn cross_workspace_isolation(pool: PgPool) {
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(
+    let ws1 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -352,7 +356,7 @@ async fn cross_workspace_isolation(pool: PgPool) {
     )
     .await
     .unwrap();
-    let ws2 = tenant::create_workspace(
+    let ws2 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -437,7 +441,7 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(
+    let ws1 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -447,7 +451,7 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
     )
     .await
     .unwrap();
-    let ws2 = tenant::create_workspace(
+    let ws2 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -469,7 +473,7 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -563,7 +567,7 @@ async fn create_workspace_invitation_persists_row_and_returns_token(pool: PgPool
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -583,7 +587,7 @@ async fn create_workspace_invitation_persists_row_and_returns_token(pool: PgPool
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -653,7 +657,7 @@ async fn accept_tenant_invitation_grants_owner_and_membership(pool: PgPool) {
         .can(
             invitee.id,
             &domain::tenant_domain(tenant.id),
-            "workspaces",
+            "workspace",
             "create",
         )
         .await
@@ -678,7 +682,7 @@ async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -698,7 +702,7 @@ async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "write".to_string())],
+        &[("document".to_string(), "write".to_string())],
     )
     .await
     .unwrap();
@@ -735,7 +739,7 @@ async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
         .can(
             invitee.id,
             &domain::workspace_domain(ws.id),
-            "documents",
+            "document",
             "write",
         )
         .await
@@ -854,7 +858,7 @@ async fn accept_invitation_after_expiry_returns_not_found(pool: PgPool) {
 // ─── Members (Stage 2c) ─────────────────────────────────────────────────────
 
 /// Tenant member listing groups multiple roles per user and requires
-/// `(members, list)`.
+/// `(member, list)`.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn member_list_tenant_groups_roles_and_requires_list(pool: PgPool) {
     let saas = setup(&pool).await;
@@ -878,7 +882,7 @@ async fn member_list_tenant_groups_roles_and_requires_list(pool: PgPool) {
         &auditor_key,
         "Auditor".to_string(),
         "".to_string(),
-        &[("members".to_string(), "list".to_string())],
+        &[("member".to_string(), "list".to_string())],
     )
     .await
     .unwrap();
@@ -908,7 +912,7 @@ async fn member_list_tenant_groups_roles_and_requires_list(pool: PgPool) {
 }
 
 /// Workspace member listing includes users holding a workspace role and
-/// rejects `(members, list)` when the actor has no roles in the workspace.
+/// rejects `(member, list)` when the actor has no roles in the workspace.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn member_list_workspace_requires_list_permission(pool: PgPool) {
     let saas = setup(&pool).await;
@@ -919,7 +923,7 @@ async fn member_list_workspace_requires_list_permission(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -940,7 +944,7 @@ async fn member_list_workspace_requires_list_permission(pool: PgPool) {
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -976,7 +980,7 @@ async fn member_change_role_replaces_role(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -997,7 +1001,7 @@ async fn member_change_role_replaces_role(pool: PgPool) {
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "write".to_string())],
+        &[("document".to_string(), "write".to_string())],
     )
     .await
     .unwrap();
@@ -1008,7 +1012,7 @@ async fn member_change_role_replaces_role(pool: PgPool) {
         &viewer_key,
         "Viewer".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -1031,14 +1035,14 @@ async fn member_change_role_replaces_role(pool: PgPool) {
 
     let can_write = saas
         .authz()
-        .can(user.id, &ws_domain, "documents", "write")
+        .can(user.id, &ws_domain, "document", "write")
         .await
         .unwrap();
     assert!(!can_write, "editor rights must be gone");
 
     let can_read = saas
         .authz()
-        .can(user.id, &ws_domain, "documents", "read")
+        .can(user.id, &ws_domain, "document", "read")
         .await
         .unwrap();
     assert!(can_read, "viewer rights must be present");
@@ -1068,7 +1072,7 @@ async fn member_change_role_same_key_is_noop(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1105,7 +1109,7 @@ async fn member_remove_role_removes_from_members_and_casbin(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1125,7 +1129,7 @@ async fn member_remove_role_removes_from_members_and_casbin(pool: PgPool) {
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "write".to_string())],
+        &[("document".to_string(), "write".to_string())],
     )
     .await
     .unwrap();
@@ -1147,7 +1151,7 @@ async fn member_remove_role_removes_from_members_and_casbin(pool: PgPool) {
 
     let can_write = saas
         .authz()
-        .can(user.id, &ws_domain, "documents", "write")
+        .can(user.id, &ws_domain, "document", "write")
         .await
         .unwrap();
     assert!(!can_write, "removed role must not grant documents:write");
@@ -1164,7 +1168,7 @@ async fn member_remove_role_removes_from_members_and_casbin(pool: PgPool) {
 // ─── my_permissions (Stage 2c) ──────────────────────────────────────────────
 
 /// Owner sees the full reference table; a non-member sees an empty list;
-/// an editor sees exactly the two `documents:*` pairs.
+/// an editor sees exactly the two `document:*` pairs.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
     let saas = setup(&pool).await;
@@ -1175,7 +1179,7 @@ async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1192,13 +1196,15 @@ async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
     let owner_perms = saas_access::my_permissions(&saas, &admin, &ws_domain)
         .await
         .unwrap();
-    let reference = ::access::list_permissions(saas.access()).await.unwrap();
+    let reference = ::access::list_permissions(saas.access().expect("access"))
+        .await
+        .unwrap();
     assert_eq!(owner_perms.len(), reference.len());
     assert!(owner_perms
         .iter()
-        .any(|(r, a)| r == "members" && a == "list"));
+        .any(|(r, a)| r == "member" && a == "list"));
 
-    // Editor — exactly `documents:read` + `documents:write`.
+    // Editor — exactly `document:read` + `document:write`.
     let editor_key = RoleKey::parse("editor").unwrap();
     let editor = make_user(&pool, "editor").await;
     saas_access::create_role(
@@ -1209,8 +1215,8 @@ async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
         "Editor".to_string(),
         "".to_string(),
         &[
-            ("documents".to_string(), "read".to_string()),
-            ("documents".to_string(), "write".to_string()),
+            ("document".to_string(), "read".to_string()),
+            ("document".to_string(), "write".to_string()),
         ],
     )
     .await
@@ -1225,10 +1231,10 @@ async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
     assert_eq!(editor_perms.len(), 2);
     assert!(editor_perms
         .iter()
-        .any(|(r, a)| r == "documents" && a == "read"));
+        .any(|(r, a)| r == "document" && a == "read"));
     assert!(editor_perms
         .iter()
-        .any(|(r, a)| r == "documents" && a == "write"));
+        .any(|(r, a)| r == "document" && a == "write"));
 
     // Non-member — empty.
     let outsider = make_user(&pool, "outsider").await;
@@ -1255,7 +1261,7 @@ async fn remove_role_last_protected_holder_is_rejected(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1288,7 +1294,7 @@ async fn remove_role_last_protected_holder_is_rejected(pool: PgPool) {
     // Still a holder — the guard runs before any mutation.
     let can = saas
         .authz()
-        .can(admin.id, &ws_domain, "documents", "write")
+        .can(admin.id, &ws_domain, "document", "write")
         .await
         .unwrap();
     assert!(can, "admin must still be able to write documents");
@@ -1384,6 +1390,10 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
         async fn purge_role(&self, domain: &str, role_key: &str) -> Result<u64, AuthzError> {
             self.inner.purge_role(domain, role_key).await
         }
+
+        async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+            self.inner.reload_in_memory().await
+        }
     }
 
     let casbin = Arc::new(
@@ -1408,7 +1418,7 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
         platform::provision_tenant(&ok_state, &admin, unique_name("Acme"), &admin, &owner_key)
             .await
             .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &ok_state,
         &admin,
         tenant.id,
@@ -1429,7 +1439,7 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "write".to_string())],
+        &[("document".to_string(), "write".to_string())],
     )
     .await
     .unwrap();
@@ -1440,7 +1450,7 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
         &viewer_key,
         "Viewer".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -1469,11 +1479,11 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
     // Over-permissioned: new role (viewer) grants read; old role (editor)
     // still grants write because `authz.revoke_role` never ran.
     let can_read = casbin
-        .can(user.id, &ws_domain, "documents", "read")
+        .can(user.id, &ws_domain, "document", "read")
         .await
         .unwrap();
     let can_write = casbin
-        .can(user.id, &ws_domain, "documents", "write")
+        .can(user.id, &ws_domain, "document", "write")
         .await
         .unwrap();
     assert!(can_read, "viewer rights must be granted");
@@ -1510,11 +1520,11 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
     .expect("retry must recover");
 
     let can_write_after = casbin
-        .can(user.id, &ws_domain, "documents", "write")
+        .can(user.id, &ws_domain, "document", "write")
         .await
         .unwrap();
     let can_read_after = casbin
-        .can(user.id, &ws_domain, "documents", "read")
+        .can(user.id, &ws_domain, "document", "read")
         .await
         .unwrap();
     assert!(!can_write_after, "editor rights must be gone after retry");
@@ -1538,7 +1548,7 @@ async fn delete_role_purges_casbin_and_members(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1558,7 +1568,7 @@ async fn delete_role_purges_casbin_and_members(pool: PgPool) {
         &temp_key,
         "Temp".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -1645,7 +1655,7 @@ async fn delete_role_purges_casbin_and_members(pool: PgPool) {
     // Effective permissions gone.
     let can_read = saas
         .authz()
-        .can(user.id, &ws_domain, "documents", "read")
+        .can(user.id, &ws_domain, "document", "read")
         .await
         .unwrap();
     assert!(!can_read, "temp role no longer grants documents:read");
@@ -1707,7 +1717,7 @@ async fn accept_addressed_invitation_verified_match_grants_role(pool: PgPool) {
         .can(
             invitee.id,
             &domain::tenant_domain(tenant_id),
-            "workspaces",
+            "workspace",
             "create",
         )
         .await
@@ -1988,7 +1998,7 @@ async fn create_workspace_emits_workspace_created(pool: PgPool) {
             .await
             .unwrap();
 
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -2130,7 +2140,7 @@ async fn change_role_emits_three_events(pool: PgPool) {
         platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &admin, &owner_key)
             .await
             .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -2151,7 +2161,7 @@ async fn change_role_emits_three_events(pool: PgPool) {
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "write".to_string())],
+        &[("document".to_string(), "write".to_string())],
     )
     .await
     .unwrap();
@@ -2162,7 +2172,7 @@ async fn change_role_emits_three_events(pool: PgPool) {
         &viewer_key,
         "Viewer".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -2319,7 +2329,7 @@ async fn resolve_active_tenant_non_member_returns_forbidden(pool: PgPool) {
     assert!(matches!(err, CoreError::Forbidden), "got {err:?}");
 }
 
-/// `list_tenants` requires `(tenants, list)` in `PLATFORM_DOMAIN`: an actor
+/// `list_tenants` requires `(tenant, list)` in `PLATFORM_DOMAIN`: an actor
 /// without platform owner is rejected, the platform admin sees every tenant.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn list_tenants_requires_platform_tenants_list(pool: PgPool) {
@@ -2694,7 +2704,7 @@ async fn advisory_lock_does_not_block_other_roles(pool: PgPool) {
         &editor_key,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -2762,7 +2772,7 @@ async fn delete_role_emits_role_deleted(pool: PgPool) {
         platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &admin, &owner_key)
             .await
             .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -2782,7 +2792,7 @@ async fn delete_role_emits_role_deleted(pool: PgPool) {
         &temp_key,
         "Temp".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -2854,7 +2864,7 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -2868,7 +2878,7 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     let ws_domain = domain::workspace_domain(ws.id);
     let editor_key = RoleKey::parse("editor").unwrap();
 
-    // Create `editor` with `documents:read` + `documents:write`.
+    // Create `editor` with `document:read` + `document:write`.
     let editor_role = saas_access::create_role(
         &saas,
         &admin,
@@ -2877,8 +2887,8 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
         "Editor".to_string(),
         "".to_string(),
         &[
-            ("documents".to_string(), "read".to_string()),
-            ("documents".to_string(), "write".to_string()),
+            ("document".to_string(), "read".to_string()),
+            ("document".to_string(), "write".to_string()),
         ],
     )
     .await
@@ -2893,17 +2903,17 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     // Sanity: holder has both before the update.
     assert!(
         saas.authz()
-            .can(holder.id, &ws_domain, "documents", "read")
+            .can(holder.id, &ws_domain, "document", "read")
             .await
             .unwrap(),
-        "setup: holder must have `documents:read` before update"
+        "setup: holder must have `document:read` before update"
     );
     assert!(
         saas.authz()
-            .can(holder.id, &ws_domain, "documents", "write")
+            .can(holder.id, &ws_domain, "document", "write")
             .await
             .unwrap(),
-        "setup: holder must have `documents:write` before update"
+        "setup: holder must have `document:write` before update"
     );
 
     // Snapshot audit count so we can isolate rows produced by this update.
@@ -2919,7 +2929,7 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
         editor_role.id,
         "Editor".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .expect("update_role must succeed");
@@ -2927,12 +2937,12 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     // ── casbin_rule / effective permissions ──────────────────────────────
     let can_read_after = saas
         .authz()
-        .can(holder.id, &ws_domain, "documents", "read")
+        .can(holder.id, &ws_domain, "document", "read")
         .await
         .unwrap();
     let can_write_after = saas
         .authz()
-        .can(holder.id, &ws_domain, "documents", "write")
+        .can(holder.id, &ws_domain, "document", "write")
         .await
         .unwrap();
     assert!(can_read_after, "read must survive the update");
@@ -2944,7 +2954,7 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     // Direct table check: no `p`-row for `(editor, ws_domain, documents, write)`.
     let p_write_after: i64 = sqlx::query_scalar(
         "select count(*) from casbin_rule \
-         where ptype='p' and v0=$1 and v1=$2 and v2='documents' and v3='write'",
+         where ptype='p' and v0=$1 and v1=$2 and v2='document' and v3='write'",
     )
     .bind(editor_key.as_str())
     .bind(&ws_domain)
@@ -2953,20 +2963,20 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     .unwrap();
     assert_eq!(
         p_write_after, 0,
-        "stale p-row for `documents:write` must be purged by update_role"
+        "stale p-row for `document:write` must be purged by update_role"
     );
 
     // Direct table check: exactly one `p`-row for `(editor, ws_domain, documents, read)`.
     let p_read_after: i64 = sqlx::query_scalar(
         "select count(*) from casbin_rule \
-         where ptype='p' and v0=$1 and v1=$2 and v2='documents' and v3='read'",
+         where ptype='p' and v0=$1 and v1=$2 and v2='document' and v3='read'",
     )
     .bind(editor_key.as_str())
     .bind(&ws_domain)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(p_read_after, 1, "exactly one p-row for `documents:read`");
+    assert_eq!(p_read_after, 1, "exactly one p-row for `document:read`");
 
     // ── audit: exactly one `role.updated`, no `member.role_*` ─────────────
     let rows: Vec<(
@@ -3012,7 +3022,7 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     );
     assert_eq!(
         removed,
-        vec![("documents".to_string(), "write".to_string())],
+        vec![("document".to_string(), "write".to_string())],
         "removed must list exactly the dropped (resource, action) pair"
     );
 
@@ -3021,7 +3031,7 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     // truth for the role *definition*; `casbin_rule` is the source of truth
     // for the *effective grants*).
     assert_eq!(updated.permissions.len(), 1);
-    assert_eq!(updated.permissions[0].resource, "documents");
+    assert_eq!(updated.permissions[0].resource, "document");
     assert_eq!(updated.permissions[0].action, "read");
 }
 
@@ -3089,33 +3099,33 @@ async fn delete_permission_unsyncs_owner_p_rows(pool: PgPool) {
     //   - tenant-owner got `p`-rows via `provision_tenant`
     //     (`create_owner_role` + `authz.grant_role(owner, tenant_domain,
     //     "owner", perms)`).
-    // `documents:read` is in the reference table (`access_rbac_init`), so
+    // `document:read` is in the reference table (`access_rbac_init`), so
     // both owner roles must hold it.
     assert_eq!(
-        count_owner_p_row(&pool, "platform", "documents", "read").await,
+        count_owner_p_row(&pool, "platform", "document", "read").await,
         1,
-        "setup: platform-owner must have a `documents:read` p-row"
+        "setup: platform-owner must have a `document:read` p-row"
     );
     assert_eq!(
-        count_owner_p_row(&pool, &tenant_domain, "documents", "read").await,
+        count_owner_p_row(&pool, &tenant_domain, "document", "read").await,
         1,
-        "setup: tenant-owner must have a `documents:read` p-row"
+        "setup: tenant-owner must have a `document:read` p-row"
     );
 
-    // Record a sibling permission (`documents:write`) — the trigger's
+    // Record a sibling permission (`document:write`) — the trigger's
     // predicate is `(v2, v3) = (OLD.resource, OLD.action)`, so this must
     // survive.
     assert_eq!(
-        count_owner_p_row(&pool, &tenant_domain, "documents", "write").await,
+        count_owner_p_row(&pool, &tenant_domain, "document", "write").await,
         1,
-        "setup: tenant-owner must have `documents:write`"
+        "setup: tenant-owner must have `document:write`"
     );
 
     // Delete the reference row. `role_permissions` cascades via FK; the
     // AFTER DELETE trigger (`owner_unsync_permission_after_delete`) is
     // what cleans `casbin_rule.p` for owner roles.
     let deleted =
-        sqlx::query("delete from permissions where resource = 'documents' and action = 'read'")
+        sqlx::query("delete from permissions where resource = 'document' and action = 'read'")
             .execute(&pool)
             .await
             .expect("delete from permissions must succeed");
@@ -3127,24 +3137,24 @@ async fn delete_permission_unsyncs_owner_p_rows(pool: PgPool) {
 
     // (a) Trigger cleaned `casbin_rule.p` for the platform-owner role.
     assert_eq!(
-        count_owner_p_row(&pool, "platform", "documents", "read").await,
+        count_owner_p_row(&pool, "platform", "document", "read").await,
         0,
-        "platform-owner p-row for `documents:read` must be removed by the AFTER DELETE trigger"
+        "platform-owner p-row for `document:read` must be removed by the AFTER DELETE trigger"
     );
 
     // (b) Trigger cleaned `casbin_rule.p` for the tenant-owner role — the
     //     same predicate fires once per domain, proving the trigger is
     //     domain-agnostic (not accidentally scoped to one domain).
     assert_eq!(
-        count_owner_p_row(&pool, &tenant_domain, "documents", "read").await,
+        count_owner_p_row(&pool, &tenant_domain, "document", "read").await,
         0,
-        "tenant-owner p-row for `documents:read` must be removed by the AFTER DELETE trigger"
+        "tenant-owner p-row for `document:read` must be removed by the AFTER DELETE trigger"
     );
 
     // (c) FK cascade cleared `role_permissions` — the role-definition
     //     side. Sanity that trigger and FK cover different layers.
     let role_perm_rows: i64 = sqlx::query_scalar(
-        "select count(*) from role_permissions where resource = 'documents' and action = 'read'",
+        "select count(*) from role_permissions where resource = 'document' and action = 'read'",
     )
     .fetch_one(&pool)
     .await
@@ -3154,13 +3164,13 @@ async fn delete_permission_unsyncs_owner_p_rows(pool: PgPool) {
         "role_permissions rows must be cleared by the FK cascade"
     );
 
-    // (d) Unrelated permission (`documents:write`) is untouched. If the
+    // (d) Unrelated permission (`document:write`) is untouched. If the
     //     trigger's predicate were ever broadened (e.g. `v2 = OLD.resource`
     //     only, ignoring `v3`), this assertion fires.
     assert_eq!(
-        count_owner_p_row(&pool, &tenant_domain, "documents", "write").await,
+        count_owner_p_row(&pool, &tenant_domain, "document", "write").await,
         1,
-        "unrelated `documents:write` p-row must survive the trigger"
+        "unrelated `document:write` p-row must survive the trigger"
     );
 }
 
@@ -3237,4 +3247,130 @@ async fn member_list_paged_works(pool: PgPool) {
         .unwrap();
     assert_eq!(page2.total, 4);
     assert_eq!(page2.items.len(), 2);
+}
+
+
+// ─── Stage 5.0-A2.2d: new create_workspace / without_access ──────────────
+
+/// Stage 5.0-A2.2d: `tenant::create_workspace` (4-arg, no owner) must
+/// insert the workspace but **not** create an owner role, **not** write
+/// `workspace_members`, and **not** write any `casbin_rule` g-row for
+/// the workspace domain. Those are `create_workspace_with_owner`'s job;
+/// the bare form is a pure "require + insert + audit" call.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_workspace_without_owner_does_not_assign(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+
+    let ws = tenant::create_workspace(&saas, &admin, tenant.id, unique_name("Bare"))
+        .await
+        .expect("create_workspace must succeed");
+    assert_eq!(ws.tenant_id, tenant.id);
+
+    let members: i64 =
+        sqlx::query_scalar("select count(*) from workspace_members where workspace_id = $1")
+            .bind(ws.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        members, 0,
+        "bare create_workspace must not write workspace_members"
+    );
+
+    let owner_roles: i64 =
+        sqlx::query_scalar("select count(*) from roles where domain = $1 and key = 'owner'")
+            .bind(domain::workspace_domain(ws.id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        owner_roles, 0,
+        "bare create_workspace must not create owner role"
+    );
+
+    let g_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule where ptype = 'g' and v2 = $1",
+    )
+    .bind(domain::workspace_domain(ws.id))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        g_rows, 0,
+        "bare create_workspace must not write casbin g-rows"
+    );
+}
+
+/// Stage 5.0-A2.2d (blocker B9 end-to-end): a `SaasState` built with
+/// `.without_access()` can still create a bare workspace — only the
+/// RBAC methods fail. This is the whole point of `without_access`: a
+/// consumer without a roles table can still use `create_tenant` /
+/// `create_workspace` / `create_document`, provided they wire some
+/// `AuthorizationEngine` impl (here, a real `CasbinAuthz` because the
+/// test already has one; a consumer would use e.g. `AlwaysAllow`).
+#[sqlx::test(migrations = "../db/migrations")]
+async fn create_workspace_works_without_access(pool: PgPool) {
+    // Phase 1: set up tenant + owner-membership through a regular
+    // (RBAC-enabled) state. `provision_tenant` on `no_rbac` below would
+    // fail — it needs `access` for owner-role assignment.
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+    let owner = make_user(&pool, "owner").await;
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant =
+        platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
+            .await
+            .unwrap();
+
+    // Phase 2: build a no-RBAC state sharing the same pool. The fresh
+    // `CasbinAuthz::from_pool` reloads from `casbin_rule`, so the
+    // owner's g-row (written in phase 1) is visible — otherwise
+    // `create_workspace`'s `authz.require` would fail for a different
+    // reason and the test would be less honest.
+    let casbin: Arc<dyn AuthorizationEngine> = Arc::new(
+        CasbinAuthz::from_pool(pool.clone())
+            .await
+            .expect("casbin init"),
+    );
+    let no_rbac = SaasBuilder::new(pool.clone())
+        .with_authz(casbin)
+        .without_access()
+        .build()
+        .expect("build without_access");
+
+    // `create_workspace` (4-arg, no owner) works — only `authz.require`
+    // + SQL, no `access::*`.
+    let ws = tenant::create_workspace(&no_rbac, &owner, tenant.id, unique_name("Bare"))
+        .await
+        .expect("create_workspace must work without access");
+    assert_eq!(ws.tenant_id, tenant.id);
+
+    // `provision_tenant` on the same state fails — it needs `access`
+    // for owner-role assignment.
+    match platform::provision_tenant(
+        &no_rbac,
+        &admin,
+        unique_name("ShouldFail"),
+        &owner,
+        &owner_key,
+    )
+    .await
+    {
+        Err(CoreError::Internal(msg)) => {
+            assert!(
+                msg.contains("RBAC not configured"),
+                "unexpected message: {msg}"
+            );
+        }
+        Err(other) => panic!("expected Internal(\"RBAC not configured\"), got {other:?}"),
+        Ok(_) => panic!("provision_tenant must fail without access"),
+    }
 }

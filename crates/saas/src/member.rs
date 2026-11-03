@@ -8,10 +8,10 @@
 //! by `saas::access::{assign_role, revoke_role}`).
 //!
 //! Invariant (§5 p.5):
-//! - `list` requires `(members, list)` in the target domain.
-//! - `change_role` / `remove_role` require `(members, manage)` in the
+//! - `list` requires `(member, list)` in the target domain.
+//! - `change_role` / `remove_role` require `(member, manage)` in the
 //!   target domain, then delegate to `saas::access::{assign_role,
-//!   revoke_role}`, which additionally require `(roles, grant)`. The
+//!   revoke_role}`, which additionally require `(role, grant)`. The
 //!   extra check is recorded in handoff §16.
 //!
 //! Stage 2d:
@@ -114,7 +114,7 @@ impl MemberScope {
 /// Lists members of `scope`: one `Member` per `user_id`, with all
 /// `role_key`s the user holds in this scope.
 ///
-/// Order: `(members, list)` → SQL join → group by `user_id`. Rows come
+/// Order: `(member, list)` → SQL join → group by `user_id`. Rows come
 /// sorted by user email; roles within one user are sorted by `role_key`.
 pub async fn list_paged(
     state: &SaasState,
@@ -126,7 +126,7 @@ pub async fn list_paged(
     let domain_str = scope.domain();
     state
         .authz
-        .require(actor.id, &domain_str, "members", "list")
+        .require(actor.id, &domain_str, "member", "list")
         .await?;
 
     let total: i64 = sqlx::query_scalar(&format!(
@@ -205,7 +205,7 @@ pub async fn list(
 ///
 /// Order (Stage 2d: flip order + owner guard; Stage 3h: advisory lock):
 /// 1. No-op if `old_role_key == new_role_key`.
-/// 2. `require(actor.id, scope.domain(), "members", "manage")`.
+/// 2. `require(actor.id, scope.domain(), "member", "manage")`.
 /// 3. Begin a lock-holder transaction and acquire
 ///    `pg_advisory_xact_lock(hashtext('owner-guard:{domain}:{old_role}'))`.
 ///    The transaction does no writes; it exists only to hold the advisory
@@ -251,7 +251,7 @@ pub async fn change_role(
     let domain_str = scope.domain();
     state
         .authz
-        .require(actor.id, &domain_str, "members", "manage")
+        .require(actor.id, &domain_str, "member", "manage")
         .await?;
 
     // Stage 3h: serialize the owner guard on `(domain, old_role_key)`.
@@ -291,7 +291,7 @@ pub async fn change_role(
 /// Removes `role_key` from `user_id` in `scope`.
 ///
 /// Order (Stage 2d: owner guard; Stage 3h: advisory lock):
-/// 1. `require(actor.id, scope.domain(), "members", "manage")`.
+/// 1. `require(actor.id, scope.domain(), "member", "manage")`.
 /// 2. Begin a lock-holder transaction and acquire
 ///    `pg_advisory_xact_lock(hashtext('owner-guard:{domain}:{role}'))`
 ///    (ADR-0003 §2.3).
@@ -329,7 +329,7 @@ pub async fn remove_role(
     let domain_str = scope.domain();
     state
         .authz
-        .require(actor.id, &domain_str, "members", "manage")
+        .require(actor.id, &domain_str, "member", "manage")
         .await?;
 
     // Stage 3h: serialize the owner guard on `(domain, role_key)`.
@@ -373,7 +373,7 @@ async fn guard_protected_last_holder(
     domain: &str,
     role_key: &RoleKey,
 ) -> Result<(), CoreError> {
-    let Some(role) = ::access::get_role(state.access(), domain, role_key)
+    let Some(role) = ::access::get_role(state.access()?, domain, role_key)
         .await
         .map_err(CoreError::from)?
     else {

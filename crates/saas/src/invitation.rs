@@ -89,7 +89,7 @@ pub async fn create_invitation(
 
     state
         .authz
-        .require(actor.id, &domain_str, "invitations", "create")
+        .require(actor.id, &domain_str, "invitation", "create")
         .await?;
 
     let (tenant_id, workspace_id) = match target {
@@ -262,7 +262,7 @@ pub async fn accept_invitation(
     if let Some(tenant_id) = invitation.tenant_id {
         let domain_str = domain::tenant_domain(tenant_id);
         let permissions =
-            ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
+            ::access::get_permissions_for_role(state.access()?, &domain_str, &role_key)
                 .await
                 .map_err(CoreError::from)?;
 
@@ -286,7 +286,7 @@ pub async fn accept_invitation(
     } else if let Some(workspace_id) = invitation.workspace_id {
         let domain_str = domain::workspace_domain(workspace_id);
         let permissions =
-            ::access::get_permissions_for_role(state.access(), &domain_str, &role_key)
+            ::access::get_permissions_for_role(state.access()?, &domain_str, &role_key)
                 .await
                 .map_err(CoreError::from)?;
 
@@ -355,7 +355,7 @@ pub async fn revoke_invitation(
 
     state
         .authz
-        .require(actor.id, &domain_str, "invitations", "revoke")
+        .require(actor.id, &domain_str, "invitation", "revoke")
         .await?;
 
     let (tenant_filter, workspace_filter) = match target {
@@ -410,7 +410,7 @@ pub async fn list_invitations(
 
     state
         .authz
-        .require(actor.id, &domain_str, "invitations", "list")
+        .require(actor.id, &domain_str, "invitation", "list")
         .await?;
 
     let invitations = match target {
@@ -462,7 +462,7 @@ async fn validate_role(
     let role_key =
         ::access::RoleKey::parse(role).map_err(|e| CoreError::Validation(e.to_string()))?;
 
-    let exists = ::access::get_role(state.access(), &domain_str, &role_key)
+    let exists = ::access::get_role(state.access()?, &domain_str, &role_key)
         .await
         .map_err(CoreError::from)?
         .is_some();

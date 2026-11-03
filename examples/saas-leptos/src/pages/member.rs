@@ -78,7 +78,7 @@ pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, Ser
         .map_err(crate::error::core_error_to_server_fn)
 }
 
-/// Assigns `role_key` to `user_id` in `domain` (`(members, manage)` required
+/// Assigns `role_key` to `user_id` in `domain` (`(member, manage)` required
 /// via `saas::access::assign_role`).
 ///
 /// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
@@ -98,7 +98,7 @@ pub async fn assign_member_role(
         .map_err(crate::error::core_error_to_server_fn)
 }
 
-/// Removes `role_key` from `user_id` in `domain` (`(members, manage)` required
+/// Removes `role_key` from `user_id` in `domain` (`(member, manage)` required
 /// via `saas::member::remove_role`).
 ///
 /// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
@@ -174,7 +174,7 @@ pub(crate) async fn resolve_domain_tenant(
 // ─── Shared panel ───────────────────────────────────────────────────────────
 
 /// Inline member panel for a domain. Renders the member list and, when the
-/// actor has `(members, manage)`, per-role remove buttons, a role- and
+/// actor has `(member, manage)`, per-role remove buttons, a role- and
 /// member-select "Assign role" form, and an "Invite instead" link to
 /// `scope_url`.
 ///
@@ -236,7 +236,7 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
     });
 
     let can_manage = move || {
-        perms.with(|p| p.contains(&("members".to_string(), "manage".to_string())))
+        perms.with(|p| p.contains(&("member".to_string(), "manage".to_string())))
     };
 
     let cache_submit = cache.clone();

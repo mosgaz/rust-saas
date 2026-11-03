@@ -21,8 +21,8 @@
 //! available to library consumers who do not want an implicit owner.
 //!
 //! **`list_tenants` / `suspend_tenant` / `activate_tenant`** delegate to
-//! `saas::platform::*` (Stage 3f). They require `(tenants, list)` /
-//! `(tenants, manage)` in `PLATFORM_DOMAIN`; a non-platform-admin gets
+//! `saas::platform::*` (Stage 3f). They require `(tenant, list)` /
+//! `(tenant, manage)` in `PLATFORM_DOMAIN`; a non-platform-admin gets
 //! HTTP 403 (`CoreError::Forbidden`).
 //!
 //! **`list_audit`** is the only `#[server]` that does not have a
@@ -112,7 +112,7 @@ pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
     Ok(tenant)
 }
 
-/// Lists every tenant on the platform. Requires `(tenants, list)` in
+/// Lists every tenant on the platform. Requires `(tenant, list)` in
 /// `PLATFORM_DOMAIN`.
 #[server]
 pub async fn list_tenants(limit: i64, offset: i64) -> Result<domain::Page<Tenant>, ServerFnError> {
@@ -124,7 +124,7 @@ pub async fn list_tenants(limit: i64, offset: i64) -> Result<domain::Page<Tenant
 }
 
 /// Suspends a tenant. Idempotent; emits `tenant.suspended` only on a
-/// transition (`active` → `suspended`). Requires `(tenants, manage)` in
+/// transition (`active` → `suspended`). Requires `(tenant, manage)` in
 /// `PLATFORM_DOMAIN`.
 #[server]
 pub async fn suspend_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
@@ -136,7 +136,7 @@ pub async fn suspend_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
 }
 
 /// Activates a suspended tenant. Idempotent; emits `tenant.activated` only
-/// on a transition (`suspended` → `active`). Requires `(tenants, manage)`
+/// on a transition (`suspended` → `active`). Requires `(tenant, manage)`
 /// in `PLATFORM_DOMAIN`.
 #[server]
 pub async fn activate_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
@@ -235,7 +235,7 @@ pub fn PlatformTenantListPage() -> impl IntoView {
     });
 
     let can_manage = move || {
-        perms.with(|p| p.contains(&("tenants".to_string(), "manage".to_string())))
+        perms.with(|p| p.contains(&("tenant".to_string(), "manage".to_string())))
     };
 
     let submit = move |_| {

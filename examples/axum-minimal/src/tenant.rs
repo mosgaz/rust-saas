@@ -11,7 +11,7 @@
 //!   `actor == owner`: the caller becomes the tenant's `owner`. Same
 //!   behaviour as `saas-leptos`'s `#[server] create_tenant`
 //!   (`pages/platform.rs`), which keeps the name `create_tenant` and
-//!   delegates to `provision_tenant` with `owner = actor`. `(tenants,
+//!   delegates to `provision_tenant` with `owner = actor`. `(tenant,
 //!   create)` in `PLATFORM_DOMAIN` is enforced inside the service.
 //!
 //! **No `resolve_active_tenant` in `create_tenant`.** Provisioning creates
@@ -52,7 +52,7 @@ pub async fn list_my_tenants(
     // Note: `list_memberships` is a membership query; pagination is over
     // the user's memberships. We keep this as a full list for now — the
     // paged version lives in `saas::platform::list_tenants_paged` (which
-    // needs `(tenants, list)`), not in `list_memberships`. Full response
+    // needs `(tenant, list)`), not in `list_memberships`. Full response
     // wrapped in `Page` with `total = items.len()` so the wire format is
     // uniform with `/audit`.
     let items = saas::tenant::list_memberships(&_state.saas, &_user).await?;
@@ -78,7 +78,7 @@ pub struct CreateTenantRequest {
 ///
 /// Delegates to `saas::platform::provision_tenant` with
 /// `owner_role_key = "owner"`, `owner = actor` — the same contract as
-/// `saas-leptos`'s `#[server] create_tenant`. Requires `(tenants, create)`
+/// `saas-leptos`'s `#[server] create_tenant`. Requires `(tenant, create)`
 /// in `PLATFORM_DOMAIN`; the `require` lives inside the service.
 pub async fn create_tenant(
     State(state): State<Arc<AppState>>,

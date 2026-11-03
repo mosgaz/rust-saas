@@ -4,7 +4,7 @@
 -- reference table and grants them to the existing `platform` owner role.
 --
 -- `permissions` has no domain column: the same `(resource, action)` may be
--- referenced by roles in any domain. `(tenants, list)` and `(tenants,
+-- referenced by roles in any domain. `(tenant, list)` and `(tenant,
 -- manage)` are checked against `PLATFORM_DOMAIN`; `(audit, read)` gates the
 -- platform audit view (`/platform/audit`). All three are platform-scoped
 -- in practice, but the reference table does not encode domain ownership.
@@ -16,17 +16,17 @@
 -- inserts idempotent.
 
 insert into permissions (resource, action, description) values
-    ('tenants', 'list',   'List tenants (platform domain)'),
-    ('tenants', 'manage', 'Suspend or activate tenants (platform domain)'),
-    ('audit',   'read',   'Read the platform audit log (platform domain)')
+    ('tenant', 'list',   'List tenants (platform domain)'),
+    ('tenant', 'manage', 'Suspend or activate tenants (platform domain)'),
+    ('audit', 'read',   'Read the platform audit log (platform domain)')
 on conflict do nothing;
 
 insert into role_permissions (role_id, resource, action)
 select r.id, p.resource, p.action
 from roles r
 cross join (values
-    ('tenants', 'list'),
-    ('tenants', 'manage'),
+    ('tenant', 'list'),
+    ('tenant', 'manage'),
     ('audit', 'read')
 ) as p(resource, action)
 where r.domain = 'platform' and r.key = 'owner'

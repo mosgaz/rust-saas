@@ -24,3 +24,5 @@ tokio.workspace = true
 chrono.workspace = true
 sqlx = { workspace = true, features = ["macros"] }
 audit-pg = { path = "../audit-pg" }
+anyhow.workspace = true
+authz-casbin = { path = "../authz-casbin" }

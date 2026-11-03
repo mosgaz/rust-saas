@@ -19,6 +19,8 @@ saas = { path = "../saas", optional = true }
 db = { path = "../db", optional = true }
 rate-limiter = { path = "../rate-limiter" }
 audit-pg = { path = "../audit-pg", optional = true }
+anyhow = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -31,6 +33,8 @@ ssr = [
     "dep:saas",
     "dep:db",
     "dep:audit-pg",
+    "dep:anyhow",
+    "dep:sqlx",
 ]
 hydrate = []
 rate-limiter-redis = ["rate-limiter/redis"]

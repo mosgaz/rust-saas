@@ -103,7 +103,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Platform {
-                                    resource: "tenants",
+                                    resource: "tenant",
                                     action: "list",
                                 }
                             >
@@ -139,10 +139,10 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::TenantAny(vec![
-                                    ("workspaces", "create"),
-                                    ("members", "list"),
-                                    ("roles", "list"),
-                                    ("invitations", "list"),
+                                    ("workspace", "create"),
+                                    ("member", "list"),
+                                    ("role", "list"),
+                                    ("invitation", "list"),
                                 ])
                             >
                                 <pages::tenant::TenantPage />
@@ -154,7 +154,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Tenant {
-                                    resource: "invitations",
+                                    resource: "invitation",
                                     action: "list",
                                 }
                             >
@@ -167,7 +167,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Tenant {
-                                    resource: "members",
+                                    resource: "member",
                                     action: "list",
                                 }
                             >
@@ -180,7 +180,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Tenant {
-                                    resource: "roles",
+                                    resource: "role",
                                     action: "list",
                                 }
                             >
@@ -193,7 +193,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Tenant {
-                                    resource: "roles",
+                                    resource: "role",
                                     action: "manage",
                                 }
                             >
@@ -216,11 +216,11 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::WorkspaceAny(vec![
-                                    ("documents", "read"),
-                                    ("documents", "write"),
-                                    ("members", "list"),
-                                    ("roles", "list"),
-                                    ("invitations", "list"),
+                                    ("document", "read"),
+                                    ("document", "write"),
+                                    ("member", "list"),
+                                    ("role", "list"),
+                                    ("invitation", "list"),
                                 ])
                             >
                                 <pages::workspace::WorkspacePage />
@@ -232,7 +232,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Workspace {
-                                    resource: "documents",
+                                    resource: "document",
                                     action: "read",
                                 }
                             >
@@ -245,7 +245,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Workspace {
-                                    resource: "invitations",
+                                    resource: "invitation",
                                     action: "list",
                                 }
                             >
@@ -258,7 +258,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Workspace {
-                                    resource: "members",
+                                    resource: "member",
                                     action: "list",
                                 }
                             >
@@ -271,7 +271,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Workspace {
-                                    resource: "roles",
+                                    resource: "role",
                                     action: "list",
                                 }
                             >
@@ -284,7 +284,7 @@ pub fn App() -> impl IntoView {
                         view=move || view! {
                             <GuardRoute
                                 guard=RouteGuard::Workspace {
-                                    resource: "roles",
+                                    resource: "role",
                                     action: "manage",
                                 }
                             >

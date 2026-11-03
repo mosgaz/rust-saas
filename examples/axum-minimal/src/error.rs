@@ -161,7 +161,10 @@ fn status_for_authn(e: &AuthnError) -> StatusCode {
 
 fn status_for_access(e: &AccessError) -> StatusCode {
     match e {
-        AccessError::Validation(_) | AccessError::InvalidRoleKey(_) => StatusCode::BAD_REQUEST,
+        AccessError::Validation(_)
+        | AccessError::InvalidRoleKey(_)
+        | AccessError::UnknownResourceType { .. }
+        | AccessError::ScopeMismatch { .. } => StatusCode::BAD_REQUEST,
         AccessError::Forbidden | AccessError::Protected | AccessError::Immutable => {
             StatusCode::FORBIDDEN
         }

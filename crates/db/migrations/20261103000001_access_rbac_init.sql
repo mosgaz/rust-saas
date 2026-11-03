@@ -44,19 +44,19 @@ create table role_permissions (
 
 -- Populate the reference table.
 insert into permissions (resource, action, description) values
-    ('tenants', 'create', 'Create tenants (platform domain)'),
-    ('workspaces', 'create', 'Create workspaces (tenant domain)'),
-    ('documents', 'read', 'Read documents (workspace domain)'),
-    ('documents', 'write', 'Create or modify documents (workspace domain)'),
-    ('members', 'manage', 'Manage members (workspace domain)'),
-    ('invitations', 'create', 'Create invitations (tenant/workspace domain)'),
-    ('invitations', 'revoke', 'Revoke invitations'),
-    ('invitations', 'list', 'List invitations'),
-    ('roles', 'create', 'Create roles in domain'),
-    ('roles', 'manage', 'Modify roles'),
-    ('roles', 'delete', 'Delete roles'),
-    ('roles', 'list', 'List roles'),
-    ('roles', 'grant', 'Assign or revoke roles');
+    ('tenant', 'create', 'Create tenants (platform domain)'),
+    ('workspace', 'create', 'Create workspaces (tenant domain)'),
+    ('document', 'read', 'Read documents (workspace domain)'),
+    ('document', 'write', 'Create or modify documents (workspace domain)'),
+    ('member', 'manage', 'Manage members (workspace domain)'),
+    ('invitation', 'create', 'Create invitations (tenant/workspace domain)'),
+    ('invitation', 'revoke', 'Revoke invitations'),
+    ('invitation', 'list', 'List invitations'),
+    ('role', 'create', 'Create roles in domain'),
+    ('role', 'manage', 'Modify roles'),
+    ('role', 'delete', 'Delete roles'),
+    ('role', 'list', 'List roles'),
+    ('role', 'grant', 'Assign or revoke roles');
 
 -- Bootstrap the platform owner role.
 insert into roles (domain, key, name, description, protected, immutable)

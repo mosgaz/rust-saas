@@ -14,7 +14,7 @@
 //! `authz::AuthorizationEngine`.
 //!
 //! Invariant (§5 p.5): every mutation service calls
-//! `authz.require(actor.id, domain, "roles", "<action>")` first, except the
+//! `authz.require(actor.id, domain, "role", "<action>")` first, except the
 //! following helpers (no `actor`, called after `require` in a caller):
 //! `get_role`, `get_role_by_id`, `delete_role_by_id`,
 //! `get_permissions_for_role`, `list_permissions`, `create_owner_role`.
@@ -38,6 +38,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 mod permission;
+pub mod registry;
 mod role;
 
 pub use permission::list_permissions_paged;
@@ -50,6 +51,8 @@ pub use role::{
     create_owner_role, create_role, delete_role, delete_role_by_id, get_role, get_role_by_id,
     list_roles_paged, update_role,
 };
+
+pub use registry::{ResourceScope, ResourceType};
 
 /// Errors produced by `access::*`.
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +69,16 @@ pub enum AccessError {
     /// `permissions` has no row for `(resource, action)`.
     #[error("permission not found: {0}:{1}")]
     PermissionNotFound(String, String),
+    /// `resource_types` has no row for `name`.
+    #[error("unknown resource type: {name}")]
+    UnknownResourceType { name: String },
+    /// `bootstrap_resource_type` refused a scope change for an existing type.
+    #[error("resource scope mismatch for `{name}`: existing={existing}, requested={requested}")]
+    ScopeMismatch {
+        name: String,
+        existing: String,
+        requested: String,
+    },
     /// `update_role`/`delete_role` refused a `protected=true` role.
     #[error("role is protected")]
     Protected,
@@ -97,6 +110,7 @@ impl From<authz::AuthzError> for AccessError {
         match e {
             authz::AuthzError::Forbidden => AccessError::Forbidden,
             authz::AuthzError::Internal(s) => AccessError::Internal(s),
+            authz::AuthzError::ReloadError(s) => AccessError::Internal(s),
         }
     }
 }

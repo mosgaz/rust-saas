@@ -83,8 +83,11 @@ async fn main() -> anyhow::Result<()> {
     // Grant platform admin the `owner` role in the `platform` domain.
     // Bootstrap-only: direct `authz.grant_role`, no `member.role_assigned`
     // audit event (matching `provision_tenant`/`create_workspace`).
+    let access_state = state
+        .access()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let platform_perms =
-        ::access::get_permissions_for_role(state.access(), "platform", &owner_key).await?;
+        ::access::get_permissions_for_role(access_state, "platform", &owner_key).await?;
     state
         .authz()
         .grant_role(
@@ -125,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     {
         Some(w) => w,
         None => {
-            tenant::create_workspace(
+            tenant::create_workspace_with_owner(
                 &state,
                 &tenant_owner,
                 tenant.id,
@@ -157,8 +160,8 @@ async fn main() -> anyhow::Result<()> {
             "Editor".to_string(),
             "Can edit documents".to_string(),
             &[
-                ("documents".to_string(), "read".to_string()),
-                ("documents".to_string(), "write".to_string()),
+                ("document".to_string(), "read".to_string()),
+                ("document".to_string(), "write".to_string()),
             ],
         )
         .await?;
@@ -172,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
             &viewer_key,
             "Viewer".to_string(),
             "Can read documents".to_string(),
-            &[("documents".to_string(), "read".to_string())],
+            &[("document".to_string(), "read".to_string())],
         )
         .await?;
     }

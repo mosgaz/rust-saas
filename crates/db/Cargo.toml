@@ -9,3 +9,6 @@ description = "PostgreSQL connection helper and migrations runner"
 [dependencies]
 sqlx.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

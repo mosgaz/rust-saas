@@ -15,7 +15,7 @@
 //!   auth endpoints). Anonymous → 401 before the handler runs.
 //! - **Permission** on the paths where the domain is unambiguous from
 //!   `(method, path)`:
-//!   - `POST /tenants`   → `PLATFORM_DOMAIN` + `(tenants, create)`
+//!   - `POST /tenants`   → `PLATFORM_DOMAIN` + `(tenant, create)`
 //!   - `GET  /audit`     → `PLATFORM_DOMAIN` + `(audit, read)`
 //! - **Pass-through** where the scope id arrives in the body (which a
 //!   middleware cannot inspect without buffering and re-parsing):
@@ -79,7 +79,7 @@ pub async fn auth_layer(
     // Path-level permission check, where the domain is known from path.
     let method = req.method().clone();
     let checked = if method == Method::POST && path == "/tenants" {
-        check_perm(&app_state, &user, domain::PLATFORM_DOMAIN, "tenants", "create").await
+        check_perm(&app_state, &user, domain::PLATFORM_DOMAIN, "tenant", "create").await
     } else if method == Method::GET && path == "/audit" {
         check_perm(&app_state, &user, domain::PLATFORM_DOMAIN, "audit", "read").await
     } else {

@@ -39,7 +39,6 @@ services:
     networks:
       - rust_saas_net
 
-
   # Stage 4.8: Redis для distributed rate limiter.
   # Если REDIS_URL не задан, приложения используют InMemoryRateLimiter.
   redis:
@@ -56,8 +55,36 @@ services:
     networks:
       - rust_saas_net
 
+  # pgAdmin 4 — web GUI для Postgres.
+  # UI:     http://localhost:5050
+  # Login:  admin@example.com / admin
+  # Server (внутри docker-сети): host=postgres port=5432 db=rust_saas user=postgres password=postgres
+  # Volume pgadmin_data сохраняет настройки/сохранённые серверы между рестартами.
+  pgadmin:
+    image: dpage/pgadmin4:9.8
+    container_name: rust-saas-pgadmin
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      # Desktop-режим: без master-password и без логина в команду.
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+      # Права на /var/lib/pgadmin (иначе падает с permission denied на свежем volume).
+      PGADMIN_CONFIG_UPGRADE_CHECK_ENABLED: 'False'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - rust_saas_net
+
 volumes:
   rust_saas_pg_data:
+  pgadmin_data:
 
 networks:
   rust_saas_net:
