@@ -618,9 +618,14 @@ async fn owner_sync_trigger_writes_casbin_rule_p(pool: PgPool) {
     );
 
     // (2) Trigger: a NEW `(resource, action)` gets a `p`-row.
+    //
+    // Resource `document` is pre-declared in `resource_types` (A1.1), so
+    // this INSERT satisfies the FK `permissions.resource →
+    // resource_types.name` (A1.3). The action is novel — that is what
+    // fires the trigger.
     sqlx::query(
         "insert into permissions (resource, action, description) \
-         values ('test_resource', 'test_action', 'A1.2 regression probe')",
+         values ('document', 'test_action_a1_2', 'A1.2 regression probe')",
     )
     .execute(&pool)
     .await
@@ -630,7 +635,7 @@ async fn owner_sync_trigger_writes_casbin_rule_p(pool: PgPool) {
         "select count(*) from role_permissions rp \
          join roles r on r.id = rp.role_id \
          where r.key = 'owner' and r.domain = 'platform' \
-           and rp.resource = 'test_resource' and rp.action = 'test_action'",
+           and rp.resource = 'document' and rp.action = 'test_action_a1_2'",
     )
     .fetch_one(&pool)
     .await
@@ -640,7 +645,7 @@ async fn owner_sync_trigger_writes_casbin_rule_p(pool: PgPool) {
     let p_rows: i64 = sqlx::query_scalar(
         "select count(*) from casbin_rule \
          where ptype = 'p' and v0 = 'owner' and v1 = 'platform' \
-           and v2 = 'test_resource' and v3 = 'test_action'",
+           and v2 = 'document' and v3 = 'test_action_a1_2'",
     )
     .fetch_one(&pool)
     .await
