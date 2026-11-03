@@ -7,9 +7,18 @@ const TTL: Duration = Duration::from_secs(30);
 /// Клиентский кэш разрешений (permissions) с TTL 30 секунд.
 /// Используется для уменьшения количества запросов к серверной функции `my_permissions`
 /// при навигации между страницами и после мутаций (assign/remove/change role).
+/// Кэш разрешений: `domain -> (Instant, Vec<(resource, action)>)`.
+type PermsMap = HashMap<String, (Instant, Vec<(String, String)>)>;
+
 #[derive(Clone)]
 pub struct PermsCache {
-    map: RwSignal<HashMap<String, (Instant, Vec<(String, String)>)>>,
+    map: RwSignal<PermsMap>,
+}
+
+impl Default for PermsCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PermsCache {

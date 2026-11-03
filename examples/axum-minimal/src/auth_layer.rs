@@ -50,7 +50,7 @@ use crate::state::AppState;
 const PUBLIC_AUTH_PATHS: &[&str] = &["/auth/register", "/auth/login", "/auth/logout"];
 
 fn is_public_auth(path: &str) -> bool {
-    PUBLIC_AUTH_PATHS.iter().any(|p| path == *p)
+    PUBLIC_AUTH_PATHS.contains(&path)
 }
 
 /// `AuthLayer` middleware. Attach to the protected router **inside**
@@ -86,7 +86,7 @@ pub async fn auth_layer(
         Ok(())
     };
     if let Err(rejection) = checked {
-        return rejection;
+        return *rejection;
     }
 
     next.run(req).await
@@ -98,7 +98,7 @@ async fn check_perm(
     domain: &str,
     resource: &str,
     action: &str,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let perms = match saas::access::my_permissions(&state.saas, user, domain).await {
         Ok(p) => p,
         Err(e) => {
@@ -108,7 +108,7 @@ async fn check_perm(
                 actor_id = %user.id,
                 "auth_layer: my_permissions failed"
             );
-            return Err(internal_error());
+            return Err(Box::new(internal_error()));
         }
     };
     if perms
@@ -117,7 +117,7 @@ async fn check_perm(
     {
         Ok(())
     } else {
-        Err(forbidden())
+        Err(Box::new(forbidden()))
     }
 }
 

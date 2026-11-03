@@ -87,7 +87,7 @@ pub async fn create_tenant(
 ) -> Result<impl IntoResponse, AppError> {
     let user = current.require()?;
 
-    let owner_key = RoleKey::parse("owner").map_err(|e| AppError::Access(e))?;
+    let owner_key = RoleKey::parse("owner").map_err(AppError::Access)?;
 
     let tenant: Tenant =
         saas::platform::provision_tenant(&state.saas, &user, body.name, &user, &owner_key)

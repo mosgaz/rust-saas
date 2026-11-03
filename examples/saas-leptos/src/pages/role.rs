@@ -537,8 +537,6 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
             </ul>
 
             {move || if can("roles", "create") {
-                let member_opts = ();
-                let _ = member_opts;
                 // `submit_create` is `FnMut + Clone`; clone per render so this
                 // outer render closure does not move it out.
                 let submit_create = submit_create.clone();
