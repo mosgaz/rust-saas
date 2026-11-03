@@ -214,6 +214,7 @@ pub async fn bootstrap_resource_types(
     // Two passes would be needed inside the tx anyway (scope is a PK
     // column and cannot be changed via `ON CONFLICT DO UPDATE`); doing it
     // outside keeps the error path free of rollbacks.
+    // Pre-flight 1: scope changes against existing rows.
     for r in resources {
         if let Some(existing) =
             sqlx::query_scalar::<_, String>("select scope from resource_types where name = $1")
@@ -227,6 +228,30 @@ pub async fn bootstrap_resource_types(
                     existing,
                     requested: r.scope.as_str().to_string(),
                 });
+            }
+        }
+    }
+
+    // Pre-flight 2: in-batch scope conflicts. `[course:workspace,
+    // course:tenant]` would otherwise slip through: the second insert hits
+    // `on conflict do nothing` (scope is not in `do update set`), leaving
+    // one row with no error.
+    {
+        use std::collections::HashMap;
+        let mut seen: HashMap<&str, &str> = HashMap::with_capacity(resources.len());
+        for r in resources {
+            let s = r.scope.as_str();
+            match seen.get(r.name.as_str()) {
+                Some(&prev) if prev != s => {
+                    return Err(AccessError::ScopeMismatch {
+                        name: r.name.clone(),
+                        existing: prev.to_string(),
+                        requested: s.to_string(),
+                    });
+                }
+                _ => {
+                    seen.insert(r.name.as_str(), s);
+                }
             }
         }
     }
@@ -252,7 +277,15 @@ pub async fn bootstrap_resource_types(
         )
         .bind(&r.name)
         .bind(r.scope.as_str())
-        .bind(&r.default_actions)
+        .bind({
+            // Sort before binding: `on conflict do update set
+            // default_actions = array_agg(distinct x order by x)` would
+            // sort on merge, but a fresh INSERT preserves input order.
+            // Sorting unconditionally keeps the two paths identical.
+            let mut a = r.default_actions.clone();
+            a.sort();
+            a
+        })
         .bind(&r.metadata)
         .bind(&r.description)
         .execute(&mut *tx)
