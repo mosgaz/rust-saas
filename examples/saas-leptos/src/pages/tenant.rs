@@ -64,7 +64,7 @@ pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace
         .map_err(crate::error::core_error_to_server_fn)?;
     let tenant_id = active.id;
 
-    saas::tenant::create_workspace(&state.saas, &user, tenant_id, name, &user, &owner_key)
+    saas::tenant::create_workspace_with_owner(&state.saas, &user, tenant_id, name, &user, &owner_key)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }

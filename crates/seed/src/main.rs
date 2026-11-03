@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     {
         Some(w) => w,
         None => {
-            tenant::create_workspace(
+            tenant::create_workspace_with_owner(
                 &state,
                 &tenant_owner,
                 tenant.id,

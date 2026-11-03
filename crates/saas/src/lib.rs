@@ -307,10 +307,79 @@ pub mod tenant {
     use super::*;
     use audit::events;
 
-    /// Creates a workspace inside a tenant and assigns the owner as `owner_role_key`.
+    /// Creates a bare workspace inside a tenant (no owner).
     ///
-    /// Emits `workspace.created` (Stage 3e) after the transaction commits.
+    /// Emits `workspace.created` (Stage 3e) after the insert commits;
+    /// `metadata` is `{ name, tenant_id }` — no `owner_id` /
+    /// `owner_role_key` (there is no owner to record).
+    ///
+    /// **No-RBAC path.** Requires only `authz.require(actor, tenant,
+    /// "workspace", "create")` + a SQL insert; does **not** touch
+    /// `state.access()`. Works on both `with_access(..)` and
+    /// `without_access()` builds.
+    ///
+    /// The caller is responsible for assigning roles/membership
+    /// afterwards (`saas::access::assign_role` if RBAC is on, or the
+    /// consumer's own mechanism). For the one-shot "create + assign
+    /// owner" flow, use [`create_workspace_with_owner`].
     pub async fn create_workspace(
+        state: &SaasState,
+        actor: &AuthUser,
+        tenant_id: Uuid,
+        name: String,
+    ) -> Result<Workspace, CoreError> {
+        let domain_str = domain::tenant_domain(tenant_id);
+
+        state
+            .authz
+            .require(actor.id, &domain_str, "workspace", "create")
+            .await?;
+
+        let workspace = sqlx::query_as::<_, Workspace>(
+            r#"
+            insert into workspaces (tenant_id, name)
+            values ($1, $2)
+            returning id, tenant_id, name, created_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&name)
+        .fetch_one(&state.pool)
+        .await?;
+
+        state
+            .audit_or_warn(AuditEvent {
+                event_type: events::WORKSPACE_CREATED.into(),
+                actor_id: Some(actor.id),
+                actor_email: Some(actor.email.clone()),
+                target_type: Some("workspace".into()),
+                target_id: Some(workspace.id),
+                metadata: serde_json::json!({
+                    "name": name,
+                    "tenant_id": tenant_id.to_string(),
+                }),
+            })
+            .await;
+
+        Ok(workspace)
+    }
+
+    /// Creates a workspace inside a tenant and assigns `owner` as
+    /// `owner_role_key` (RBAC path; requires `AccessState`).
+    ///
+    /// Emits `workspace.created` (Stage 3e) after the transaction
+    /// commits; `metadata` carries `owner_id` / `owner_role_key`.
+    ///
+    /// **Renamed from `create_workspace` in Stage 5.0-A2.2c** to free
+    /// the old name for the no-RBAC path
+    /// ([`create_workspace`]). Callers that want owner assignment on
+    /// workspace creation use this function; callers that want a bare
+    /// workspace (and assign the owner separately via
+    /// `saas::access::assign_role`) use [`create_workspace`].
+    ///
+    /// Requires `state.access()`; fails with `Internal("RBAC not
+    /// configured")` on a `without_access()` build.
+    pub async fn create_workspace_with_owner(
         state: &SaasState,
         actor: &AuthUser,
         tenant_id: Uuid,
@@ -843,14 +912,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_workspace_requires_tenant_workspaces_create() {
+    async fn create_workspace_with_owner_requires_tenant_workspaces_create() {
         let mock = Arc::new(MockAuthz::denying());
         let state = lazy_state(mock.clone());
         let actor = actor();
         let tenant_id = Uuid::new_v4();
         let role_key = RoleKey::parse("owner").unwrap();
 
-        let err = tenant::create_workspace(
+        let err = tenant::create_workspace_with_owner(
             &state,
             &actor,
             tenant_id,

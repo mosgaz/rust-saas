@@ -85,7 +85,7 @@ pub struct CreateWorkspaceRequest {
 /// 1. `resolve_active_tenant(state, actor, tenant_id)` — non-member →
 ///    `Forbidden` (403); suspended → `TenantSuspended` (403); missing →
 ///    `NotFound` (404).
-/// 2. `saas::tenant::create_workspace(..., owner = actor, owner_role =
+/// 2. `saas::tenant::create_workspace_with_owner(..., owner = actor, owner_role =
 ///    "owner")` — the same call `saas-leptos` makes in
 ///    `pages::tenant::create_workspace`.
 pub async fn create_workspace(
@@ -101,7 +101,7 @@ pub async fn create_workspace(
         saas::platform::resolve_active_tenant(&state.saas, &user, body.tenant_id).await?;
     let tenant_id = active.id;
 
-    let ws: Workspace = saas::tenant::create_workspace(
+    let ws: Workspace = saas::tenant::create_workspace_with_owner(
         &state.saas,
         &user,
         tenant_id,

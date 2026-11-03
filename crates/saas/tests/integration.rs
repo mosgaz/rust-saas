@@ -272,7 +272,7 @@ async fn create_workspace_grants_owner_and_membership(pool: PgPool) {
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -318,7 +318,7 @@ async fn platform_admin_cannot_create_document_without_workspace_role(pool: PgPo
         .await
         .unwrap();
 
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &owner,
         tenant.id,
@@ -346,7 +346,7 @@ async fn cross_workspace_isolation(pool: PgPool) {
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(
+    let ws1 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -356,7 +356,7 @@ async fn cross_workspace_isolation(pool: PgPool) {
     )
     .await
     .unwrap();
-    let ws2 = tenant::create_workspace(
+    let ws2 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -441,7 +441,7 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
         .await
         .unwrap();
 
-    let ws1 = tenant::create_workspace(
+    let ws1 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -451,7 +451,7 @@ async fn list_memberships_returns_only_member_workspaces(pool: PgPool) {
     )
     .await
     .unwrap();
-    let ws2 = tenant::create_workspace(
+    let ws2 = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -567,7 +567,7 @@ async fn create_workspace_invitation_persists_row_and_returns_token(pool: PgPool
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -682,7 +682,7 @@ async fn accept_workspace_invitation_grants_role_and_membership(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -923,7 +923,7 @@ async fn member_list_workspace_requires_list_permission(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -980,7 +980,7 @@ async fn member_change_role_replaces_role(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1072,7 +1072,7 @@ async fn member_change_role_same_key_is_noop(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1109,7 +1109,7 @@ async fn member_remove_role_removes_from_members_and_casbin(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1179,7 +1179,7 @@ async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1261,7 +1261,7 @@ async fn remove_role_last_protected_holder_is_rejected(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1418,7 +1418,7 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
         platform::provision_tenant(&ok_state, &admin, unique_name("Acme"), &admin, &owner_key)
             .await
             .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &ok_state,
         &admin,
         tenant.id,
@@ -1548,7 +1548,7 @@ async fn delete_role_purges_casbin_and_members(pool: PgPool) {
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -1998,7 +1998,7 @@ async fn create_workspace_emits_workspace_created(pool: PgPool) {
             .await
             .unwrap();
 
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -2140,7 +2140,7 @@ async fn change_role_emits_three_events(pool: PgPool) {
         platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &admin, &owner_key)
             .await
             .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -2772,7 +2772,7 @@ async fn delete_role_emits_role_deleted(pool: PgPool) {
         platform::provision_tenant(&saas, &admin, unique_name("AuditAcme"), &admin, &owner_key)
             .await
             .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,
@@ -2864,7 +2864,7 @@ async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPo
     let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
         .await
         .unwrap();
-    let ws = tenant::create_workspace(
+    let ws = tenant::create_workspace_with_owner(
         &saas,
         &admin,
         tenant.id,

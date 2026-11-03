@@ -76,7 +76,7 @@ async fn provision_tenant_and_workspace(
         .await
         .expect("provision_tenant");
 
-    let ws = saas::tenant::create_workspace(
+    let ws = saas::tenant::create_workspace_with_owner(
         saas,
         &owner,
         tenant.id,
