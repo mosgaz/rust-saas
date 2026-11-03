@@ -9,7 +9,7 @@ Older versions are not maintained.
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Instead, please use the [Private Vulnerability Reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability) feature on GitHub, or send an email to `security@mosgaz.dev` (replace with actual email if needed).
+Instead, please use the [Private Vulnerability Reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability) feature on GitHub, or send an email to `mosgaz@list.ru`.
 
 Please include:
 - A description of the vulnerability.

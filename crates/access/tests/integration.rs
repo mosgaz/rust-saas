@@ -146,8 +146,8 @@ async fn create_role_persists_role_and_permissions(pool: PgPool) {
     let key = RoleKey::parse("test_role").unwrap();
 
     let permissions = vec![
-        ("documents".to_string(), "read".to_string()),
-        ("documents".to_string(), "write".to_string()),
+        ("document".to_string(), "read".to_string()),
+        ("document".to_string(), "write".to_string()),
     ];
 
     let role = access::create_role(
@@ -232,7 +232,7 @@ async fn get_role_and_get_permissions_for_role(pool: PgPool) {
         &key,
         "Custom".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -245,7 +245,7 @@ async fn get_role_and_get_permissions_for_role(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(perms.len(), 1);
-    assert_eq!(perms[0], ("documents".to_string(), "read".to_string()));
+    assert_eq!(perms[0], ("document".to_string(), "read".to_string()));
 
     let missing = access::get_role(&state, domain, &RoleKey::parse("missing").unwrap())
         .await

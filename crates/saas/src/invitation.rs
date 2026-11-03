@@ -89,7 +89,7 @@ pub async fn create_invitation(
 
     state
         .authz
-        .require(actor.id, &domain_str, "invitations", "create")
+        .require(actor.id, &domain_str, "invitation", "create")
         .await?;
 
     let (tenant_id, workspace_id) = match target {
@@ -355,7 +355,7 @@ pub async fn revoke_invitation(
 
     state
         .authz
-        .require(actor.id, &domain_str, "invitations", "revoke")
+        .require(actor.id, &domain_str, "invitation", "revoke")
         .await?;
 
     let (tenant_filter, workspace_filter) = match target {
@@ -410,7 +410,7 @@ pub async fn list_invitations(
 
     state
         .authz
-        .require(actor.id, &domain_str, "invitations", "list")
+        .require(actor.id, &domain_str, "invitation", "list")
         .await?;
 
     let invitations = match target {

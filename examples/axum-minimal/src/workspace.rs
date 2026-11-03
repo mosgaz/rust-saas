@@ -149,7 +149,7 @@ pub struct CreateDocumentRequest {
 ///    workspace's `tenant_id` (`NotFound` if the workspace is gone), then
 ///    calls `resolve_active_tenant` (membership + active status). Same
 ///    pattern as `saas-leptos::pages::workspace::create_document`.
-/// 2. `saas::workspace::create_document` — enforces `(documents, write)`
+/// 2. `saas::workspace::create_document` — enforces `(document, write)`
 ///    on `workspace:{id}` internally.
 pub async fn create_document(
     State(state): State<Arc<AppState>>,

@@ -1,7 +1,7 @@
 //! Role and permission wrappers over the `access` crate.
 //!
 //! Invariant (§5 p.5): every mutation service calls
-//! `authz.require(actor.id, domain, "roles", "<action>")` first.
+//! `authz.require(actor.id, domain, "role", "<action>")` first.
 //!
 //! `assign_role` and `revoke_role` update the `casbin_rule` (via
 //! `authz.grant_role`/`revoke_role`) and the `*_members` bookkeeping tables in
@@ -199,7 +199,7 @@ pub async fn update_role(
 /// 1. `access::get_role_by_id(role_id)` — obtain `domain`, `key`,
 ///    `protected` (no `actor`, §5 p.5).
 /// 2. Reject `protected=true` ([`CoreError::Forbidden`]).
-/// 3. `require(actor.id, role.domain, "roles", "delete")`.
+/// 3. `require(actor.id, role.domain, "role", "delete")`.
 /// 4. `authz.purge_role(domain, key)` — deletes all `g`-rows (`user →
 ///    role_key → domain`) and `p`-rows (`role_key → domain → resource →
 ///    action`) for this role in this domain.
@@ -231,7 +231,7 @@ pub async fn delete_role(
 
     state
         .authz()
-        .require(actor.id, &role.domain, "roles", "delete")
+        .require(actor.id, &role.domain, "role", "delete")
         .await?;
 
     state
@@ -351,7 +351,7 @@ pub async fn my_permissions(
 /// Assigns `role_key` to `user_id` in `domain`.
 ///
 /// Order:
-/// 1. `require(actor.id, domain, "roles", "grant")`.
+/// 1. `require(actor.id, domain, "role", "grant")`.
 /// 2. `::access::get_permissions_for_role(domain, role_key)` to fetch `p`-rows.
 /// 3. `INSERT` into `tenant_members` / `workspace_members` (bookkeeping).
 /// 4. `authz.grant_role(user_id, domain, role_key, permissions)`.
@@ -365,7 +365,7 @@ pub async fn assign_role(
 ) -> Result<(), CoreError> {
     state
         .authz()
-        .require(actor.id, domain, "roles", "grant")
+        .require(actor.id, domain, "role", "grant")
         .await?;
 
     let permissions = ::access::get_permissions_for_role(state.access(), domain, role_key)
@@ -436,7 +436,7 @@ pub async fn assign_role(
 /// Revokes `role_key` from `user_id` in `domain`.
 ///
 /// Order:
-/// 1. `require(actor.id, domain, "roles", "grant")`.
+/// 1. `require(actor.id, domain, "role", "grant")`.
 /// 2. `DELETE` from `tenant_members` / `workspace_members`.
 /// 3. `authz.revoke_role(user_id, domain, role_key)`.
 /// 4. Emit `member.role_revoked` (Stage 3e; target: user).
@@ -449,7 +449,7 @@ pub async fn revoke_role(
 ) -> Result<(), CoreError> {
     state
         .authz()
-        .require(actor.id, domain, "roles", "grant")
+        .require(actor.id, domain, "role", "grant")
         .await?;
 
     match parse_domain(domain) {

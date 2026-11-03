@@ -14,7 +14,7 @@
 //! `authz::AuthorizationEngine`.
 //!
 //! Invariant (§5 p.5): every mutation service calls
-//! `authz.require(actor.id, domain, "roles", "<action>")` first, except the
+//! `authz.require(actor.id, domain, "role", "<action>")` first, except the
 //! following helpers (no `actor`, called after `require` in a caller):
 //! `get_role`, `get_role_by_id`, `delete_role_by_id`,
 //! `get_permissions_for_role`, `list_permissions`, `create_owner_role`.

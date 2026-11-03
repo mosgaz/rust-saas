@@ -157,8 +157,8 @@ async fn main() -> anyhow::Result<()> {
             "Editor".to_string(),
             "Can edit documents".to_string(),
             &[
-                ("documents".to_string(), "read".to_string()),
-                ("documents".to_string(), "write".to_string()),
+                ("document".to_string(), "read".to_string()),
+                ("document".to_string(), "write".to_string()),
             ],
         )
         .await?;
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
             &viewer_key,
             "Viewer".to_string(),
             "Can read documents".to_string(),
-            &[("documents".to_string(), "read".to_string())],
+            &[("document".to_string(), "read".to_string())],
         )
         .await?;
     }

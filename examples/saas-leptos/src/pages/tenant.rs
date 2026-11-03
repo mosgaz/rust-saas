@@ -183,10 +183,10 @@ pub fn TenantPage() -> impl IntoView {
                     let has = |r: &str, a: &str| {
                         perms.iter().any(|(pr, pa)| pr == r && pa == a)
                     };
-                    can_create_workspace.set(has("workspaces", "create"));
-                    can_members.set(has("members", "list"));
-                    can_roles.set(has("roles", "list"));
-                    can_invitations.set(has("invitations", "list"));
+                    can_create_workspace.set(has("workspace", "create"));
+                    can_members.set(has("member", "list"));
+                    can_roles.set(has("role", "list"));
+                    can_invitations.set(has("invitation", "list"));
                 }
                 Err(_) => {
                     can_create_workspace.set(false);

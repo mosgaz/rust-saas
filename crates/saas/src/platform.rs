@@ -16,7 +16,7 @@
 //! `authz.grant_role` + `tenant_members` row).
 //!
 //! **Platform admin is not a superuser.** `list_tenants`, `suspend_tenant`,
-//! and `activate_tenant` require `(tenants, list|manage)` in
+//! and `activate_tenant` require `(tenant, list|manage)` in
 //! `PLATFORM_DOMAIN`; they do **not** grant the actor any role inside the
 //! target tenant (ADR-0002, handoff §2).
 //!
@@ -25,7 +25,7 @@
 //! (`Forbidden` if the actor is not a tenant member, `TenantSuspended` if
 //! the tenant's status is not `active`, `NotFound` if the tenant does not
 //! exist). Membership is checked via `EXISTS tenant_members` — not
-//! `authz.require(tenants, read)` — so that workspace-only roles
+//! `authz.require(tenant, read)` — so that workspace-only roles
 //! (`editor`/`viewer`) can pass (ADR-0002 rev.2 §2.4). `#[server]`
 //! functions in the example call this before any mutation of tenant-scoped
 //! resources (ADR-0002 §3); reads do not resolve.
@@ -65,7 +65,7 @@ pub async fn create_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "create")
         .await?;
 
     let tenant = sqlx::query_as::<_, Tenant>(
@@ -106,7 +106,7 @@ pub async fn provision_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "create")
         .await?;
 
     let mut tx = state.pool.begin().await?;
@@ -169,7 +169,7 @@ pub async fn provision_tenant(
 
 /// Lists every tenant on the platform, newest first, with pagination.
 ///
-/// Requires `(tenants, list)` in `PLATFORM_DOMAIN` (Stage 3f).
+/// Requires `(tenant, list)` in `PLATFORM_DOMAIN` (Stage 3f).
 /// Read-only: no audit emission.
 pub async fn list_tenants_paged(
     state: &SaasState,
@@ -179,7 +179,7 @@ pub async fn list_tenants_paged(
 ) -> Result<Page<Tenant>, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "list")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "list")
         .await?;
 
     let total: i64 = sqlx::query_scalar("select count(*) from tenants")
@@ -217,7 +217,7 @@ pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Ten
 
 /// Suspends a tenant (`tenants.status = 'suspended'`).
 ///
-/// Requires `(tenants, manage)` in `PLATFORM_DOMAIN`. Idempotent: emits
+/// Requires `(tenant, manage)` in `PLATFORM_DOMAIN`. Idempotent: emits
 /// `tenant.suspended` only on a transition (`active` → `suspended`); a
 /// no-op call on an already-suspended tenant returns the row unchanged and
 /// emits nothing. `NotFound` if the tenant does not exist.
@@ -236,7 +236,7 @@ pub async fn suspend_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "manage")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "manage")
         .await?;
 
     let updated = sqlx::query_as::<_, Tenant>(
@@ -283,7 +283,7 @@ pub async fn suspend_tenant(
 
 /// Activates a suspended tenant (`tenants.status = 'active'`).
 ///
-/// Symmetric to [`suspend_tenant`]: requires `(tenants, manage)` in
+/// Symmetric to [`suspend_tenant`]: requires `(tenant, manage)` in
 /// `PLATFORM_DOMAIN`; emits `tenant.activated` only on a transition
 /// (`suspended` → `active`); idempotent no-op returns the row with no
 /// emission; `NotFound` if the tenant does not exist.
@@ -295,7 +295,7 @@ pub async fn activate_tenant(
 ) -> Result<Tenant, CoreError> {
     state
         .authz
-        .require(actor.id, PLATFORM_DOMAIN, "tenants", "manage")
+        .require(actor.id, PLATFORM_DOMAIN, "tenant", "manage")
         .await?;
 
     let updated = sqlx::query_as::<_, Tenant>(
@@ -370,8 +370,8 @@ impl std::ops::Deref for ActiveTenant {
 ///
 /// Order (ADR-0002 rev.2 §2.4; decision A):
 /// 1. Membership check: `EXISTS (SELECT 1 FROM tenant_members WHERE
-///    tenant_id = $1 AND user_id = $2)`. **Not** `authz.require(tenants,
-///    read)` — an `editor`/`viewer` with no `(tenants, read)` permission in
+///    tenant_id = $1 AND user_id = $2)`. **Not** `authz.require(tenant,
+///    read)` — an `editor`/`viewer` with no `(tenant, read)` permission in
 ///    the tenant domain would otherwise be unable to load pages that
 ///    legitimately mutate their workspace. Membership is the right
 ///    precondition for "can I act in this tenant?".

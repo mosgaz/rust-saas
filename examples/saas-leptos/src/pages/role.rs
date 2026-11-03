@@ -103,7 +103,7 @@ pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> 
 /// Uses `access::get_role_by_id` (no `actor`, §5 p.5 helper): any
 /// authenticated user who knows the `role_id` can read its metadata. The
 /// mutation (`update_role`) performs `authz.require(actor, domain,
-/// "roles", "manage")` server-side. Read-only; no `resolve_active_tenant`.
+/// "role", "manage")` server-side. Read-only; no `resolve_active_tenant`.
 #[server]
 pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
@@ -317,9 +317,9 @@ fn PermissionCheckboxes(
 // ─── Shared list panel ──────────────────────────────────────────────────────
 
 /// Inline roles panel. Lists roles in `domain`, offers an Edit button per
-/// non-protected/non-immutable role (if `(roles, manage)`), a Delete button
-/// per non-protected role (if `(roles, delete)`), and an inline create form
-/// (if `(roles, create)`) with permission checkboxes.
+/// non-protected/non-immutable role (if `(role, manage)`), a Delete button
+/// per non-protected role (if `(role, delete)`), and an inline create form
+/// (if `(role, create)`) with permission checkboxes.
 #[component]
 pub fn RoleListPage(domain: String) -> impl IntoView {
     let domain = StoredValue::new(domain);
@@ -447,10 +447,10 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
                                     .join(", ");
                                 let edit_href = edit_url_for(&r);
                                 let can_manage = perms.with(|p| {
-                                    p.contains(&("roles".to_string(), "manage".to_string()))
+                                    p.contains(&("role".to_string(), "manage".to_string()))
                                 });
                                 let can_delete = perms.with(|p| {
-                                    p.contains(&("roles".to_string(), "delete".to_string()))
+                                    p.contains(&("role".to_string(), "delete".to_string()))
                                 });
                                 let show_edit =
                                     !protected && !immutable && can_manage && edit_href.is_some();
@@ -536,7 +536,7 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
                 }}
             </ul>
 
-            {move || if can("roles", "create") {
+            {move || if can("role", "create") {
                 // `submit_create` is `FnMut + Clone`; clone per render so this
                 // outer render closure does not move it out.
                 let submit_create = submit_create.clone();

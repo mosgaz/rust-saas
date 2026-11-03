@@ -33,8 +33,8 @@ async fn grant_role_grants_permissions_and_can_checks_them(pool: PgPool) {
     let role_key = "editor";
 
     let permissions = vec![
-        ("documents".to_string(), "read".to_string()),
-        ("documents".to_string(), "write".to_string()),
+        ("document".to_string(), "read".to_string()),
+        ("document".to_string(), "write".to_string()),
     ];
 
     authz
@@ -43,15 +43,15 @@ async fn grant_role_grants_permissions_and_can_checks_them(pool: PgPool) {
         .expect("grant_role must succeed");
 
     let can_read = authz
-        .can(user_id, domain, "documents", "read")
+        .can(user_id, domain, "document", "read")
         .await
         .unwrap();
     let can_write = authz
-        .can(user_id, domain, "documents", "write")
+        .can(user_id, domain, "document", "write")
         .await
         .unwrap();
     let can_delete = authz
-        .can(user_id, domain, "documents", "delete")
+        .can(user_id, domain, "document", "delete")
         .await
         .unwrap();
 
@@ -60,11 +60,11 @@ async fn grant_role_grants_permissions_and_can_checks_them(pool: PgPool) {
     assert!(!can_delete, "must not be able to delete");
 
     authz
-        .require(user_id, domain, "documents", "read")
+        .require(user_id, domain, "document", "read")
         .await
         .expect("require must pass");
     let err = authz
-        .require(user_id, domain, "documents", "delete")
+        .require(user_id, domain, "document", "delete")
         .await
         .expect_err("require must fail");
     assert!(matches!(err, AuthzError::Forbidden));
@@ -77,7 +77,7 @@ async fn revoke_role_removes_permissions(pool: PgPool) {
     let domain = "tenant:test-revoke";
     let role_key = "editor";
 
-    let permissions = vec![("documents".to_string(), "read".to_string())];
+    let permissions = vec![("document".to_string(), "read".to_string())];
 
     authz
         .grant_role(user_id, domain, role_key, &permissions)
@@ -85,7 +85,7 @@ async fn revoke_role_removes_permissions(pool: PgPool) {
         .unwrap();
 
     let can_before = authz
-        .can(user_id, domain, "documents", "read")
+        .can(user_id, domain, "document", "read")
         .await
         .unwrap();
     assert!(can_before, "must have permission before revoke");
@@ -96,7 +96,7 @@ async fn revoke_role_removes_permissions(pool: PgPool) {
         .expect("revoke_role must succeed");
 
     let can_after = authz
-        .can(user_id, domain, "documents", "read")
+        .can(user_id, domain, "document", "read")
         .await
         .unwrap();
     assert!(!can_after, "must not have permission after revoke");
@@ -109,7 +109,7 @@ async fn domain_isolation(pool: PgPool) {
     let domain_a = "tenant:a";
     let domain_b = "tenant:b";
 
-    let permissions = vec![("documents".to_string(), "read".to_string())];
+    let permissions = vec![("document".to_string(), "read".to_string())];
 
     authz
         .grant_role(user_id, domain_a, "editor", &permissions)
@@ -117,11 +117,11 @@ async fn domain_isolation(pool: PgPool) {
         .unwrap();
 
     let can_a = authz
-        .can(user_id, domain_a, "documents", "read")
+        .can(user_id, domain_a, "document", "read")
         .await
         .unwrap();
     let can_b = authz
-        .can(user_id, domain_b, "documents", "read")
+        .can(user_id, domain_b, "document", "read")
         .await
         .unwrap();
 
@@ -135,8 +135,8 @@ async fn multiple_roles_in_same_domain_are_additive(pool: PgPool) {
     let user_id = Uuid::new_v4();
     let domain = "workspace:test-multi";
 
-    let role1_perms = vec![("documents".to_string(), "read".to_string())];
-    let role2_perms = vec![("documents".to_string(), "write".to_string())];
+    let role1_perms = vec![("document".to_string(), "read".to_string())];
+    let role2_perms = vec![("document".to_string(), "write".to_string())];
 
     authz
         .grant_role(user_id, domain, "viewer", &role1_perms)
@@ -148,11 +148,11 @@ async fn multiple_roles_in_same_domain_are_additive(pool: PgPool) {
         .unwrap();
 
     let can_read = authz
-        .can(user_id, domain, "documents", "read")
+        .can(user_id, domain, "document", "read")
         .await
         .unwrap();
     let can_write = authz
-        .can(user_id, domain, "documents", "write")
+        .can(user_id, domain, "document", "write")
         .await
         .unwrap();
 
@@ -165,7 +165,7 @@ async fn grant_role_is_idempotent(pool: PgPool) {
     let authz = setup(&pool).await;
     let user_id = Uuid::new_v4();
     let domain = "tenant:test-idempotent";
-    let permissions = vec![("documents".to_string(), "read".to_string())];
+    let permissions = vec![("document".to_string(), "read".to_string())];
 
     authz
         .grant_role(user_id, domain, "editor", &permissions)
@@ -177,7 +177,7 @@ async fn grant_role_is_idempotent(pool: PgPool) {
         .expect("second grant must not fail");
 
     let can_read = authz
-        .can(user_id, domain, "documents", "read")
+        .can(user_id, domain, "document", "read")
         .await
         .unwrap();
     assert!(can_read, "permission must persist after duplicate grant");
@@ -202,7 +202,7 @@ async fn has_role_reflects_g_rows(pool: PgPool) {
             user_id,
             domain,
             "editor",
-            &[("documents".to_string(), "read".to_string())],
+            &[("document".to_string(), "read".to_string())],
         )
         .await
         .unwrap();
@@ -233,7 +233,7 @@ async fn has_role_reflects_g_rows(pool: PgPool) {
 async fn count_users_with_role_tracks_holders(pool: PgPool) {
     let authz = setup(&pool).await;
     let domain = "tenant:test-count";
-    let perms = vec![("documents".to_string(), "read".to_string())];
+    let perms = vec![("document".to_string(), "read".to_string())];
 
     let c0 = authz
         .count_users_with_role(domain, "owner")
@@ -277,8 +277,8 @@ async fn purge_role_removes_g_and_p_rows_and_is_idempotent(pool: PgPool) {
     let u1 = Uuid::new_v4();
     let u2 = Uuid::new_v4();
     let permissions = vec![
-        ("documents".to_string(), "read".to_string()),
-        ("members".to_string(), "list".to_string()),
+        ("document".to_string(), "read".to_string()),
+        ("member".to_string(), "list".to_string()),
     ];
 
     authz
@@ -331,7 +331,7 @@ async fn purge_role_removes_g_and_p_rows_and_is_idempotent(pool: PgPool) {
     assert_eq!(remaining, 0, "no rows must remain after purge");
 
     assert!(
-        !authz.can(u1, domain, "documents", "read").await.unwrap(),
+        !authz.can(u1, domain, "document", "read").await.unwrap(),
         "in-memory model must not grant permission after purge"
     );
     assert!(
@@ -352,7 +352,7 @@ async fn purge_role_leaves_other_roles_and_domains_intact(pool: PgPool) {
     let domain_a = "tenant:test-purge-scope-a";
     let domain_b = "tenant:test-purge-scope-b";
 
-    let perms = vec![("documents".to_string(), "read".to_string())];
+    let perms = vec![("document".to_string(), "read".to_string())];
     let u = Uuid::new_v4();
 
     authz
@@ -369,11 +369,11 @@ async fn purge_role_leaves_other_roles_and_domains_intact(pool: PgPool) {
     assert_eq!(deleted, 2, "one g-row + one p-row in domain_a");
 
     assert!(
-        authz.can(u, domain_a, "documents", "read").await.unwrap(),
+        authz.can(u, domain_a, "document", "read").await.unwrap(),
         "other role 'keep' must still grant permission in domain_a"
     );
     assert!(
-        authz.can(u, domain_b, "documents", "read").await.unwrap(),
+        authz.can(u, domain_b, "document", "read").await.unwrap(),
         "same role_key 'target' in domain_b must not be purged"
     );
     assert!(
@@ -397,9 +397,9 @@ async fn grant_role_is_idempotent_on_p_rows(pool: PgPool) {
     let role_key = "editor";
 
     let permissions = vec![
-        ("documents".to_string(), "read".to_string()),
-        ("documents".to_string(), "write".to_string()),
-        ("members".to_string(), "list".to_string()),
+        ("document".to_string(), "read".to_string()),
+        ("document".to_string(), "write".to_string()),
+        ("member".to_string(), "list".to_string()),
     ];
 
     authz
@@ -477,7 +477,7 @@ async fn unique_index_rejects_duplicates(pool: PgPool) {
     sqlx::query(
         r#"
         insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
-        values ('p', 'editor', 'tenant:idx-test', 'documents', 'read', '', '')
+        values ('p', 'editor', 'tenant:idx-test', 'document', 'read', '', '')
         "#,
     )
     .execute(&pool)
@@ -488,7 +488,7 @@ async fn unique_index_rejects_duplicates(pool: PgPool) {
     let err = sqlx::query(
         r#"
         insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
-        values ('p', 'editor', 'tenant:idx-test', 'documents', 'read', '', '')
+        values ('p', 'editor', 'tenant:idx-test', 'document', 'read', '', '')
         "#,
     )
     .execute(&pool)
@@ -514,7 +514,7 @@ async fn unique_index_rejects_duplicates(pool: PgPool) {
     sqlx::query(
         r#"
         insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
-        values ('p', 'editor', 'tenant:idx-test', 'documents', 'write', '', '')
+        values ('p', 'editor', 'tenant:idx-test', 'document', 'write', '', '')
         "#,
     )
     .execute(&pool)
@@ -532,7 +532,7 @@ async fn unique_index_rejects_duplicates(pool: PgPool) {
 /// writing **directly** to `casbin_rule` (bypassing the in-memory
 /// enforcer — exactly the state this replica would be in if a different
 /// process had won the race). `grant_role` then runs with the same `p`-row
-/// plus one non-racing `p`-row (`documents:write`) to also verify that the
+/// plus one non-racing `p`-row (`document:write`) to also verify that the
 /// coalesced `load_policy` does not clobber rows the same call just wrote.
 ///
 /// Regressions this catches:
@@ -542,7 +542,7 @@ async fn unique_index_rejects_duplicates(pool: PgPool) {
 ///   `can` / `require` would disagree with the database (they would still
 ///   miss the racing row),
 /// - without the `has_policy` pre-check from Stage 3h, this call would
-///   double-insert the racing `p`-row on the `documents:write` side too —
+///   double-insert the racing `p`-row on the `document:write` side too —
 ///   the final uniqueness assertions catch that.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn grant_role_survives_unique_violation(pool: PgPool) {
@@ -558,7 +558,7 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
     sqlx::query(
         r#"
         insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
-        values ('p', $1, $2, 'documents', 'read', '', '')
+        values ('p', $1, $2, 'document', 'read', '', '')
         "#,
     )
     .bind(role_key)
@@ -585,7 +585,7 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
     // must:
     //   1. hit `casbin_rule_unique_idx` on `add_grouping_policy`,
     //   2. hit `casbin_rule_unique_idx` on `add_policy` (documents:read),
-    //   3. successfully insert `documents:write` (no race on that one),
+    //   3. successfully insert `document:write` (no race on that one),
     //   4. reload once at the end (`needs_reload` coalesces 1–3),
     //   5. return `Ok(())`.
     authz
@@ -594,8 +594,8 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
             domain,
             role_key,
             &[
-                ("documents".to_string(), "read".to_string()),
-                ("documents".to_string(), "write".to_string()),
+                ("document".to_string(), "read".to_string()),
+                ("document".to_string(), "write".to_string()),
             ],
         )
         .await
@@ -606,7 +606,7 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
     //     the violation, `can` would return `false` here.
     assert!(
         authz
-            .can(user_id, domain, "documents", "read")
+            .can(user_id, domain, "document", "read")
             .await
             .unwrap(),
         "replica must see the row another process wrote (load_policy after violation)"
@@ -616,7 +616,7 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
     //     coalesced reload must not clobber rows this call wrote itself.
     assert!(
         authz
-            .can(user_id, domain, "documents", "write")
+            .can(user_id, domain, "document", "write")
             .await
             .unwrap(),
         "non-racing add_policy must still insert and survive the coalesced reload"
@@ -632,7 +632,7 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
     // (d) The unique index held: exactly one row per (ptype, v0..v3).
     let p_read_rows: i64 = sqlx::query_scalar(
         "select count(*) from casbin_rule \
-         where ptype='p' and v0=$1 and v1=$2 and v2='documents' and v3='read'",
+         where ptype='p' and v0=$1 and v1=$2 and v2='document' and v3='read'",
     )
     .bind(role_key)
     .bind(domain)
@@ -641,7 +641,7 @@ async fn grant_role_survives_unique_violation(pool: PgPool) {
     .unwrap();
     assert_eq!(
         p_read_rows, 1,
-        "exactly one p-row for `documents:read` — unique index held across the race"
+        "exactly one p-row for `document:read` — unique index held across the race"
     );
 
     let g_rows: i64 = sqlx::query_scalar(

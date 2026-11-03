@@ -236,7 +236,7 @@ pub mod tenant {
 
         state
             .authz
-            .require(actor.id, &domain_str, "workspaces", "create")
+            .require(actor.id, &domain_str, "workspace", "create")
             .await?;
 
         let mut tx = state.pool.begin().await?;
@@ -340,7 +340,7 @@ pub mod workspace {
 
         state
             .authz
-            .require(actor.id, &domain_str, "documents", "write")
+            .require(actor.id, &domain_str, "document", "write")
             .await?;
 
         let document = sqlx::query_as::<_, Document>(
@@ -367,7 +367,7 @@ pub mod workspace {
 
         state
             .authz
-            .require(actor.id, &domain_str, "documents", "read")
+            .require(actor.id, &domain_str, "document", "read")
             .await?;
 
         let documents = sqlx::query_as::<_, Document>(
@@ -395,7 +395,7 @@ pub mod workspace {
 
         state
             .authz
-            .require(actor.id, &domain_str, "documents", "read")
+            .require(actor.id, &domain_str, "document", "read")
             .await?;
 
         let document = sqlx::query_as::<_, Document>(
@@ -610,7 +610,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, PLATFORM_DOMAIN);
-        assert_eq!(call.resource, "tenants");
+        assert_eq!(call.resource, "tenant");
         assert_eq!(call.action, "create");
 
         assert!(mock.grant_role_calls().is_empty());
@@ -634,7 +634,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, PLATFORM_DOMAIN);
-        assert_eq!(call.resource, "tenants");
+        assert_eq!(call.resource, "tenant");
         assert_eq!(call.action, "create");
 
         assert!(mock.grant_role_calls().is_empty());
@@ -665,7 +665,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.resource, "workspaces");
+        assert_eq!(call.resource, "workspace");
         assert_eq!(call.action, "create");
 
         assert!(mock.grant_role_calls().is_empty());
@@ -688,7 +688,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "documents");
+        assert_eq!(call.resource, "document");
         assert_eq!(call.action, "write");
     }
 
@@ -709,7 +709,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "documents");
+        assert_eq!(call.resource, "document");
         assert_eq!(call.action, "read");
     }
 
@@ -738,7 +738,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "create");
     }
 
@@ -767,7 +767,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "create");
     }
 
@@ -794,7 +794,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "revoke");
     }
 
@@ -816,7 +816,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "list");
     }
 

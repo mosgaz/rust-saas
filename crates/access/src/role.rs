@@ -2,7 +2,7 @@
 //!
 //! Invariant (§5 p.5):
 //! - `create_role`, `update_role`, `delete_role`, `list_roles` — with
-//!   `authz.require(actor.id, domain, "roles", "<action>")`.
+//!   `authz.require(actor.id, domain, "role", "<action>")`.
 //! - `get_role`, `get_role_by_id` — no actor (helper, called after
 //!   `require` in a caller).
 //! - `delete_role_by_id` — no actor (low-level `DELETE`, called by
@@ -63,7 +63,7 @@ impl RoleRow {
 /// Creates a role in `domain` with the given permissions.
 ///
 /// Order:
-/// 1. `require(actor.id, domain, "roles", "create")`.
+/// 1. `require(actor.id, domain, "role", "create")`.
 /// 2. `INSERT roles` with `protected=false`, `immutable=false`.
 /// 3. `INSERT role_permissions` for each `(resource, action)`; a missing
 ///    `(resource, action)` in `permissions` yields
@@ -92,7 +92,7 @@ pub async fn create_role(
 ) -> Result<Role, AccessError> {
     state
         .authz()
-        .require(actor.id, domain, "roles", "create")
+        .require(actor.id, domain, "role", "create")
         .await?;
 
     let mut tx = state.pool().begin().await?;
@@ -148,7 +148,7 @@ pub async fn create_role(
 ///
 /// Order:
 /// 1. Load the role (its `domain` decides the `require` scope).
-/// 2. `require(actor.id, role.domain, "roles", "manage")`.
+/// 2. `require(actor.id, role.domain, "role", "manage")`.
 /// 3. Reject `protected=true` ([`AccessError::Protected`]) and
 ///    `immutable=true` ([`AccessError::Immutable`]).
 /// 4. `UPDATE roles` + replace `role_permissions` in one transaction.
@@ -186,7 +186,7 @@ pub async fn update_role(
 
     state
         .authz()
-        .require(actor.id, &role.domain, "roles", "manage")
+        .require(actor.id, &role.domain, "role", "manage")
         .await?;
 
     if role.protected {
@@ -217,7 +217,7 @@ pub async fn update_role(
     let permissions = get_permissions_for_role_id(state.pool(), role_id).await?;
 
     // Stage 4.5a+: diff vs the permissions the role had *before* this
-    // update. Closes the forensic gap: "who had `documents:read` on date T?"
+    // update. Closes the forensic gap: "who had `document:read` on date T?"
     // is answerable by temporal-joining `role.updated` (Day N) with
     // `member.role_assigned` (Day M) — without replaying `casbin_rule`.
     //
@@ -282,7 +282,7 @@ pub async fn update_role(
 ///
 /// Order:
 /// 1. Load the role (its `domain` decides the `require` scope).
-/// 2. `require(actor.id, role.domain, "roles", "delete")`.
+/// 2. `require(actor.id, role.domain, "role", "delete")`.
 /// 3. Reject `protected=true` ([`AccessError::Protected`]).
 /// 4. `DELETE roles` (cascades `role_permissions`).
 ///
@@ -306,7 +306,7 @@ pub async fn delete_role(
 
     state
         .authz()
-        .require(actor.id, &role.domain, "roles", "delete")
+        .require(actor.id, &role.domain, "role", "delete")
         .await?;
 
     if role.protected {
@@ -328,7 +328,7 @@ pub async fn delete_role(
 /// Lists roles in `domain`.
 ///
 /// Order:
-/// 1. `require(actor.id, domain, "roles", "list")`.
+/// 1. `require(actor.id, domain, "role", "list")`.
 /// 2. `SELECT roles WHERE domain = $1 ORDER BY key`.
 /// 3. For each, load `permissions` via `role_permissions`.
 pub async fn list_roles_paged(
@@ -340,7 +340,7 @@ pub async fn list_roles_paged(
 ) -> Result<Page<Role>, AccessError> {
     state
         .authz()
-        .require(actor.id, domain, "roles", "list")
+        .require(actor.id, domain, "role", "list")
         .await?;
 
     let total: i64 = sqlx::query_scalar("select count(*) from roles where domain = $1")

@@ -298,7 +298,7 @@ mod test_support_tests {
     async fn allow_all_grant_and_revoke_are_noops() {
         let a = AllowAllAuthz;
         let uid = Uuid::new_v4();
-        a.grant_role(uid, "d", "editor", &[("documents".into(), "read".into())])
+        a.grant_role(uid, "d", "editor", &[("document".into(), "read".into())])
             .await
             .unwrap();
         a.revoke_role(uid, "d", "editor").await.unwrap();
