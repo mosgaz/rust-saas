@@ -140,7 +140,14 @@ impl From<AccessError> for CoreError {
 pub struct SaasState {
     pub(crate) pool: PgPool,
     pub(crate) authz: Arc<dyn AuthorizationEngine>,
-    pub(crate) access: Arc<AccessState>,
+    /// `None` iff the state was built via
+    /// [`SaasBuilder::without_access`] — a deliberate no-RBAC build. In
+    /// that case only the low-level methods (`create_tenant`,
+    /// `create_workspace`, `create_document`, `list_*`) work; the
+    /// RBAC-required ones (`provision_tenant`, `create_workspace_with_owner`,
+    /// `invitation::*`, `member::*`, `access::*`) return
+    /// [`CoreError::Internal`] via [`SaasState::access`].
+    pub(crate) access: Option<Arc<AccessState>>,
     pub(crate) audit: Arc<dyn AuditLogger>,
 }
 
@@ -155,16 +162,22 @@ impl SaasState {
 
     /// Shared access state.
     ///
-    /// `Ok` on every `SaasState` built via `with_access(...)`. `Err`
-    /// (`CoreError::Internal`) on `SaasState` built via
-    /// `without_access()` (A2.2b) — the caller asked for a non-RBAC
-    /// build and must not invoke `access::*` methods.
+    /// `Ok` on every `SaasState` built via `with_access(...)` (`access =
+    /// Some`). `Err(CoreError::Internal("RBAC not configured"))` on a
+    /// `SaasState` built via `without_access()` (`access = None`) — the
+    /// caller asked for a no-RBAC build and must not invoke `access::*`
+    /// methods.
     ///
-    /// Read-only callers (`list_*`, `get_*`) can map `Err` to 500;
+    /// Read-only callers (`list_*`, `get_*`) map `Err` to 500;
     /// RBAC-required mutations (`create_workspace_with_owner`,
-    /// `provision_tenant`) require `Ok` by construction.
+    /// `provision_tenant`, `invitation::*`, `member::*`) require `Ok`
+    /// by construction.
     pub fn access(&self) -> Result<&AccessState, CoreError> {
-        Ok(self.access.as_ref())
+        self.access.as_deref().ok_or_else(|| {
+            CoreError::Internal(
+                "RBAC not configured: built with without_access()".into(),
+            )
+        })
     }
 
     pub fn audit(&self) -> &Arc<dyn AuditLogger> {
@@ -192,6 +205,11 @@ pub struct SaasBuilder {
     pool: PgPool,
     authz: Option<Arc<dyn AuthorizationEngine>>,
     access: Option<Arc<AccessState>>,
+    /// Set by [`SaasBuilder::without_access`], cleared by
+    /// [`SaasBuilder::with_access`]. Distinguishes "consumer explicitly
+    /// opted out of RBAC" from "consumer forgot to call `with_access`" —
+    /// both leave `access = None`, but only the former should build.
+    access_skipped: bool,
     audit: Option<Arc<dyn AuditLogger>>,
 }
 
@@ -201,6 +219,7 @@ impl SaasBuilder {
             pool,
             authz: None,
             access: None,
+            access_skipped: false,
             audit: None,
         }
     }
@@ -212,6 +231,28 @@ impl SaasBuilder {
 
     pub fn with_access(mut self, access: Arc<AccessState>) -> Self {
         self.access = Some(access);
+        self.access_skipped = false;
+        self
+    }
+
+    /// Opt out of RBAC explicitly. The resulting [`SaasState`] works for
+    /// the low-level methods (`create_tenant`, `create_workspace`,
+    /// `create_document`, `list_*`), which only use `authz.require` +
+    /// SQL. The RBAC-required methods (`provision_tenant`,
+    /// `create_workspace_with_owner`, `invitation::*`, `member::*`,
+    /// `access::*`) return [`CoreError::Internal`] via
+    /// [`SaasState::access`].
+    ///
+    /// `authz` is still required — the low-level methods call
+    /// `authz.require(..)` for defense in depth. A no-RBAC consumer
+    /// passes their own `AuthorizationEngine` impl (e.g. an
+    /// `AlwaysAllow` in ~5 lines).
+    ///
+    /// Calling `without_access()` after `with_access()` wins; the
+    /// reverse is also true (last call wins).
+    pub fn without_access(mut self) -> Self {
+        self.access = None;
+        self.access_skipped = true;
         self
     }
 
@@ -223,13 +264,35 @@ impl SaasBuilder {
         self
     }
 
+    /// Builds a [`SaasState`].
+    ///
+    /// `authz` is always required. `access` must be provided via
+    /// [`SaasBuilder::with_access`] **or** explicitly opted out of via
+    /// [`SaasBuilder::without_access`]; calling neither is a bug in the
+    /// caller and fails fast.
     pub fn build(self) -> Result<SaasState, CoreError> {
         let authz = self.authz.ok_or_else(|| {
             CoreError::Internal("SaasBuilder: authorization engine is required".into())
         })?;
-        let access = self
-            .access
-            .ok_or_else(|| CoreError::Internal("SaasBuilder: access state is required".into()))?;
+        let access = match (self.access, self.access_skipped) {
+            (Some(a), false) => Some(a),
+            (None, true) => None,
+            (_, false) => {
+                return Err(CoreError::Internal(
+                    "SaasBuilder: access state is required; call with_access(..) \
+                     or without_access() to opt out"
+                        .into(),
+                ));
+            }
+            // (Some(_), true) is unreachable: `with_access` clears
+            // `access_skipped`, `without_access` clears `access` — the
+            // last call wins. Keeping the arm explicit (not `_ =>`) so
+            // an accidental third combination is a compile-time surprise
+            // rather than silent behaviour.
+            (Some(_), true) => unreachable!(
+                "SaasBuilder: with_access/without_access must be mutually exclusive"
+            ),
+        };
         let audit = self.audit.unwrap_or_else(|| Arc::new(NoopAuditLogger));
         Ok(SaasState {
             pool: self.pool,
@@ -619,6 +682,118 @@ mod tests {
             email_verified: true,
             created_at: Utc::now(),
         }
+    }
+
+    // ─── A2.2b: without_access builder ─────────────────────────────────
+
+    fn lazy_pool() -> PgPool {
+        PgPool::connect_lazy("postgres://saas-test-host/saas_test")
+            .expect("lazy pool must be constructible")
+    }
+
+    #[tokio::test]
+    async fn without_access_works() {
+        let mock = Arc::new(MockAuthz::denying());
+        let state = SaasBuilder::new(lazy_pool())
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .without_access()
+            .build()
+            .expect("build with without_access must succeed");
+        let err = match state.access() {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err from access() on a without_access() build"),
+        };
+        match err {
+            CoreError::Internal(msg) => {
+                assert!(
+                    msg.contains("without_access"),
+                    "error message should mention without_access: {msg}"
+                );
+            }
+            other => panic!("expected CoreError::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn without_access_without_authz_fails() {
+        let err = match SaasBuilder::new(lazy_pool())
+            .without_access()
+            .build()
+        {
+            Err(e) => e,
+            Ok(_) => panic!("without_authz + without_access must fail"),
+        };
+        match err {
+            CoreError::Internal(msg) => {
+                assert!(
+                    msg.contains("authorization engine is required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected CoreError::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn access_required_unless_without_access() {
+        // Neither with_access nor without_access → build must fail
+        // (this protects against "forgot to call with_access").
+        let mock = Arc::new(MockAuthz::denying());
+        let err = match SaasBuilder::new(lazy_pool())
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .build()
+        {
+            Err(e) => e,
+            Ok(_) => panic!("build without access/without_access must fail"),
+        };
+        match err {
+            CoreError::Internal(msg) => {
+                assert!(
+                    msg.contains("access state is required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected CoreError::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_access_still_works() {
+        let mock = Arc::new(MockAuthz::denying());
+        let pool = lazy_pool();
+        let access = Arc::new(AccessState::new(
+            pool.clone(),
+            mock.clone() as Arc<dyn AuthorizationEngine>,
+        ));
+        let state = SaasBuilder::new(pool)
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .with_access(access)
+            .build()
+            .expect("with_access build must succeed");
+        assert!(
+            state.access().is_ok(),
+            "access() must be Ok on a with_access() build"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_access_wins_over_with_access_when_last() {
+        let mock = Arc::new(MockAuthz::denying());
+        let pool = lazy_pool();
+        let access = Arc::new(AccessState::new(
+            pool.clone(),
+            mock.clone() as Arc<dyn AuthorizationEngine>,
+        ));
+        let state = SaasBuilder::new(pool)
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .with_access(access)
+            .without_access()
+            .build()
+            .expect("last call (without_access) wins");
+        assert!(
+            state.access().is_err(),
+            "last call (without_access) wins → access() is Err"
+        );
     }
 
     #[tokio::test]
