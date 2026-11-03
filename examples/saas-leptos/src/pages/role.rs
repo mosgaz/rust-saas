@@ -108,7 +108,13 @@ pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> 
 pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let _user = crate::extract::CurrentUser::from_request().await?.require()?;
-    let role = access::get_role_by_id(state.saas.access(), role_id)
+    let role = access::get_role_by_id(
+        state
+            .saas
+            .access()
+            .map_err(crate::error::core_error_to_server_fn)?,
+        role_id,
+    )
         .await
         .map_err(crate::error::access_error_to_server_fn)?;
     Ok(role.map(RoleView::from))
@@ -178,7 +184,13 @@ pub async fn update_role(
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
 
-    let existing = access::get_role_by_id(state.saas.access(), role_id)
+    let existing = access::get_role_by_id(
+        state
+            .saas
+            .access()
+            .map_err(crate::error::core_error_to_server_fn)?,
+        role_id,
+    )
         .await
         .map_err(crate::error::access_error_to_server_fn)?
         .ok_or_else(|| {
@@ -203,7 +215,13 @@ pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
 
-    let existing = access::get_role_by_id(state.saas.access(), role_id)
+    let existing = access::get_role_by_id(
+        state
+            .saas
+            .access()
+            .map_err(crate::error::core_error_to_server_fn)?,
+        role_id,
+    )
         .await
         .map_err(crate::error::access_error_to_server_fn)?
         .ok_or_else(|| {

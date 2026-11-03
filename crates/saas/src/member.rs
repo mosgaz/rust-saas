@@ -373,7 +373,7 @@ async fn guard_protected_last_holder(
     domain: &str,
     role_key: &RoleKey,
 ) -> Result<(), CoreError> {
-    let Some(role) = ::access::get_role(state.access(), domain, role_key)
+    let Some(role) = ::access::get_role(state.access()?, domain, role_key)
         .await
         .map_err(CoreError::from)?
     else {

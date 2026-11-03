@@ -45,7 +45,7 @@ pub async fn create_role(
     permissions: &[(String, String)],
 ) -> Result<Role, CoreError> {
     ::access::create_role(
-        state.access(),
+        state.access()?,
         actor,
         domain,
         key,
@@ -117,7 +117,7 @@ pub async fn update_role(
     // `grant_role` calls that follow. A `NotFound` here matches what
     // `access::update_role` would return — no behavioural difference, just
     // an earlier error.
-    let existing = ::access::get_role_by_id(state.access(), role_id)
+    let existing = ::access::get_role_by_id(state.access()?, role_id)
         .await
         .map_err(CoreError::from)?
         .ok_or(CoreError::NotFound)?;
@@ -153,7 +153,7 @@ pub async fn update_role(
     // 2. Update `roles` + `role_permissions`; `role.updated` fires inside
     //    `access::update_role` (with the `added` / `removed` diff).
     let updated = ::access::update_role(
-        state.access(),
+        state.access()?,
         actor,
         role_id,
         name,
@@ -220,7 +220,7 @@ pub async fn delete_role(
     actor: &AuthUser,
     role_id: Uuid,
 ) -> Result<(), CoreError> {
-    let role = ::access::get_role_by_id(state.access(), role_id)
+    let role = ::access::get_role_by_id(state.access()?, role_id)
         .await
         .map_err(CoreError::from)?
         .ok_or(CoreError::NotFound)?;
@@ -241,7 +241,7 @@ pub async fn delete_role(
 
     delete_members_by_domain(state, &role.domain, role.key.as_str()).await?;
 
-    ::access::delete_role_by_id(state.access(), role_id)
+    ::access::delete_role_by_id(state.access()?, role_id)
         .await
         .map_err(CoreError::from)?;
 
@@ -273,7 +273,7 @@ pub async fn list_roles_paged(
     limit: i64,
     offset: i64,
 ) -> Result<Page<Role>, CoreError> {
-    ::access::list_roles_paged(state.access(), actor, domain, limit, offset)
+    ::access::list_roles_paged(state.access()?, actor, domain, limit, offset)
         .await
         .map_err(Into::into)
 }
@@ -297,7 +297,7 @@ pub async fn list_permissions_paged(
     limit: i64,
     offset: i64,
 ) -> Result<Page<Permission>, CoreError> {
-    ::access::list_permissions_paged(state.access(), limit, offset)
+    ::access::list_permissions_paged(state.access()?, limit, offset)
         .await
         .map_err(Into::into)
 }
@@ -327,7 +327,7 @@ pub async fn my_permissions(
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<(String, String)>, CoreError> {
-    let reference = ::access::list_permissions_paged(state.access(), i64::MAX, 0)
+    let reference = ::access::list_permissions_paged(state.access()?, i64::MAX, 0)
         .await
         .map_err(CoreError::from)?
         .items;
@@ -368,7 +368,7 @@ pub async fn assign_role(
         .require(actor.id, domain, "role", "grant")
         .await?;
 
-    let permissions = ::access::get_permissions_for_role(state.access(), domain, role_key)
+    let permissions = ::access::get_permissions_for_role(state.access()?, domain, role_key)
         .await
         .map_err(CoreError::from)?;
 

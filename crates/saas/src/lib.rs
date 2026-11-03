@@ -153,8 +153,18 @@ impl SaasState {
         &self.authz
     }
 
-    pub fn access(&self) -> &AccessState {
-        &self.access
+    /// Shared access state.
+    ///
+    /// `Ok` on every `SaasState` built via `with_access(...)`. `Err`
+    /// (`CoreError::Internal`) on `SaasState` built via
+    /// `without_access()` (A2.2b) — the caller asked for a non-RBAC
+    /// build and must not invoke `access::*` methods.
+    ///
+    /// Read-only callers (`list_*`, `get_*`) can map `Err` to 500;
+    /// RBAC-required mutations (`create_workspace_with_owner`,
+    /// `provision_tenant`) require `Ok` by construction.
+    pub fn access(&self) -> Result<&AccessState, CoreError> {
+        Ok(self.access.as_ref())
     }
 
     pub fn audit(&self) -> &Arc<dyn AuditLogger> {
@@ -268,12 +278,12 @@ pub mod tenant {
 
         let ws_domain = domain::workspace_domain(workspace.id);
 
-        ::access::create_owner_role(state.access(), &ws_domain)
+        ::access::create_owner_role(state.access()?, &ws_domain)
             .await
             .map_err(CoreError::from)?;
 
         let permissions =
-            ::access::get_permissions_for_role(state.access(), &ws_domain, owner_role_key)
+            ::access::get_permissions_for_role(state.access()?, &ws_domain, owner_role_key)
                 .await
                 .map_err(CoreError::from)?;
 

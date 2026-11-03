@@ -45,9 +45,13 @@ async fn make_user(pool: &PgPool, label: &str) -> AuthUser {
 
 async fn grant_platform_admin(state: &SaasState, user: &AuthUser) {
     let owner_key = RoleKey::parse("owner").unwrap();
-    let perms = ::access::get_permissions_for_role(state.access(), "platform", &owner_key)
-        .await
-        .unwrap();
+    let perms = ::access::get_permissions_for_role(
+        state.access().expect("access"),
+        "platform",
+        &owner_key,
+    )
+    .await
+    .unwrap();
     state
         .authz()
         .grant_role(user.id, "platform", "owner", &perms)

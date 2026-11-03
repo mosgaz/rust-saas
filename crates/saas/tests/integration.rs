@@ -140,9 +140,13 @@ async fn make_user_with_email(pool: &PgPool, email: &str, verified: bool) -> Aut
 /// Grants `platform` owner to the given user.
 async fn grant_platform_admin(state: &SaasState, user: &AuthUser) {
     let owner_key = RoleKey::parse("owner").unwrap();
-    let perms = ::access::get_permissions_for_role(state.access(), "platform", &owner_key)
-        .await
-        .unwrap();
+    let perms = ::access::get_permissions_for_role(
+        state.access().expect("access"),
+        "platform",
+        &owner_key,
+    )
+    .await
+    .unwrap();
     state
         .authz()
         .grant_role(user.id, "platform", "owner", &perms)
@@ -1192,7 +1196,9 @@ async fn my_permissions_owner_editor_and_non_member(pool: PgPool) {
     let owner_perms = saas_access::my_permissions(&saas, &admin, &ws_domain)
         .await
         .unwrap();
-    let reference = ::access::list_permissions(saas.access()).await.unwrap();
+    let reference = ::access::list_permissions(saas.access().expect("access"))
+        .await
+        .unwrap();
     assert_eq!(owner_perms.len(), reference.len());
     assert!(owner_perms
         .iter()

@@ -78,7 +78,10 @@ fn status_for_authn(e: &AuthnError) -> u16 {
 
 fn status_for_access(e: &AccessError) -> u16 {
     match e {
-        AccessError::Validation(_) | AccessError::InvalidRoleKey(_) => 400,
+        AccessError::Validation(_)
+        | AccessError::InvalidRoleKey(_)
+        | AccessError::UnknownResourceType { .. }
+        | AccessError::ScopeMismatch { .. } => 400,
         AccessError::Forbidden | AccessError::Protected | AccessError::Immutable => 403,
         AccessError::RoleNotFound(_) | AccessError::PermissionNotFound(_, _) => 404,
         AccessError::Internal(_) | AccessError::Db(_) => 500,

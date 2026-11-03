@@ -120,12 +120,12 @@ pub async fn provision_tenant(
 
     let domain_str = domain::tenant_domain(tenant.id);
 
-    ::access::create_owner_role(state.access(), &domain_str)
+    ::access::create_owner_role(state.access()?, &domain_str)
         .await
         .map_err(CoreError::from)?;
 
     let permissions =
-        ::access::get_permissions_for_role(state.access(), &domain_str, owner_role_key)
+        ::access::get_permissions_for_role(state.access()?, &domain_str, owner_role_key)
             .await
             .map_err(CoreError::from)?;
 
