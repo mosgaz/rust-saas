@@ -62,7 +62,7 @@ fn is_mutation(method: &Method) -> bool {
 }
 
 fn is_public_auth(path: &str) -> bool {
-    PUBLIC_AUTH_PATHS.iter().any(|p| path == *p)
+    PUBLIC_AUTH_PATHS.contains(&path)
 }
 
 fn new_token() -> String {

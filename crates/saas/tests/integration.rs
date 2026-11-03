@@ -1,3 +1,4 @@
+#![allow(deprecated, clippy::type_complexity)]
 //! Integration tests for `saas` against a real PostgreSQL + `authz-casbin`.
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
@@ -2826,4 +2827,414 @@ async fn delete_role_emits_role_deleted(pool: PgPool) {
     assert_eq!(*target_id, Some(role.id));
     assert_eq!(metadata["domain"], ws_domain.as_str());
     assert_eq!(metadata["key"], "temp");
+}
+
+// ─── Stage 4.5a: `update_role` syncs `casbin_rule.p` + `role.updated` metadata ─
+
+/// Stage 4.5a: after `saas::access::update_role`, every current holder of
+/// the role must reflect the **new** permission set in `casbin_rule.p`:
+/// - a removed permission must stop working,
+/// - an added permission must start working,
+/// - `role.updated` must fire exactly once with an `added` / `removed`
+///   diff,
+/// - **no** `member.role_*` events must be emitted (role-level change,
+///   not membership-level; see Appendix B §2.62).
+///
+/// Regression for `saas-pluggability-04 §4.21` — before 4.5a,
+/// `access::update_role` rewrote `role_permissions` but left stale
+/// `casbin_rule.p`, so removed permissions kept working for existing
+/// holders and newly-added permissions did not apply to them.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn update_role_propagates_new_and_removed_permissions_to_casbin(pool: PgPool) {
+    let saas = setup_with_audit(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let ws = tenant::create_workspace(
+        &saas,
+        &admin,
+        tenant.id,
+        unique_name("Eng"),
+        &admin,
+        &owner_key,
+    )
+    .await
+    .unwrap();
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let editor_key = RoleKey::parse("editor").unwrap();
+
+    // Create `editor` with `documents:read` + `documents:write`.
+    let editor_role = saas_access::create_role(
+        &saas,
+        &admin,
+        &ws_domain,
+        &editor_key,
+        "Editor".to_string(),
+        "".to_string(),
+        &[
+            ("documents".to_string(), "read".to_string()),
+            ("documents".to_string(), "write".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Assign it to a holder.
+    let holder = make_user(&pool, "holder").await;
+    saas_access::assign_role(&saas, &admin, holder.id, &ws_domain, &editor_key)
+        .await
+        .unwrap();
+
+    // Sanity: holder has both before the update.
+    assert!(
+        saas.authz()
+            .can(holder.id, &ws_domain, "documents", "read")
+            .await
+            .unwrap(),
+        "setup: holder must have `documents:read` before update"
+    );
+    assert!(
+        saas.authz()
+            .can(holder.id, &ws_domain, "documents", "write")
+            .await
+            .unwrap(),
+        "setup: holder must have `documents:write` before update"
+    );
+
+    // Snapshot audit count so we can isolate rows produced by this update.
+    let before_audit: i64 = sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Update: drop `write`, keep `read`.
+    let updated = saas_access::update_role(
+        &saas,
+        &admin,
+        editor_role.id,
+        "Editor".to_string(),
+        "".to_string(),
+        &[("documents".to_string(), "read".to_string())],
+    )
+    .await
+    .expect("update_role must succeed");
+
+    // ── casbin_rule / effective permissions ──────────────────────────────
+    let can_read_after = saas
+        .authz()
+        .can(holder.id, &ws_domain, "documents", "read")
+        .await
+        .unwrap();
+    let can_write_after = saas
+        .authz()
+        .can(holder.id, &ws_domain, "documents", "write")
+        .await
+        .unwrap();
+    assert!(can_read_after, "read must survive the update");
+    assert!(
+        !can_write_after,
+        "write must be revoked for existing holders (4.5a: casbin_rule.p resync)"
+    );
+
+    // Direct table check: no `p`-row for `(editor, ws_domain, documents, write)`.
+    let p_write_after: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule \
+         where ptype='p' and v0=$1 and v1=$2 and v2='documents' and v3='write'",
+    )
+    .bind(editor_key.as_str())
+    .bind(&ws_domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        p_write_after, 0,
+        "stale p-row for `documents:write` must be purged by update_role"
+    );
+
+    // Direct table check: exactly one `p`-row for `(editor, ws_domain, documents, read)`.
+    let p_read_after: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule \
+         where ptype='p' and v0=$1 and v1=$2 and v2='documents' and v3='read'",
+    )
+    .bind(editor_key.as_str())
+    .bind(&ws_domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(p_read_after, 1, "exactly one p-row for `documents:read`");
+
+    // ── audit: exactly one `role.updated`, no `member.role_*` ─────────────
+    let rows: Vec<(
+        String,
+        Option<Uuid>,
+        Option<String>,
+        Option<Uuid>,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        r#"
+            select event_type, actor_id, target_type, target_id, metadata
+            from audit_log
+            order by occurred_at asc, id asc
+            offset $1
+            "#,
+    )
+    .bind(before_audit)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "update_role must emit exactly one audit event (no member.role_* flood), got: {:?}",
+        rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>()
+    );
+    let (event_type, actor_id, target_type, target_id, metadata) = &rows[0];
+    assert_eq!(event_type, "role.updated");
+    assert_eq!(*actor_id, Some(admin.id));
+    assert_eq!(target_type.as_deref(), Some("role"));
+    assert_eq!(*target_id, Some(editor_role.id));
+
+    // `added` / `removed` diff. Both serialise as JSON arrays of pairs;
+    // `from_value` gives a clean assertion message on mismatch.
+    let added: Vec<(String, String)> = serde_json::from_value(metadata["added"].clone())
+        .expect("metadata.added must be a JSON array");
+    let removed: Vec<(String, String)> = serde_json::from_value(metadata["removed"].clone())
+        .expect("metadata.removed must be a JSON array");
+    assert!(
+        added.is_empty(),
+        "removing a permission is a removal, not an addition; got added={added:?}"
+    );
+    assert_eq!(
+        removed,
+        vec![("documents".to_string(), "write".to_string())],
+        "removed must list exactly the dropped (resource, action) pair"
+    );
+
+    // Consistency: the `Role` returned by `update_role` reflects the new set
+    // (`roles`/`role_permissions` — the `access` layer is the source of
+    // truth for the role *definition*; `casbin_rule` is the source of truth
+    // for the *effective grants*).
+    assert_eq!(updated.permissions.len(), 1);
+    assert_eq!(updated.permissions[0].resource, "documents");
+    assert_eq!(updated.permissions[0].action, "read");
+}
+
+// ─── Stage 4.5c: owner-unsync trigger (AFTER DELETE on permissions) ───────
+
+/// Counts `casbin_rule.p` rows for `(v0='owner', v1=domain, v2=resource,
+/// v3=action)`. Used by the 4.5c test to assert against the raw table —
+/// the AFTER DELETE trigger writes at SQL level, so the in-memory
+/// enforcer of the test's `CasbinAuthz` is not the right thing to read.
+async fn count_owner_p_row(pool: &PgPool, domain: &str, resource: &str, action: &str) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from casbin_rule \
+         where ptype = 'p' and v0 = 'owner' and v1 = $1 and v2 = $2 and v3 = $3",
+    )
+    .bind(domain)
+    .bind(resource)
+    .bind(action)
+    .fetch_one(pool)
+    .await
+    .expect("count query must succeed")
+}
+
+/// Stage 4.5c: deleting a `(resource, action)` from the `permissions`
+/// reference table must remove the corresponding `casbin_rule.p` rows for
+/// **every** `owner` role, in every domain.
+///
+/// Before 4.5c the FK `role_permissions → permissions ON DELETE CASCADE`
+/// cleared the role-definition side, but the effective grants in
+/// `casbin_rule.p` (written at role-assignment time) were untouched:
+/// orphaned `p`-rows kept `owner` allowing a permission the reference
+/// table no longer knew about (`saas-pluggability-04 §4.23`).
+///
+/// Custom roles are deliberately **not** unsynced by the trigger — that
+/// is a consumer-level policy decision documented in
+/// `20261111000001_owner_sync_delete_trigger.sql`. The test therefore
+/// only checks `owner` rows, in two domains (`platform` — bootstrap
+/// owner; `tenant:<id>` — provisioned owner), which is enough to prove
+/// the trigger is domain-agnostic and not accidentally scoped to one
+/// domain.
+///
+/// The trigger writes to `casbin_rule` at SQL level, so the in-memory
+/// enforcer of this `CasbinAuthz` instance is **not** reloaded by the
+/// `DELETE`. The test asserts against raw `casbin_rule` rows, not
+/// against `can` / `require`. Reload-after-external-write is a separate
+/// concern (same class as Stage 3h's in-memory-is-authoritative caveat);
+/// consumers that mutate `permissions` while a process is running must
+/// call `authz.purge_role` + re-`grant_role` on their own replica (or
+/// restart). The DB-side invariant this test pins is the one the trigger
+/// owns.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn delete_permission_unsyncs_owner_p_rows(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+    let tenant_domain = domain::tenant_domain(tenant.id);
+
+    // Sanity — before the DELETE:
+    //   - platform-owner got `p`-rows via `grant_platform_admin` (which
+    //     calls `authz.grant_role(user, "platform", "owner", perms)`);
+    //   - tenant-owner got `p`-rows via `provision_tenant`
+    //     (`create_owner_role` + `authz.grant_role(owner, tenant_domain,
+    //     "owner", perms)`).
+    // `documents:read` is in the reference table (`access_rbac_init`), so
+    // both owner roles must hold it.
+    assert_eq!(
+        count_owner_p_row(&pool, "platform", "documents", "read").await,
+        1,
+        "setup: platform-owner must have a `documents:read` p-row"
+    );
+    assert_eq!(
+        count_owner_p_row(&pool, &tenant_domain, "documents", "read").await,
+        1,
+        "setup: tenant-owner must have a `documents:read` p-row"
+    );
+
+    // Record a sibling permission (`documents:write`) — the trigger's
+    // predicate is `(v2, v3) = (OLD.resource, OLD.action)`, so this must
+    // survive.
+    assert_eq!(
+        count_owner_p_row(&pool, &tenant_domain, "documents", "write").await,
+        1,
+        "setup: tenant-owner must have `documents:write`"
+    );
+
+    // Delete the reference row. `role_permissions` cascades via FK; the
+    // AFTER DELETE trigger (`owner_unsync_permission_after_delete`) is
+    // what cleans `casbin_rule.p` for owner roles.
+    let deleted =
+        sqlx::query("delete from permissions where resource = 'documents' and action = 'read'")
+            .execute(&pool)
+            .await
+            .expect("delete from permissions must succeed");
+    assert_eq!(
+        deleted.rows_affected(),
+        1,
+        "exactly one reference row must be deleted"
+    );
+
+    // (a) Trigger cleaned `casbin_rule.p` for the platform-owner role.
+    assert_eq!(
+        count_owner_p_row(&pool, "platform", "documents", "read").await,
+        0,
+        "platform-owner p-row for `documents:read` must be removed by the AFTER DELETE trigger"
+    );
+
+    // (b) Trigger cleaned `casbin_rule.p` for the tenant-owner role — the
+    //     same predicate fires once per domain, proving the trigger is
+    //     domain-agnostic (not accidentally scoped to one domain).
+    assert_eq!(
+        count_owner_p_row(&pool, &tenant_domain, "documents", "read").await,
+        0,
+        "tenant-owner p-row for `documents:read` must be removed by the AFTER DELETE trigger"
+    );
+
+    // (c) FK cascade cleared `role_permissions` — the role-definition
+    //     side. Sanity that trigger and FK cover different layers.
+    let role_perm_rows: i64 = sqlx::query_scalar(
+        "select count(*) from role_permissions where resource = 'documents' and action = 'read'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        role_perm_rows, 0,
+        "role_permissions rows must be cleared by the FK cascade"
+    );
+
+    // (d) Unrelated permission (`documents:write`) is untouched. If the
+    //     trigger's predicate were ever broadened (e.g. `v2 = OLD.resource`
+    //     only, ignoring `v3`), this assertion fires.
+    assert_eq!(
+        count_owner_p_row(&pool, &tenant_domain, "documents", "write").await,
+        1,
+        "unrelated `documents:write` p-row must survive the trigger"
+    );
+}
+
+// ─── Stage 4.8: Pagination ─────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "../db/migrations")]
+async fn list_tenants_paged_works(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    // Create 3 tenants
+    for i in 0..3 {
+        let owner = make_user(&pool, &format!("owner_{}", i)).await;
+        let owner_key = RoleKey::parse("owner").unwrap();
+        platform::provision_tenant(
+            &saas,
+            &admin,
+            unique_name(&format!("T{}", i)),
+            &owner,
+            &owner_key,
+        )
+        .await
+        .unwrap();
+    }
+
+    let page1 = platform::list_tenants_paged(&saas, &admin, 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.total, 3);
+    assert_eq!(page1.items.len(), 2);
+
+    let page2 = platform::list_tenants_paged(&saas, &admin, 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.total, 3);
+    assert_eq!(page2.items.len(), 1);
+}
+
+#[sqlx::test(migrations = "../db/migrations")]
+async fn member_list_paged_works(pool: PgPool) {
+    let saas = setup(&pool).await;
+    let admin = make_user(&pool, "admin").await;
+    grant_platform_admin(&saas, &admin).await;
+
+    let owner_key = RoleKey::parse("owner").unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &admin, &owner_key)
+        .await
+        .unwrap();
+
+    // Add 3 users to the tenant
+    for i in 0..3 {
+        let user = make_user(&pool, &format!("user_{}", i)).await;
+        saas_access::assign_role(
+            &saas,
+            &admin,
+            user.id,
+            &domain::tenant_domain(tenant.id),
+            &owner_key,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Admin is also a member. Total = 4.
+    let page1 = member::list_paged(&saas, &admin, MemberScope::Tenant(tenant.id), 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.total, 4);
+    assert_eq!(page1.items.len(), 2);
+
+    let page2 = member::list_paged(&saas, &admin, MemberScope::Tenant(tenant.id), 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.total, 4);
+    assert_eq!(page2.items.len(), 2);
 }

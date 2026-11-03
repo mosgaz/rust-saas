@@ -2,6 +2,8 @@
 name = "access"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "Role and permission ownership: permissions, roles, role_permissions (ADR-0001)"
 
 [dependencies]

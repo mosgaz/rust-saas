@@ -92,10 +92,10 @@ impl From<access::Role> for RoleView {
 pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
-    let roles = saas::access::list_roles(&state.saas, &user, &domain)
+    let page = saas::access::list_roles_paged(&state.saas, &user, &domain, i64::MAX, 0)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
-    Ok(roles.into_iter().map(RoleView::from).collect())
+    Ok(page.items.into_iter().map(RoleView::from).collect())
 }
 
 /// Returns a role by `role_id`, or `None` if not found.
@@ -119,10 +119,10 @@ pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> 
 #[server]
 pub async fn list_permissions() -> Result<Vec<(String, String, String)>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let perms = saas::access::list_permissions(&state.saas)
+    let page = saas::access::list_permissions_paged(&state.saas, i64::MAX, 0)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
-    Ok(perms
+    Ok(page.items
         .into_iter()
         .map(|p| (p.resource, p.action, p.description))
         .collect())
@@ -537,8 +537,6 @@ pub fn RoleListPage(domain: String) -> impl IntoView {
             </ul>
 
             {move || if can("roles", "create") {
-                let member_opts = ();
-                let _ = member_opts;
                 // `submit_create` is `FnMut + Clone`; clone per render so this
                 // outer render closure does not move it out.
                 let submit_create = submit_create.clone();

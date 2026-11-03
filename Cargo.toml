@@ -12,12 +12,15 @@ members = [
     "crates/seed",
     "crates/audit",
     "crates/audit-pg",
+    "crates/rate-limiter",
     "crates/rust-saas",
 ]
 exclude = ["examples/*"]
 
 [workspace.package]
-version = "0.2.0"
+publish = false
+license = "MIT"
+version = "0.2.2"
 edition = "2021"
 
 [workspace.dependencies]
@@ -36,3 +39,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 sha2 = "0.10"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

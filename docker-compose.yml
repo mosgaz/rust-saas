@@ -39,6 +39,23 @@ services:
     networks:
       - rust_saas_net
 
+
+  # Stage 4.8: Redis для distributed rate limiter.
+  # Если REDIS_URL не задан, приложения используют InMemoryRateLimiter.
+  redis:
+    image: redis:7-alpine
+    container_name: rust-saas-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - rust_saas_net
+
 volumes:
   rust_saas_pg_data:
 

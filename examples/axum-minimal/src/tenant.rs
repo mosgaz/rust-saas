@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
 use access::RoleKey;
@@ -34,6 +34,7 @@ use domain::Tenant;
 use serde::Deserialize;
 
 use crate::error::AppError;
+use crate::pagination::PaginationQuery;
 use crate::extract::CurrentUser;
 use crate::state::AppState;
 
@@ -43,12 +44,26 @@ use crate::state::AppState;
 ///
 /// Read-only; no `resolve_active_tenant` (see module doc).
 pub async fn list_my_tenants(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     current: CurrentUser,
+    Query(q): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let user = current.require()?;
-    let tenants = saas::tenant::list_memberships(&state.saas, &user).await?;
-    Ok(Json(tenants))
+    let _user = current.require()?;
+    // Note: `list_memberships` is a membership query; pagination is over
+    // the user's memberships. We keep this as a full list for now — the
+    // paged version lives in `saas::platform::list_tenants_paged` (which
+    // needs `(tenants, list)`), not in `list_memberships`. Full response
+    // wrapped in `Page` with `total = items.len()` so the wire format is
+    // uniform with `/audit`.
+    let items = saas::tenant::list_memberships(&_state.saas, &_user).await?;
+    let (limit, offset) = q.clamp();
+    let total = items.len() as i64;
+    let items: Vec<_> = items
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok(Json(domain::Page { items, total, limit, offset }))
 }
 
 // ─── POST /tenants ─────────────────────────────────────────────────────────
@@ -72,7 +87,7 @@ pub async fn create_tenant(
 ) -> Result<impl IntoResponse, AppError> {
     let user = current.require()?;
 
-    let owner_key = RoleKey::parse("owner").map_err(|e| AppError::Access(e))?;
+    let owner_key = RoleKey::parse("owner").map_err(AppError::Access)?;
 
     let tenant: Tenant =
         saas::platform::provision_tenant(&state.saas, &user, body.name, &user, &owner_key)

@@ -1,52 +1,27 @@
-//! Simple in-memory rate limiter (Stage 3g, ported from `saas-leptos`).
-//!
-//! Sliding-window counter keyed by an arbitrary string (e.g. an email
-//! address). `try_acquire` records a hit and returns `Ok(())` if the number
-//! of hits in the current window is under `max`; otherwise it returns
-//! `Err(retry_after_secs)` and does **not** record a hit.
-//!
-//! Stage 3g usage: `POST /auth/register` is limited to `3 / 1 h` per email
-//! (see `crate::auth::register`). This mirrors `saas-leptos`'s limit on
-//! `request_email_verification`; the endpoint differs, the mechanism is the
-//! same. Per-email, not per-IP; IP-based limiting belongs to a reverse proxy
-//! or a Stage 4 rate limiter.
-//!
-//! **Process-local.** State is an in-memory `Mutex<HashMap<…>>`; it is not
-//! shared across instances. Multi-instance deployments need a shared store
-//! (Redis, DB table) — Stage 4+. Same "not distributed" caveat as the
-//! refresh-token grace window.
-//!
-//! **Bounded by key diversity, not by time.** Each distinct key occupies one
-//! map entry; per-key buckets are pruned on access, but an unbounded stream
-//! of *distinct* keys (e.g. many `register` calls with attacker-chosen
-//! addresses) grows the map. Acceptable for the reference consumer;
-//! production should add a sweep or TTL cache (Stage 4+).
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Sliding-window, per-key, in-memory rate limiter.
-pub struct SimpleRateLimiter {
+#[async_trait::async_trait]
+pub trait RateLimiter: Send + Sync {
+    /// Attempts to record a hit for `key`.
+    ///
+    /// - `Ok(())` — hit recorded; fewer than `max` hits in `[now - window, now]`.
+    /// - `Err(retry_after_secs)` — not recorded; the caller should wait at
+    ///   least this many seconds. `max = 0` always rejects. `window =
+    ///   Duration::ZERO` allows every call.
+    async fn try_acquire(&self, key: &str, max: usize, window: Duration) -> Result<(), u64>;
+}
+
+pub struct InMemoryRateLimiter {
     entries: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
-impl SimpleRateLimiter {
+impl InMemoryRateLimiter {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Attempts to record a hit for `key`.
-    ///
-    /// - `Ok(())` — hit recorded; fewer than `max` hits in
-    ///   `[now - window, now]`.
-    /// - `Err(retry_after_secs)` — not recorded; the caller should wait at
-    ///   least this many seconds. `max = 0` always rejects. `window =
-    ///   Duration::ZERO` allows every call (each hit prunes itself).
-    pub fn try_acquire(&self, key: &str, max: usize, window: Duration) -> Result<(), u64> {
-        self.try_acquire_at(Instant::now(), key, max, window)
     }
 
     fn try_acquire_at(
@@ -65,7 +40,6 @@ impl SimpleRateLimiter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let bucket = guard.entry(key.to_string()).or_default();
 
-        // Prune hits that fell out of the sliding window.
         while let Some(&front) = bucket.front() {
             if now.saturating_duration_since(front) >= window {
                 bucket.pop_front();
@@ -86,11 +60,26 @@ impl SimpleRateLimiter {
     }
 }
 
-impl Default for SimpleRateLimiter {
+impl Default for InMemoryRateLimiter {
     fn default() -> Self {
         Self::new()
     }
 }
+
+#[async_trait::async_trait]
+impl RateLimiter for InMemoryRateLimiter {
+    async fn try_acquire(&self, key: &str, max: usize, window: Duration) -> Result<(), u64> {
+        self.try_acquire_at(Instant::now(), key, max, window)
+    }
+}
+
+#[deprecated(note = "use InMemoryRateLimiter")]
+pub type SimpleRateLimiter = InMemoryRateLimiter;
+
+#[cfg(feature = "redis")]
+mod redis;
+#[cfg(feature = "redis")]
+pub use self::redis::RedisRateLimiter;
 
 #[cfg(test)]
 mod tests {
@@ -102,7 +91,7 @@ mod tests {
 
     #[test]
     fn allows_up_to_max_then_rejects() {
-        let limiter = SimpleRateLimiter::new();
+        let limiter = InMemoryRateLimiter::new();
         let t0 = Instant::now();
         let window = Duration::from_secs(3600);
         let key = "alice@example.test";
@@ -119,7 +108,7 @@ mod tests {
 
     #[test]
     fn different_keys_are_independent() {
-        let limiter = SimpleRateLimiter::new();
+        let limiter = InMemoryRateLimiter::new();
         let t0 = Instant::now();
         let window = Duration::from_secs(60);
 
@@ -131,7 +120,7 @@ mod tests {
 
     #[test]
     fn window_expiry_allows_new_hit() {
-        let limiter = SimpleRateLimiter::new();
+        let limiter = InMemoryRateLimiter::new();
         let t0 = Instant::now();
         let window = Duration::from_secs(60);
         let key = "k";
@@ -146,7 +135,7 @@ mod tests {
 
     #[test]
     fn max_zero_always_rejects() {
-        let limiter = SimpleRateLimiter::new();
+        let limiter = InMemoryRateLimiter::new();
         assert!(limiter
             .try_acquire_at(Instant::now(), "k", 0, Duration::from_secs(60))
             .is_err());

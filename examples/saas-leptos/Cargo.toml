@@ -18,6 +18,7 @@ saas = { path = "../../crates/saas", optional = true }
 db = { path = "../../crates/db", optional = true }
 audit = { path = "../../crates/audit", optional = true }
 audit-pg = { path = "../../crates/audit-pg", optional = true }
+rate-limiter = { path = "../../crates/rate-limiter", features = ["redis"], optional = true }
 
 leptos = { version = "0.8" }
 leptos_meta = { version = "0.8" }
@@ -44,6 +45,8 @@ lettre = { version = "0.11", default-features = false, features = [
     "webpki-roots",
 ], optional = true }
 async-trait = { version = "0.1", optional = true }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.16", default-features = false, optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -75,6 +78,7 @@ ssr = [
     "dep:db",
     "dep:audit",
     "dep:audit-pg",
+    "dep:rate-limiter",
     "dep:axum",
     "dep:axum-extra",
     "dep:cookie",
@@ -86,6 +90,8 @@ ssr = [
     "dep:dotenvy",
     "dep:lettre",
     "dep:async-trait",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
     "domain/ssr",
     "leptos/ssr",
     "leptos_meta/ssr",
@@ -115,3 +121,20 @@ lto = true
 codegen-units = 1
 
 [workspace]
+
+[dev-dependencies]
+# Stage 4.7: `#[sqlx::test]` for isolated per-test DBs.
+# `tokio` is already in [dependencies] as optional (ssr); pull the macro
+# runtime explicitly so `#[tokio::test]` works in tests.
+sqlx = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full", "macros"] }
+# Stage 4.7: `tower::ServiceExt::oneshot` for in-process router calls.
+tower = { version = "0.5", features = ["util"] }
+# Stage 4.7: read `Response` body as bytes.
+http-body-util = "0.1"
+
+[[test]]
+name = "e2e"
+# All server modules (`state`, `extract`, `middleware`, `auth`, …) are
+# `#[cfg(feature = "ssr")]`; the test target needs the SSR build.
+required-features = ["ssr"]

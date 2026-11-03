@@ -1,84 +1,29 @@
-//! `axum-minimal` entry point — Stage 3g portability proof.
+//! `axum-minimal` entry point.
 //!
-//! A second consumer of `rust-saas` on pure Axum, no Leptos. It uses the
-//! same public contracts (`saas::*`, `authn::*`, `access::*`, `audit::*`,
-//! `domain::*`) and the same `resolve_active_tenant` calls in mutation
-//! handlers as `examples/saas-leptos` — that is the point of Stage 3g
-//! (plan §1).
+//! Thin binary: reads env, wires `AppState` (one `PgPool`, one
+//! `CasbinAuthz`, one `PgAuditLogger`, one `Authn`, one `SaasState`),
+//! then serves `axum_minimal::build_app(app_state)`.
 //!
-//! **Wiring** mirrors `examples/saas-leptos/src/main.rs` without the
-//! Leptos-specific pieces:
+//! Everything else (handlers, middleware, router assembly) lives in the
+//! library crate \u2014 that is what `tests/e2e.rs` drives in-process via
+//! `tower::ServiceExt::oneshot` (Stage 4.7).
 //!
-//! - `db::connect` + `db::migrate` — same startup step.
-//! - `CasbinAuthz::from_pool` — one `PgPool`, one authorization engine.
-//! - `PgAuditLogger::from_pool` — one `PgPool`, one audit logger.
-//! - `AccessState::with_audit`, `Authn::with_audit`,
-//!   `SaasBuilder::with_audit` — real logger plugged into every layer
-//!   (Stage 3e contract: `with_audit` is additive; missing it is a
-//!   deployment mistake, not a compile error).
-//! - `auto_refresh` on the **protected** router — public routes
-//!   (`register`, `login`, `logout`) bypass it.
-//! - `TraceLayer` on the whole app.
-//!
-//! **Router split** (same rationale as `saas-leptos`, ADR-0002 rev.2 §2.1):
-//!
-//! - **protected** — `POST /auth/refresh`, `GET|POST /tenants`,
-//!   `GET|POST /workspaces`, `GET|POST /documents`, `GET /audit`. All
-//!   routes that read `CurrentUser::require()` go here, so `auto_refresh`
-//!   has already populated `Extension<Option<AuthUser>>`.
-//! - **public** — `POST /auth/register`, `POST /auth/login`,
-//!   `POST /auth/logout`. No actor is required; `login`/`logout` read
-//!   cookies directly. `logout` does **not** require a valid access token
-//!   (it revokes whatever refresh cookie is present — a stale access token
-//!   must not block a logout).
-//!
-//! **Module shadowing note.** `mod audit;` declares the local handler
-//! module (our `src/audit.rs`), which shadows the external `audit` crate in
-//! the crate-root namespace. Therefore the external trait is imported as
-//! `::audit::AuditLogger` (leading `::` forces the crate path). The local
-//! module is still reachable as `audit::list_audit` — that is what the
-//! router uses.
-//!
-//! **`Arc<AppState>` as router state.** Handlers take
-//! `State<Arc<AppState>>` (cheap clones, `Arc` is shared across requests),
-//! so the routers are `Router<Arc<AppState>>` and `with_state` receives
-//! `Arc::new(app_state)` — not the bare `AppState`.
-//!
-//! **Deliberate deviation from ADR-0002 rev.2 §3.8.** `saas-leptos` uses a
-//! plain helper `CurrentUser::from_request()` and deliberately avoids
-//! `axum::extract::FromRequestParts`; `axum-minimal` does the opposite —
-//! `crate::extract::CurrentUser` is a real `FromRequestParts` impl. That is
-//! exactly what 3g demonstrates (plan §2, §6); recorded in `handoff §16`
-//! and Appendix B §2.48.
+//! Deliberate deviation from ADR-0002 rev.2 \u00a73.8: `crate::extract::CurrentUser`
+//! is a real `axum::extract::FromRequestParts` impl (Axum-native pipeline);
+//! `saas-leptos` uses a plain helper because Leptos `#[server]` functions
+//! do not go through Axum's extractor pipeline. Recorded in handoff \u00a716
+//! and Appendix B \u00a72.50.
 
 use std::sync::Arc;
 
 use ::audit::AuditLogger;
 use audit_pg::PgAuditLogger;
 use authz::AuthorizationEngine;
-use axum::middleware::from_fn_with_state;
-use axum::routing::{get, post};
-use axum::Router;
-use tower_http::trace::TraceLayer;
-
-mod audit;
-mod auth_layer;
-mod auth;
-mod cookie;
-mod csrf;
-mod email;
-mod error;
-mod extract;
-mod health;
-mod middleware;
-mod rate_limit;
-mod state;
-mod tenant;
-mod workspace;
-
-use crate::email::NoopEmailSender;
-use crate::rate_limit::SimpleRateLimiter;
-use crate::state::AppState;
+use axum_minimal::email::NoopEmailSender;
+use rate_limiter::RateLimiter;
+use axum_minimal::state::AppState;
+use axum_minimal::{cookie, build_app};
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -113,23 +58,23 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(authn::DEFAULT_REFRESH_TTL_DAYS);
 
-    // ── Database + migrations ──────────────────────────────────────────────
+    // \u2500\u2500 Database + migrations \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
-    // ── Authorization engine ───────────────────────────────────────────────
+    // \u2500\u2500 Authorization engine \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
 
-    // ── Audit logger (Stage 3e) ────────────────────────────────────────────
+    // \u2500\u2500 Audit logger (Stage 3e) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
-    // ── AccessState (access crate) ─────────────────────────────────────────
+    // \u2500\u2500 AccessState (access crate) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     let access = Arc::new(
         access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
     );
 
-    // ── Authn ──────────────────────────────────────────────────────────────
+    // \u2500\u2500 Authn \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     let authn = Arc::new(
         authn::Authn::with_ttl(
             pool.clone(),
@@ -140,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         .with_audit(audit.clone()),
     );
 
-    // ── SaasState (business logic) ─────────────────────────────────────────
+    // \u2500\u2500 SaasState (business logic) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     let saas = Arc::new(
         saas::SaasBuilder::new(pool)
             .with_authz(authz)
@@ -149,81 +94,38 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
     );
 
-    // ── Email transport + rate limiter ─────────────────────────────────────
-    // `axum-minimal` ships only `NoopEmailSender` (plan §1: SMTP out of
-    // scope). The `EmailSender` trait exists so a future consumer can plug
-    // in a real sender without changing `AppState`.
-    let email: Arc<dyn email::EmailSender> = Arc::new(NoopEmailSender);
-    let rate_limit = Arc::new(SimpleRateLimiter::new());
+    // \u2500\u2500 Email transport + rate limiter \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    // SMTP out of scope for 3g \u2014 `NoopEmailSender` only.
+    let email: Arc<dyn axum_minimal::email::EmailSender> = Arc::new(NoopEmailSender);
+    let rate_limit: Arc<dyn RateLimiter> = match std::env::var("REDIS_URL") {
+        Ok(url) if !url.trim().is_empty() => Arc::new(
+            rate_limiter::RedisRateLimiter::from_url(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to Redis: {e}"))?,
+        ),
+        _ => Arc::new(rate_limiter::InMemoryRateLimiter::new()),
+    };
 
     // Stage 4.1b: cookie policy (Secure/SameSite/Max-Age).
-    let cookie_cfg = std::sync::Arc::new(
-        cookie::CookieConfig::from_env(&bind_addr),
-    );
+    let cookie_cfg = Arc::new(cookie::CookieConfig::from_env(&bind_addr));
+
+    // Stage 4.10: install the Prometheus recorder once per process.
+    // `install_recorder` is a global singleton — a second call panics.
+    // `main.rs` is the only install site for the binary; `tests/e2e.rs`
+    // uses `metrics::try_recorder()` + `build_recorder()` (idempotent).
+    let prometheus = PrometheusBuilder::new().install_recorder()?;
 
     let app_state = Arc::new(AppState {
         authn: authn.clone(),
         saas,
         email,
         rate_limit,
-        cookie: cookie_cfg.clone(),
+        cookie: cookie_cfg,
+        prometheus,
     });
 
-    // ── Router: public vs protected ────────────────────────────────────────
-    //
-    // `auto_refresh` is attached only to the protected group. It is
-    // parametrised over `Arc<Authn>` (see `middleware.rs`), so
-    // `from_fn_with_state` supplies the `Authn` explicitly — the router's
-    // own state stays `Arc<AppState>`.
-    let protected: Router<Arc<AppState>> = Router::new()
-        .route("/auth/refresh", post(auth::refresh))
-        .route(
-            "/tenants",
-            get(tenant::list_my_tenants).post(tenant::create_tenant),
-        )
-        .route(
-            "/workspaces",
-            get(workspace::list_my_workspaces).post(workspace::create_workspace),
-        )
-        .route(
-            "/documents",
-            get(workspace::list_documents).post(workspace::create_document),
-        )
-        .route("/audit", get(audit::list_audit))
-        // Axum note: the *last* `.route_layer` is the outermost. So the
-        // calls below are in reverse execution order — the request runs
-        // them top-to-bottom of this list.
-        //
-        // Stage 4.1d: server-side AuthLayer (innermost of the three — must
-        // run *after* auto_refresh has populated Extension<Option<AuthUser>>).
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            auth_layer::auth_layer,
-        ))
-        // Stage 3g: auto_refresh (verify access / rotate refresh).
-        .route_layer(from_fn_with_state(app_state.clone(), middleware::auto_refresh))
-        // Stage 4.1c: CSRF guard (outermost — reject cross-origin before
-        // doing any auth work).
-        .route_layer(axum::middleware::from_fn(csrf::csrf_guard));
+    let router = build_app(app_state);
 
-    let public: Router<Arc<AppState>> = Router::new()
-        .route("/healthz", get(health::healthz))
-        .route("/auth/register", post(auth::register))
-        .route("/auth/login", post(auth::login))
-        .route("/auth/logout", post(auth::logout));
-
-    let router = protected
-        .merge(public)
-        .layer(TraceLayer::new_for_http())
-        // Stage 4.1c: issue a `csrf` cookie on the first request
-        // (runs after the handler; if the client already has one, no-op).
-        .layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            csrf::csrf_issue,
-        ))
-        .with_state(app_state);
-
-    // ── Serve ──────────────────────────────────────────────────────────────
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {bind_addr}: {e}"))?;

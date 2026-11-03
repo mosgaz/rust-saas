@@ -2,10 +2,13 @@
 name = "audit-pg"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "PostgreSQL implementation of the audit::AuditLogger trait (audit_log table)"
 
 [dependencies]
 audit = { path = "../audit" }
+domain = { path = "../domain" }
 
 sqlx.workspace = true
 uuid.workspace = true

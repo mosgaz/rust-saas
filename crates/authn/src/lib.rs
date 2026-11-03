@@ -29,7 +29,7 @@
 //! replay of the same raw token returns [`AuthnError::TokenInvalid`], so a
 //! reset URL that leaks via browser history or `Referer` cannot overwrite
 //! the freshly rotated password. In a single transaction it rewrites
-//! `users.password_hash` and `users.password_changed_at = now()` (via
+//! `users.password_hash` and `users.password_changed_at = clock_timestamp()` (via
 //! `identity::update_password_tx`), expires every outstanding reset token
 //! for the user, and revokes every refresh-token family
 //! ([`RevokeReason::PasswordReset`]). Access JWTs issued before the change
@@ -79,6 +79,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
+use tracing::instrument;
 
 use identity::{IdentityError, UserRecord};
 
@@ -321,6 +322,7 @@ impl Authn {
         .await;
     }
 
+#[instrument(skip(self, email, password), fields(operation = "register"))]
     pub async fn register(&self, email: &str, password: &str) -> Result<AuthUser, AuthnError> {
         identity::validate_email(email)?;
         identity::validate_password(password)?;
@@ -341,6 +343,7 @@ impl Authn {
         Ok(user)
     }
 
+#[instrument(skip(self, email, password), fields(operation = "login"))]
     pub async fn login(&self, email: &str, password: &str) -> Result<AuthUser, AuthnError> {
         let record: UserRecord = match identity::find_by_email(&self.pool, email).await? {
             Some(r) => r,
@@ -438,6 +441,7 @@ impl Authn {
     /// 5. `expires_at` in the past → [`AuthnError::RefreshInvalid`].
     /// 6. Mark the row used, insert a new row in the same family, commit,
     ///    and return `(new_raw, user)`.
+#[instrument(skip(self, raw), fields(operation = "rotate_refresh_token"))]
     pub async fn rotate_refresh_token(&self, raw: &str) -> Result<(String, AuthUser), AuthnError> {
         let token_hash = hash_token(raw);
         let mut tx = self.pool.begin().await?;
@@ -692,6 +696,7 @@ impl Authn {
     /// 6. Mark token used (`WHERE used_at IS NULL`; 0 rows affected → race →
     ///    [`AuthnError::TokenInvalid`]); `UPDATE users SET email_verified_at
     ///    = COALESCE(email_verified_at, now())`; commit; return `AuthUser`.
+#[instrument(skip(self, raw), fields(operation = "verify_email"))]
     pub async fn verify_email(&self, raw: &str) -> Result<AuthUser, AuthnError> {
         let token_hash = hash_token(raw);
         let mut tx = self.pool.begin().await?;
@@ -800,6 +805,7 @@ impl Authn {
     /// path; the silent `Ok(None)` path (unknown email) does not audit
     /// (Stage 3e). Does **not** validate the target's password; does
     /// **not** touch `email_verified_at` (reset ≠ verification).
+#[instrument(skip(self, email), fields(operation = "request_password_reset"))]
     pub async fn request_password_reset(&self, email: &str) -> Result<Option<String>, AuthnError> {
         let Some(record) = identity::find_by_email(&self.pool, email).await? else {
             return Ok(None);
@@ -860,7 +866,7 @@ impl Authn {
     /// 5. `SELECT id FROM users ... FOR UPDATE` — row-lock the user,
     ///    serializing with concurrent reset attempts.
     /// 6. `identity::update_password_tx` — `password_hash = $1`,
-    ///    `password_changed_at = now()`.
+    ///    `password_changed_at = clock_timestamp()`.
     /// 7. `UPDATE password_reset_tokens SET used_at = now() WHERE user_id
     ///    = $1 AND used_at IS NULL` — expire the consumed token **and**
     ///    every other outstanding reset token of the user.
@@ -873,6 +879,7 @@ impl Authn {
     /// Access JWTs remain valid until their short `exp` (iat-vs-
     /// `password_changed_at` enforcement is Stage 4). Does **not** issue
     /// cookies or log the user in; the UI redirects to `/login`.
+#[instrument(skip(self, raw, new_password), fields(operation = "reset_password"))]
     pub async fn reset_password(
         &self,
         raw: &str,

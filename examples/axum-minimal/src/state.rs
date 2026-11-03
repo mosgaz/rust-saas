@@ -27,7 +27,8 @@ use saas::SaasState;
 
 use crate::cookie::CookieConfig;
 use crate::email::EmailSender;
-use crate::rate_limit::SimpleRateLimiter;
+use rate_limiter::RateLimiter;
+use metrics_exporter_prometheus::PrometheusHandle;
 
 /// Process-wide state, cloned into every request handler.
 ///
@@ -54,12 +55,17 @@ pub struct AppState {
     /// In-memory rate limiter; used by `POST /auth/register`
     /// (3 / 1 h per email). Process-local; not distributed (see
     /// `rate_limit.rs`).
-    pub rate_limit: Arc<SimpleRateLimiter>,
+    pub rate_limit: Arc<dyn RateLimiter>,
 
     /// Cookie policy (Secure/SameSite/Max-Age) resolved from env at startup
     /// (Stage 4.1b). Shared with `middleware::auto_refresh` and the auth
     /// handlers in `src/auth.rs`.
     pub cookie: Arc<CookieConfig>,
+
+    /// Prometheus recorder handle (Stage 4.10). Set once in `main.rs` /
+    /// `tests::setup_app` via `PrometheusBuilder::new().build_recorder()`;
+    /// `/metrics` renders it. `PrometheusHandle` is `Clone` (wraps `Arc`).
+    pub prometheus: PrometheusHandle,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Authn> {
@@ -80,8 +86,14 @@ impl axum::extract::FromRef<AppState> for Arc<dyn EmailSender> {
     }
 }
 
-impl axum::extract::FromRef<AppState> for Arc<SimpleRateLimiter> {
+impl axum::extract::FromRef<AppState> for Arc<dyn RateLimiter> {
     fn from_ref(state: &AppState) -> Self {
         state.rate_limit.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for PrometheusHandle {
+    fn from_ref(state: &AppState) -> Self {
+        state.prometheus.clone()
     }
 }

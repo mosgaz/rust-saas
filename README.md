@@ -34,9 +34,14 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **Cookie config (Stage 4.1b): `CookieConfig { secure, access_ttl, refresh_ttl }` — `Secure` defaults to non-loopback bind address; `COOKIE_SECURE=1|0` overrides. `SameSite=Lax`, `Max-Age` from TTL. Both examples.**
 - **CSRF (Stage 4.1c): `axum-minimal` — double-submit (`csrf` cookie + `X-CSRF-Token` header); `saas-leptos` — `Origin`/`Host` guard on top of `SameSite=Lax`. Two mechanisms because Leptos `#[server]` has no hook for a custom header.**
 - **`AuthLayer` (Stage 4.1d): server-side defense-in-depth in `axum-minimal` — 401 for anonymous, path-level permission for `POST /tenants` (`(tenants, create)`), `GET /audit` (`(audit, read)`); pass-through for body-scoped paths.**
-- **`/healthz` (Stage 4.4a): readiness probe in both examples — `200 {"status":"ok"}`, no DB hit, no auth, no CSRF cookie.**
+- **`/healthz` (Stage 4.4a): liveness probe in both examples — `200 {"status":"ok"}`, no DB hit, no auth, no CSRF cookie. `/readyz` (Stage 4.10) is the readiness counterpart: it checks the DB (`SELECT 1`) and, in `axum-minimal`, Redis (`PING` when `REDIS_URL` is set); returns `503` if any check is `down`.**
+- **Prometheus `/metrics` + `tracing` spans (Stage 4.10): public `/metrics` (exposition format, no PII) and `#[instrument]` spans on mutations in `authn`, `saas::platform`, `saas::member`, `access::role`. Counter examples: `login_total{status}`, `register_total{status}`. See `ADR-0007-Observability.md`.**
 - **`db::migrate_with` + `audit-pg::MIGRATOR` (Stage 4.3c): additive per-crate migration set. Composition with `db::migrate()` on the same database is not supported (sqlx → `VersionMissing`).**
 - **`authz::test_support` (Stage 4.3a): `AllowAllAuthz` / `DenyAllAuthz` under feature `test-support` — consumer tests no longer need inline mocks.**
+- **Pagination (Stage 4.8): `domain::Page<T>` + `list_*_paged` across `access`, `saas`, `audit-pg`. Offset-based (`?limit=&offset=`); old `list_*` are deprecated but remain for compatibility.**
+- **Distributed rate limiter (Stage 4.8): `crates/rate-limiter` with `RateLimiter` trait, `InMemoryRateLimiter` (default), and `RedisRateLimiter` (feature `redis`). Examples use `Arc<dyn RateLimiter>`; `REDIS_URL` toggles Redis.**
+- **SSR-correct guards (Stage 4.9): `GuardRoute` uses `Resource`/`Suspense`, so SSR responses for guarded routes contain the final content (or 401/403) instead of a "Loading…" placeholder.**
+- **`AuthLayer` in `saas-leptos` (Stage 4.9): defense-in-depth middleware — 401 for anonymous, path-level permissions for `/platform` and `/platform/audit`.**
 - **Domain-ownership RBAC: roles are data, owner of a domain has all permissions**
 - **Owner guard: the last holder of a protected role cannot be removed**
 - **Tenant and workspace member management (list; assign/remove role; permission-gated UI; role and member selects)**
@@ -144,6 +149,7 @@ authz        -> uuid, thiserror, async-trait
 audit        -> serde, uuid, thiserror, async-trait, chrono, serde_json
 audit-pg     -> audit, sqlx, uuid, thiserror, async-trait
 db           -> sqlx, anyhow
+rate-limiter -> async-trait, uuid, tracing, redis (optional)
 domain       -> serde, uuid, chrono; sqlx (optional, ssr only);
                 `test-support` feature (test-only AuthUser constructors)
 rust-saas    -> domain, authz, audit (default);
@@ -245,7 +251,7 @@ Example permissions and demo roles:
 | Email verification | SHA-256 (`sha2`) over a random raw token; raw token not persisted; 24-hour TTL, single-active per user |
 | Password reset | SHA-256 (`sha2`) over a random raw token; raw token not persisted; 1-hour TTL, single-active per user, one-shot |
 | Email delivery | `lettre` (async SMTP, tokio1-rustls, 10s timeout) in `saas-leptos`; `NoopEmailSender` in `axum-minimal`; Mailpit for local dev |
-| Rate limiting | In-memory sliding-window (`SimpleRateLimiter` in both examples; not distributed) |
+| Rate limiting | Distributed sliding-window (`RateLimiter` trait; `InMemoryRateLimiter` default, `RedisRateLimiter` via feature) |
 | Invitation tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Refresh tokens | SHA-256 (`sha2`) over a random raw token; raw token not persisted |
 | Styling | Tailwind CSS v4 (in `saas-leptos`) |
@@ -463,7 +469,7 @@ why.
 
 A small fail-fast smoke test is available at
 `examples/saas-leptos/smoke.sh` — it starts the image, checks SSR +
-static assets (CSS / JS / WASM, with a `wasm < 600 KB` regression guard),
+static assets (CSS / JS / WASM, with a `wasm < 2 MB` regression guard),
 guard routes, seed-user presence, and nine core tables, and stops the
 container. Run it from `examples/saas-leptos/`:
 
@@ -564,6 +570,28 @@ Smoke — saas-leptos:
 
     curl -i -X POST http://127.0.0.1:3395/_server/create_tenant -H 'Origin: https://evil.example' -H 'Content-Type: application/json' -d '{}' -b /tmp/cj.txt | head -1
     # HTTP/1.1 403 Forbidden
+### Health and observability
+
+Two probes, different questions:
+
+| Endpoint | Question | Checks | Auth / CSRF | K8s probe |
+|---|---|---|---|---|
+| `GET /healthz` | alive and serving HTTP? | none | no / no | `livenessProbe` |
+| `GET /readyz` | ready to accept traffic? | DB `SELECT 1`; Redis `PING` if `REDIS_URL` | no / no | `readinessProbe` |
+
+`/healthz` always returns `200 {"status":"ok"}` — no DB, no auth, no cookie (Docker `HEALTHCHECK` and k8s `livenessProbe`). `/readyz` returns `200 {"status":"ok","checks":{"db":"ok","redis":"ok"|"not_configured"}}` or `503 {"status":"fail","checks":{...}}`. `saas-leptos` reports `redis: "not_configured"` (no direct `redis` dep — `rate-limiter` encapsulates it); `axum-minimal` PINGs Redis when `REDIS_URL` is set. Both routes are on the **public** router.
+
+Metrics (Stage 4.10): both examples expose `GET /metrics` in Prometheus exposition format (`metrics` + `metrics-exporter-prometheus 0.16`, `default-features = false` — no `http-listener`, `/metrics` is rendered by an Axum handler). Public on purpose: the scraper has no session; the body contains counters only. Counters wired today: `login_total{status="success"|"failed"}`, `register_total{status="success"|"failed"|"rate_limited"}`. A consumer that needs auth wraps `/metrics` in its own middleware.
+
+Tracing (Stage 4.10): `#[instrument]` spans on mutation paths only, not on `list_*` / `get_*` (would flood production logs on every page render):
+
+- `authn`: `register`, `login`, `rotate_refresh_token`, `verify_email`, `request_password_reset`, `reset_password`.
+- `saas::platform`: `provision_tenant`, `suspend_tenant`, `activate_tenant`, `resolve_active_tenant`.
+- `saas::member`: `change_role`, `remove_role`.
+- `access::role`: `create_role`, `update_role`, `delete_role`.
+
+Span fields: `operation` (function name), `actor_id` (`Uuid`), plus `domain` / `role_key` / `tenant_id` where relevant. Secrets (`password`, `raw`, `token`, `new_password`), PII (`actor.email`), and free-form user input (`name`, `description`, `permissions`) are `skip`ped. Spans are visible under the default `RUST_LOG=info`.
+
 ### Checking the build
 
 From the repository root:
@@ -580,7 +608,7 @@ From the repository root:
 cargo test
 ```
 
-**131 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 13+37 = 50; `saas` 11+44 = 55; `access` 0+6 = 6; `authz-casbin` 0+11 = 11; `audit` 3+0 = 3; `audit-pg` 0+4 = 4. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
+**174 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 15+38 = 53; `saas` 11+46 = 57; `access` 0+6 = 6; `authz-casbin` 0+12 = 12; `audit` 3+0 = 3; `audit-pg` 0+6 = 6. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
 
 Stage 3g (`axum-minimal`) does **not** change the library test counter — `crates/*` is untouched (0 migrations, 0 breaking changes, 0 new library tests). The example ships no `tests/` directory (binary-only crate; the plan marks example smoke tests optional). Its smoke coverage is the curl checklist above, which exercises the same `saas::*` / `authn::*` calls as `saas-leptos`.
 
@@ -821,7 +849,14 @@ Second consumer — pure Axum, no Leptos; the portability proof.
 - **Stage 4.3 (done): isolation.** `authz::test_support` (`AllowAllAuthz` / `DenyAllAuthz`); `db::migrate_with` + `audit-pg::MIGRATOR`.
 - **Stage 4.4a (done): `/healthz`** in both examples.
 - **Stage 4.4b (partial): Dockerfile + WASM bundle.** Dockerfile for `saas-leptos` (multi-stage, non-root, `cargo-leptos =0.3.11`, binaryen 133, `wasm-bindgen =0.2.129`, `[profile.wasm-release]`). WASM: 1.7 MB (from 2.6 MB); **target 400 KB not met** — `wasm-opt` plateaus; further reduction requires removing dependencies. See `saas-19.md` §16.
-- Stage 4.5+ (open): CI, observability, backups, distributed rate limiting, RLS, E2E HTTP tests, outbox, audit retention/immutability, distributed single-flight refresh, escape hatch `_or_platform_admin`, pagination/filters on `/platform/audit` and `/platform/tenants`, SSR-correct guards in `saas-leptos`, server-side per-route middleware (defense in depth).
+- **Stage 4 CLOSED (4.0–4.11).** Security fixes, CI, E2E HTTP tests, pagination,
+  distributed rate limiter, SSR-correct guards, AuthLayer, observability, close-out.
+- **Stage 5 (open):** RLS (Postgres row-level security), cursor-based pagination,
+  OTel OTLP / distributed tracing, SSO (OIDC), 2FA (TOTP), cleanup TTL tables
+  (`refresh_tokens`, `email_verifications`, `password_reset_tokens`), outbox pattern
+  for audit, audit retention/immutability, distributed single-flight refresh,
+  escape hatch `_or_platform_admin`, `SaasBuilder::without_access`, UI pagination
+  for `member`/`role` pages, SSR-correct guards for `DocumentPage`/`RoleFormPage`.
 
 
 ## Pluggability: what can be replaced, what cannot
@@ -891,7 +926,7 @@ of these should not treat their absence as a bug:
 ## Compatibility
 
 All `crates/*` share **one version** (`[workspace.package] version =
-"0.2.0"`). Consumers must pin every path / git dependency to the same
+"0.2.2"`). Consumers must pin every path / git dependency to the same
 revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change
 log.
 

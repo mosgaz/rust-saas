@@ -115,10 +115,10 @@ pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
 /// Lists every tenant on the platform. Requires `(tenants, list)` in
 /// `PLATFORM_DOMAIN`.
 #[server]
-pub async fn list_tenants() -> Result<Vec<Tenant>, ServerFnError> {
+pub async fn list_tenants(limit: i64, offset: i64) -> Result<domain::Page<Tenant>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
-    saas::platform::list_tenants(&state.saas, &user)
+    saas::platform::list_tenants_paged(&state.saas, &user, limit, offset)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -157,7 +157,7 @@ pub async fn activate_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
 /// so a UI-side cap prevents accidental large reads before pagination
 /// (Stage 4).
 #[server]
-pub async fn list_audit(limit: i64) -> Result<Vec<AuditRowView>, ServerFnError> {
+pub async fn list_audit(limit: i64, offset: i64) -> Result<domain::Page<AuditRowView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     let user = crate::extract::CurrentUser::from_request().await?.require()?;
 
@@ -170,13 +170,18 @@ pub async fn list_audit(limit: i64) -> Result<Vec<AuditRowView>, ServerFnError> 
         ));
     }
 
-    let clamped = limit.clamp(1, 200);
     let logger = audit_pg::PgAuditLogger::from_pool(state.saas.pool().clone());
-    let rows = logger
-        .list(clamped)
+    let page = logger
+        .list_paged(limit, offset)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    Ok(rows.into_iter().map(AuditRowView::from).collect())
+
+    Ok(domain::Page {
+        items: page.items.into_iter().map(AuditRowView::from).collect(),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    })
 }
 
 // ─── `/platform` — tenant list ──────────────────────────────────────────────
@@ -185,7 +190,9 @@ pub async fn list_audit(limit: i64) -> Result<Vec<AuditRowView>, ServerFnError> 
 /// tenant list (suspend / activate).
 #[component]
 pub fn PlatformTenantListPage() -> impl IntoView {
-    let tenants = RwSignal::new(Vec::<Tenant>::new());
+    let page = RwSignal::new(None::<domain::Page<Tenant>>);
+    let limit = RwSignal::new(50_i64);
+    let offset = RwSignal::new(0_i64);
     let perms = RwSignal::new(std::collections::HashSet::<(String, String)>::new());
     let refresh = RwSignal::new(0u32);
     let name = RwSignal::new(String::new());
@@ -195,14 +202,16 @@ pub fn PlatformTenantListPage() -> impl IntoView {
 
     Effect::new(move |_| {
         let _ = refresh.get();
+        let lim = limit.get();
+        let off = offset.get();
         // `PermsCache` is `Clone` but not `Copy`. Clone per invocation so
         // `Effect::new`'s `move |_|` remains `FnMut`: the async block below
         // consumes the clone, not the captured `cache`.
         let cache = cache.clone();
         spawn_local(async move {
-            match list_tenants().await {
-                Ok(list) => {
-                    tenants.set(list);
+            match list_tenants(lim, off).await {
+                Ok(p) => {
+                    page.set(Some(p));
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e.to_string())),
@@ -271,14 +280,16 @@ pub fn PlatformTenantListPage() -> impl IntoView {
             <div class="mt-8">
                 <h2 class="text-xl font-semibold">"Tenants"</h2>
                 <ul class="mt-3 divide-y divide-neutral-800">
-                    {move || {
-                        let list = tenants.get();
-                        if list.is_empty() {
-                            view! {
-                                <li class="py-2 text-neutral-500">"No tenants yet."</li>
-                            }
-                                .into_any()
-                        } else {
+                    {move || match page.get() {
+                        None => view! { <li class="py-2 text-neutral-500">"Loading…"</li> }.into_any(),
+                        Some(p) => {
+                            let list = p.items;
+                            if list.is_empty() {
+                                view! {
+                                    <li class="py-2 text-neutral-500">"No tenants yet."</li>
+                                }
+                                    .into_any()
+                            } else {
                             list.into_iter()
                                 .map(|t| {
                                     let id = t.id;
@@ -345,9 +356,42 @@ pub fn PlatformTenantListPage() -> impl IntoView {
                                 })
                                 .collect_view()
                                 .into_any()
+                            }
                         }
                     }}
                 </ul>
+                {move || {
+                    if let Some(p) = page.get() {
+                        let total = p.total;
+                        let lim = p.limit;
+                        let off = p.offset;
+                        let has_prev = off > 0;
+                        let has_next = off + lim < total;
+                        Some(view! {
+                            <div class="mt-4 flex items-center justify-between">
+                                <button
+                                    class="btn text-sm"
+                                    disabled=!has_prev
+                                    on:click=move |_| offset.update(|o| *o = (*o - lim).max(0))
+                                >
+                                    "Prev"
+                                </button>
+                                <span class="text-sm text-neutral-400">
+                                    {format!("Showing {}-{} of {}", off + 1, (off + lim).min(total), total)}
+                                </span>
+                                <button
+                                    class="btn text-sm"
+                                    disabled=!has_next
+                                    on:click=move |_| offset.update(|o| *o += lim)
+                                >
+                                    "Next"
+                                </button>
+                            </div>
+                        })
+                    } else {
+                        None
+                    }
+                }}
             </div>
         </main>
     }
@@ -370,19 +414,21 @@ pub fn PlatformTenantListPage() -> impl IntoView {
 /// falls back to `100`.
 #[component]
 pub fn PlatformAuditListPage() -> impl IntoView {
-    let rows = RwSignal::new(Vec::<AuditRowView>::new());
-    let limit = RwSignal::new("100".to_string());
+    let page = RwSignal::new(None::<domain::Page<AuditRowView>>);
+    let limit = RwSignal::new("50".to_string());
+    let offset = RwSignal::new(0_i64);
     let refresh = RwSignal::new(0u32);
     let error = RwSignal::new(None::<String>);
 
     Effect::new(move |_| {
         let _ = refresh.get();
         let lim_raw = limit.get();
-        let lim = lim_raw.trim().parse::<i64>().unwrap_or(100);
+        let lim = lim_raw.trim().parse::<i64>().unwrap_or(50).clamp(1, 200);
+        let off = offset.get();
         spawn_local(async move {
-            match list_audit(lim).await {
-                Ok(list) => {
-                    rows.set(list);
+            match list_audit(lim, off).await {
+                Ok(p) => {
+                    page.set(Some(p));
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e.to_string())),
@@ -410,6 +456,7 @@ pub fn PlatformAuditListPage() -> impl IntoView {
                     min="1"
                     max="200"
                     bind:value=limit
+                    on:change=move |_| offset.set(0)
                 />
                 <button
                     class="btn mt-3"
@@ -423,14 +470,16 @@ pub fn PlatformAuditListPage() -> impl IntoView {
 
             <div class="mt-8">
                 <ul class="divide-y divide-neutral-800">
-                    {move || {
-                        let list = rows.get();
-                        if list.is_empty() {
-                            view! {
-                                <li class="py-2 text-neutral-500">"No audit rows yet."</li>
-                            }
-                                .into_any()
-                        } else {
+                    {move || match page.get() {
+                        None => view! { <li class="py-2 text-neutral-500">"Loading…"</li> }.into_any(),
+                        Some(p) => {
+                            let list = p.items;
+                            if list.is_empty() {
+                                view! {
+                                    <li class="py-2 text-neutral-500">"No audit rows yet."</li>
+                                }
+                                    .into_any()
+                            } else {
                             list.into_iter()
                                 .map(|r| {
                                     let when = r.occurred_at.to_rfc3339();
@@ -464,9 +513,42 @@ pub fn PlatformAuditListPage() -> impl IntoView {
                                 })
                                 .collect_view()
                                 .into_any()
+                            }
                         }
                     }}
                 </ul>
+                {move || {
+                    if let Some(p) = page.get() {
+                        let total = p.total;
+                        let lim = p.limit;
+                        let off = p.offset;
+                        let has_prev = off > 0;
+                        let has_next = off + lim < total;
+                        Some(view! {
+                            <div class="mt-4 flex items-center justify-between">
+                                <button
+                                    class="btn text-sm"
+                                    disabled=!has_prev
+                                    on:click=move |_| offset.update(|o| *o = (*o - lim).max(0))
+                                >
+                                    "Prev"
+                                </button>
+                                <span class="text-sm text-neutral-400">
+                                    {format!("Showing {}-{} of {}", off + 1, (off + lim).min(total), total)}
+                                </span>
+                                <button
+                                    class="btn text-sm"
+                                    disabled=!has_next
+                                    on:click=move |_| offset.update(|o| *o += lim)
+                                >
+                                    "Next"
+                                </button>
+                            </div>
+                        })
+                    } else {
+                        None
+                    }
+                }}
             </div>
         </main>
     }

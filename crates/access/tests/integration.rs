@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration tests for `access` against a real PostgreSQL.
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
@@ -271,4 +272,54 @@ async fn require_fails_if_authz_denies(pool: PgPool) {
     .expect_err("require must deny");
 
     assert!(matches!(err, AccessError::Forbidden));
+}
+
+#[sqlx::test(migrations = "../db/migrations")]
+async fn list_roles_paged_works(pool: PgPool) {
+    let state = setup(pool.clone(), false);
+    let actor = actor();
+    let domain = "tenant:test-paged";
+
+    // Create 5 roles
+    for i in 0..5 {
+        let key = RoleKey::parse(format!("role_{}", i)).unwrap();
+        access::create_role(
+            &state,
+            &actor,
+            domain,
+            &key,
+            format!("Role {}", i),
+            "".to_string(),
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Page 1: limit 2, offset 0
+    let page1 = access::list_roles_paged(&state, &actor, domain, 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.limit, 2);
+    assert_eq!(page1.offset, 0);
+    assert_eq!(page1.items[0].key.as_str(), "role_0");
+    assert_eq!(page1.items[1].key.as_str(), "role_1");
+
+    // Page 2: limit 2, offset 2
+    let page2 = access::list_roles_paged(&state, &actor, domain, 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.offset, 2);
+    assert_eq!(page2.items[0].key.as_str(), "role_2");
+
+    // Page 3: offset beyond total
+    let page3 = access::list_roles_paged(&state, &actor, domain, 2, 10)
+        .await
+        .unwrap();
+    assert_eq!(page3.total, 5);
+    assert!(page3.items.is_empty());
 }

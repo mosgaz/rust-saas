@@ -28,7 +28,7 @@
 
 use ::access::{Permission, Role, RoleKey};
 use audit::{events, AuditEvent};
-use domain::AuthUser;
+use domain::{AuthUser, Page};
 use uuid::Uuid;
 
 use crate::{CoreError, SaasState};
@@ -57,8 +57,52 @@ pub async fn create_role(
     .map_err(Into::into)
 }
 
-/// Updates a role. Delegates to `access::update_role`
-/// (which emits `role.updated`).
+/// Updates a role **and** resynchronises `casbin_rule` for every current
+/// holder of the role.
+///
+/// `access::update_role` rewrites `roles` + `role_permissions` (and emits
+/// `role.updated` with an `added` / `removed` permission diff), but it
+/// does **not** touch `casbin_rule.p`: the source of truth for
+/// authorization. Without resync, a removed permission keeps working for
+/// existing holders, and an added permission does not apply to them
+/// (real security bug — `saas-pluggability-04 §4.21`).
+///
+/// Order (Stage 4.5a):
+/// 1. Snapshot holders: `SELECT DISTINCT v0 FROM casbin_rule
+///    WHERE ptype='g' AND v1=$key AND v2=$domain`. Taken **before** the
+///    update — a later change cannot invent a holder who was not already
+///    there, and this is the same set `access::update_role`'s metadata
+///    diff describes.
+/// 2. `access::update_role` — rewrites `roles` + `role_permissions`,
+///    returns the role with the **new** permission set.
+/// 3. `authz.purge_role(domain, key)` — removes every `p`-row for the
+///    role in this domain (and any orphan `g`-row, idempotent).
+/// 4. For each holder: `authz.grant_role(holder, domain, key,
+///    role.permissions)` — writes the `g`-row back and one `p`-row per
+///    new permission. `grant_role` is idempotent on `p`-rows
+///    (`has_policy` pre-check, Stage 3h).
+///
+/// **No `member.role_*` for holders.** The *role definition* changed, not
+/// the membership — `member.role_assigned` for a user who already held
+/// the role would be semantically false, and N events per bulk
+/// `update_role` would be audit flood, not signal. The `role.updated`
+/// event (emitted by `access::update_role`) carries the
+/// `added` / `removed` diff; forensic reconstruction is a temporal join
+/// with `member.role_assigned` / `member.role_revoked`. See Appendix B
+/// §2.62.
+///
+/// **Not atomic across `role_permissions` and `casbin_rule`.** Same A-lite
+/// window as `delete_role` (ADR-0003 §2.1): step 2 commits, step 4 is a
+/// separate set of writes via the in-memory enforcer. A failure between
+/// them leaves holders with the *old* effective permissions until a retry
+/// of `update_role` re-runs step 3–4 idempotently. This is the known
+/// `*_members` / `role_permissions` vs `casbin_rule` consistency window,
+/// unchanged.
+///
+/// **`platform` domain** has no `*_members` table, but it can still have
+/// holders (`seed` grants `platform` owner via `authz.grant_role`
+/// directly). The `SELECT DISTINCT v0` picks them up regardless of scope —
+/// no `parse_domain` filter is needed or applied.
 pub async fn update_role(
     state: &SaasState,
     actor: &AuthUser,
@@ -67,7 +111,48 @@ pub async fn update_role(
     description: String,
     permissions: &[(String, String)],
 ) -> Result<Role, CoreError> {
-    ::access::update_role(
+    // Load the role once to learn `(domain, key)` *before* the update.
+    // `access::update_role` fetches its own copy internally; this load is
+    // for the holder snapshot and the domain-scoped `purge_role` /
+    // `grant_role` calls that follow. A `NotFound` here matches what
+    // `access::update_role` would return — no behavioural difference, just
+    // an earlier error.
+    let existing = ::access::get_role_by_id(state.access(), role_id)
+        .await
+        .map_err(CoreError::from)?
+        .ok_or(CoreError::NotFound)?;
+
+    // 1. Snapshot current holders of `(domain, key)` from `casbin_rule`.
+    //    `casbin_rule.v0` is `user_id::text`; parse after fetch so a
+    //    malformed row (should not exist) fails loudly rather than silently
+    //    skipping a holder.
+    let holder_rows: Vec<String> = sqlx::query_scalar(
+        r#"
+        select distinct v0
+        from casbin_rule
+        where ptype = 'g' and v1 = $1 and v2 = $2
+        "#,
+    )
+    .bind(existing.key.as_str())
+    .bind(&existing.domain)
+    .fetch_all(state.pool())
+    .await?;
+
+    let mut holders: Vec<Uuid> = Vec::with_capacity(holder_rows.len());
+    for raw in holder_rows {
+        let id = Uuid::parse_str(&raw).map_err(|e| {
+            CoreError::Internal(format!(
+                "casbin_rule g-row v0 is not a UUID (domain={}, role={}): {e}",
+                existing.domain,
+                existing.key.as_str()
+            ))
+        })?;
+        holders.push(id);
+    }
+
+    // 2. Update `roles` + `role_permissions`; `role.updated` fires inside
+    //    `access::update_role` (with the `added` / `removed` diff).
+    let updated = ::access::update_role(
         state.access(),
         actor,
         role_id,
@@ -76,7 +161,36 @@ pub async fn update_role(
         permissions,
     )
     .await
-    .map_err(Into::into)
+    .map_err(CoreError::from)?;
+
+    // 3. Purge the role's `p`-rows (and any leftover `g`-row) so stale
+    //    permissions cannot survive the rewrite.
+    state
+        .authz()
+        .purge_role(&updated.domain, updated.key.as_str())
+        .await?;
+
+    // 4. Re-grant to every holder with the new permission set.
+    //    `updated.permissions` is `Vec<Permission>`; `grant_role` wants
+    //    `&[(String, String)]`.
+    let new_permissions: Vec<(String, String)> = updated
+        .permissions
+        .iter()
+        .map(|p| (p.resource.clone(), p.action.clone()))
+        .collect();
+    for holder in holders {
+        state
+            .authz()
+            .grant_role(
+                holder,
+                &updated.domain,
+                updated.key.as_str(),
+                &new_permissions,
+            )
+            .await?;
+    }
+
+    Ok(updated)
 }
 
 /// Deletes a role and cleans up its residuals.
@@ -151,23 +265,48 @@ pub async fn delete_role(
     Ok(())
 }
 
+/// Lists roles in `domain`. Delegates to `access::list_roles_paged`.
+pub async fn list_roles_paged(
+    state: &SaasState,
+    actor: &AuthUser,
+    domain: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Role>, CoreError> {
+    ::access::list_roles_paged(state.access(), actor, domain, limit, offset)
+        .await
+        .map_err(Into::into)
+}
+
 /// Lists roles in `domain`. Delegates to `access::list_roles`.
+#[deprecated(note = "use list_roles_paged(..., i64::MAX, 0) for 'all rows'")]
 pub async fn list_roles(
     state: &SaasState,
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<Role>, CoreError> {
-    ::access::list_roles(state.access(), actor, domain)
+    Ok(list_roles_paged(state, actor, domain, i64::MAX, 0)
+        .await?
+        .items)
+}
+
+/// Lists all permissions in the reference table. Delegates to
+/// `access::list_permissions_paged`.
+pub async fn list_permissions_paged(
+    state: &SaasState,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Permission>, CoreError> {
+    ::access::list_permissions_paged(state.access(), limit, offset)
         .await
         .map_err(Into::into)
 }
 
 /// Lists all permissions in the reference table. Delegates to
 /// `access::list_permissions`.
+#[deprecated(note = "use list_permissions_paged(..., i64::MAX, 0) for 'all rows'")]
 pub async fn list_permissions(state: &SaasState) -> Result<Vec<Permission>, CoreError> {
-    ::access::list_permissions(state.access())
-        .await
-        .map_err(Into::into)
+    Ok(list_permissions_paged(state, i64::MAX, 0).await?.items)
 }
 
 /// Returns the `(resource, action)` pairs that `actor` is effectively
@@ -188,9 +327,10 @@ pub async fn my_permissions(
     actor: &AuthUser,
     domain: &str,
 ) -> Result<Vec<(String, String)>, CoreError> {
-    let reference = ::access::list_permissions(state.access())
+    let reference = ::access::list_permissions_paged(state.access(), i64::MAX, 0)
         .await
-        .map_err(CoreError::from)?;
+        .map_err(CoreError::from)?
+        .items;
 
     let mut out = Vec::with_capacity(reference.len());
     for Permission {

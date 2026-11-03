@@ -21,6 +21,19 @@
 //! The unique index `casbin_rule_unique_idx` (migration
 //! `20261110000001_casbin_rule_unique_idx.sql`) is a belt-and-suspenders
 //! safety net on the database side.
+//!
+//! **Stage 4.5b — cross-process race on `grant_role`.** `has_policy` /
+//! `has_grouping_policy` are in-memory; across processes two replicas can
+//! both pass the pre-check and both call `add_*_policy`. The second insert
+//! hits `casbin_rule_unique_idx` (PostgreSQL `23505`), which
+//! `sqlx-adapter` surfaces as `casbin::Error::AdapterError(...)` — the
+//! trait `AuthorizationEngine` would otherwise map that to
+//! `AuthzError::Internal` and the caller would see HTTP 500 on an
+//! idempotent `assign_role`. 4.5b treats the violation as an idempotent
+//! success and reloads the in-memory model from `casbin_rule` so the
+//! pre-check reflects reality for the next call. No `sqlx-adapter` fork
+//! (ADR-0003 §3.65). The unique index is now load-bearing: it is the
+//! only cross-process safety net this reference keeps.
 
 use std::sync::Arc;
 
@@ -138,6 +151,16 @@ impl AuthorizationEngine for CasbinAuthz {
     ) -> Result<(), AuthzError> {
         let mut enforcer = self.enforcer.write().await;
 
+        // Stage 4.5b: if a cross-process race causes a unique violation on
+        // `casbin_rule_unique_idx`, the offending row is already in the
+        // database — treat it as an idempotent success and reload the
+        // in-memory model *once* at the end. Without the reload, this
+        // replica's in-memory enforcer would be missing the row another
+        // replica wrote, and `can` / `require` would disagree with the
+        // database. Multiple violations within one call coalesce into a
+        // single reload.
+        let mut needs_reload = false;
+
         // Idempotent `g`-row: skip `add_grouping_policy` when the user already
         // holds `role_key` in `domain`. `add_grouping_policy` normally
         // deduplicates, but the pre-check is cheap and makes the whole method
@@ -149,10 +172,13 @@ impl AuthorizationEngine for CasbinAuthz {
             domain.to_string(),
         ];
         if !enforcer.has_grouping_policy(grouping.clone()) {
-            enforcer
-                .add_grouping_policy(grouping)
-                .await
-                .map_err(|e| AuthzError::Internal(e.to_string()))?;
+            match enforcer.add_grouping_policy(grouping).await {
+                Ok(_) => {}
+                Err(e) if is_unique_violation(&e) => {
+                    needs_reload = true;
+                }
+                Err(e) => return Err(AuthzError::Internal(e.to_string())),
+            }
         }
 
         for (resource, action) in permissions {
@@ -170,8 +196,22 @@ impl AuthorizationEngine for CasbinAuthz {
             if enforcer.has_policy(policy.clone()) {
                 continue;
             }
+            match enforcer.add_policy(policy).await {
+                Ok(_) => {}
+                Err(e) if is_unique_violation(&e) => {
+                    needs_reload = true;
+                }
+                Err(e) => return Err(AuthzError::Internal(e.to_string())),
+            }
+        }
+
+        if needs_reload {
+            // Reload under the same write-lock so concurrent `can` / `require`
+            // reads see a consistent model. A cross-process race that produced
+            // a violation means the row is in the database; `load_policy` pulls
+            // it (and every other row we just wrote) into memory.
             enforcer
-                .add_policy(policy)
+                .load_policy()
                 .await
                 .map_err(|e| AuthzError::Internal(e.to_string()))?;
         }
@@ -259,4 +299,41 @@ impl AuthorizationEngine for CasbinAuthz {
 
         Ok(result.rows_affected())
     }
+}
+
+/// `true` iff `e` is (or wraps) a PostgreSQL unique violation raised by
+/// `casbin_rule_unique_idx` — the constraint from migration
+/// `20261110000001_casbin_rule_unique_idx.sql`.
+///
+/// **Why string matching.** `sqlx-adapter` does not preserve the typed
+/// `sqlx::Error`; it wraps it in `casbin::Error::AdapterError(Box<dyn
+/// Error + Send + Sync>)`. Downcasting would require matching on the
+/// concrete `sqlx::Error::Database` variant, which is not reachable from
+/// the trait surface without a `sqlx-adapter` fork (ADR-0003 §3.65). The
+/// `Display` string is stable for PostgreSQL (SQLSTATE `23505`,
+/// canonical `duplicate key …` phrasing) and, more importantly, the
+/// constraint name `casbin_rule_unique_idx` is deterministic: our own
+/// migration. If either ever changes, the test
+/// `grant_role_survives_unique_violation` (integration) catches the
+/// regression — the check then falls through to `AuthzError::Internal`
+/// and the test fails, surfacing the breakage instead of silently
+/// treating a genuine violation as success.
+///
+/// **What this is *not*.** Not a general "catch all errors" path — the
+/// caller still gets `AuthzError::Internal` for any non-unique failure
+/// (connection lost, FK violation, disk full, …). Only the specific
+/// constraint is treated as "already there, reload and continue".
+fn is_unique_violation(e: &casbin::Error) -> bool {
+    let msg = e.to_string();
+    // Most specific: constraint name from our own migration.
+    if msg.contains("casbin_rule_unique_idx") {
+        return true;
+    }
+    // Fallback: canonical PostgreSQL phrasing + the table name. Some
+    // `sqlx-adapter` / `casbin` version pairs strip the constraint name
+    // from the wrapped `Display`; the phrasing + table combination is
+    // specific enough in practice (`casbin_rule` is only used by this
+    // crate, and `duplicate key` only comes from a unique/PK violation).
+    let lower = msg.to_lowercase();
+    lower.contains("duplicate key") && msg.contains("casbin_rule")
 }

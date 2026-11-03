@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rust_saas
+        ports:
+          - 5430:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rust_saas"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+          JWT_SECRET: test-secret
+        run: cargo test --workspace
+
+
+  test-redis:
+    name: Test Redis Rate Limiter
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test rate-limiter with Redis
+        run: cargo test -p rate-limiter --features redis
+
+  check-examples:
+    name: Check Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check axum-minimal
+        run: cargo check --manifest-path examples/axum-minimal/Cargo.toml
+
+      - name: Check saas-leptos (SSR)
+        run: cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr
+
+      - name: Check saas-leptos (Hydrate)
+        run: cargo check --manifest-path examples/saas-leptos/Cargo.toml
+
+  e2e-examples:
+    name: E2E Examples
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rust_saas
+        ports:
+          - 5430:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rust_saas"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            examples/axum-minimal -> target
+            examples/saas-leptos -> target
+
+      # Stage 4.7: in-process HTTP tests (`tower::oneshot`), one isolated
+      # DB per test via `#[sqlx::test]`. Same 6 scenarios as the plan
+      # (`Приблизительный план` §3).
+      - name: E2E axum-minimal
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+          REDIS_URL: redis://localhost:6379
+        run: cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
+
+      # `saas-leptos` server modules are `#[cfg(feature = "ssr")]`; the
+      # `[[test]] name = "e2e" required-features = ["ssr"]` in Cargo.toml
+      # gates the target accordingly.
+      - name: E2E saas-leptos
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+          REDIS_URL: redis://localhost:6379
+        run: cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr --test e2e
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  docker-and-smoke:
+    name: Docker Build & Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build axum-minimal image
+        run: docker build -f examples/axum-minimal/Dockerfile -t rust-saas/axum-minimal:ci .
+
+      - name: Build saas-leptos image
+        run: docker build -f examples/saas-leptos/Dockerfile -t rust-saas/saas-leptos:ci .
+
+      - name: Start Postgres & Mailpit
+        run: docker compose up -d
+
+      - name: Wait for Postgres
+        run: |
+          until docker exec rust-saas-postgres-core pg_isready -U postgres -d rust_saas; do
+            sleep 1
+          done
+
+      - name: Seed database
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+        run: cargo run -p seed
+
+      - name: Run smoke test
+        env:
+          IMAGE: rust-saas/saas-leptos:ci
+          NET: rust-saas_rust_saas_net
+          PG_DB: rust_saas
+          PG_USER: postgres
+        run: ./examples/saas-leptos/smoke.sh

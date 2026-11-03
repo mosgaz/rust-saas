@@ -43,13 +43,15 @@
 //!   `metadata`).
 //! - `suspend_tenant` → `tenant.suspended` (only on transition).
 //! - `activate_tenant` → `tenant.activated` (only on transition).
+//!
 //! All emissions are best-effort via `SaasState::audit_or_warn`; a failed
 //! write does not fail the business operation (ADR-0004 §2.4).
 
 use ::access::RoleKey;
 use audit::{events, AuditEvent};
-use domain::{AuthUser, Tenant, TenantStatus, PLATFORM_DOMAIN};
+use domain::{AuthUser, Page, Tenant, TenantStatus, PLATFORM_DOMAIN};
 use uuid::Uuid;
+use tracing::instrument;
 
 use crate::{CoreError, SaasState};
 
@@ -91,6 +93,10 @@ pub async fn create_tenant(
 ///
 /// Emits `tenant.created` (Stage 3e) after the transaction commits; the
 /// target is the new tenant, the actor is `actor` (not `owner`).
+#[instrument(
+    skip(state, actor, name),
+    fields(actor_id = %actor.id, owner_id = %owner.id, role_key = %owner_role_key.as_str()),
+)]
 pub async fn provision_tenant(
     state: &SaasState,
     actor: &AuthUser,
@@ -161,23 +167,52 @@ pub async fn provision_tenant(
     Ok(tenant)
 }
 
-/// Lists every tenant on the platform, newest first.
+/// Lists every tenant on the platform, newest first, with pagination.
 ///
-/// Requires `(tenants, list)` in `PLATFORM_DOMAIN` (Stage 3f). No pagination
-/// in Stage 3f (MVP; Stage 4 adds `limit` / `offset` — see Appendix B
-/// §IV). Read-only: no audit emission.
-pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Tenant>, CoreError> {
+/// Requires `(tenants, list)` in `PLATFORM_DOMAIN` (Stage 3f).
+/// Read-only: no audit emission.
+pub async fn list_tenants_paged(
+    state: &SaasState,
+    actor: &AuthUser,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Tenant>, CoreError> {
     state
         .authz
         .require(actor.id, PLATFORM_DOMAIN, "tenants", "list")
         .await?;
 
-    let tenants = sqlx::query_as::<_, Tenant>(
-        "select id, name, status, created_at from tenants order by created_at desc",
+    let total: i64 = sqlx::query_scalar("select count(*) from tenants")
+        .fetch_one(&state.pool)
+        .await?;
+
+    let items = sqlx::query_as::<_, Tenant>(
+        r#"
+        select id, name, status, created_at
+        from tenants
+        order by created_at desc
+        limit $1 offset $2
+        "#,
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
-    Ok(tenants)
+
+    Ok(Page {
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+/// Lists every tenant on the platform, newest first.
+///
+/// **Deprecated:** use [`list_tenants_paged`] with `(i64::MAX, 0)` for "all rows".
+#[deprecated(note = "use list_tenants_paged(..., i64::MAX, 0) for 'all rows'")]
+pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Tenant>, CoreError> {
+    Ok(list_tenants_paged(state, actor, i64::MAX, 0).await?.items)
 }
 
 /// Suspends a tenant (`tenants.status = 'suspended'`).
@@ -193,6 +228,7 @@ pub async fn list_tenants(state: &SaasState, actor: &AuthUser) -> Result<Vec<Ten
 /// blocked by [`crate::invitation::create_invitation`] (defense in depth)
 /// and by [`crate::invitation::accept_invitation`] (both check
 /// `status = 'active'` on the invitation's tenant).
+#[instrument(skip(state, actor), fields(operation = "suspend_tenant", actor_id = %actor.id))]
 pub async fn suspend_tenant(
     state: &SaasState,
     actor: &AuthUser,
@@ -251,6 +287,7 @@ pub async fn suspend_tenant(
 /// `PLATFORM_DOMAIN`; emits `tenant.activated` only on a transition
 /// (`suspended` → `active`); idempotent no-op returns the row with no
 /// emission; `NotFound` if the tenant does not exist.
+#[instrument(skip(state, actor), fields(operation = "activate_tenant", actor_id = %actor.id))]
 pub async fn activate_tenant(
     state: &SaasState,
     actor: &AuthUser,
@@ -352,6 +389,7 @@ impl std::ops::Deref for ActiveTenant {
 /// are: `create_workspace`, `create_document`, `create_role`,
 /// `update_role`, `delete_role`, `assign_role`, `remove_role`,
 /// `create_invitation`.
+#[instrument(skip(state, actor), fields(operation = "resolve_active_tenant", actor_id = %actor.id))]
 pub async fn resolve_active_tenant(
     state: &SaasState,
     actor: &AuthUser,

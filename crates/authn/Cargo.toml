@@ -2,6 +2,8 @@
 name = "authn"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "Authentication: Argon2, JWT access tokens, opaque refresh tokens with rotation and family revocation"
 
 [dependencies]

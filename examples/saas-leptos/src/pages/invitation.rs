@@ -30,8 +30,8 @@
 //!     (case-insensitive) → the server returns
 //!     [`saas::CoreError::Forbidden`]; the UI shows "invitation is for X,
 //!     you are logged in as Y" and a link to `/login`.
-//!   Link invitations (`email IS NULL`) skip both checks (Stage 2a
-//!   behaviour preserved).
+//!   - Link invitations (`email IS NULL`) skip both checks (Stage 2a
+//!     behaviour preserved).
 //!
 //! **Stage 3f (ADR-0002 rev.2):**
 //! - `create_invitation` resolves the tenant via

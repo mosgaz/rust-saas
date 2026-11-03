@@ -219,7 +219,7 @@ pub async fn same_origin_guard(req: Request, next: Next) -> Response {
         if o == "null" {
             return cross_origin_forbidden();
         }
-        let origin_authority = o.splitn(2, "://").nth(1).unwrap_or(o);
+        let origin_authority = o.split_once("://").map(|x| x.1).unwrap_or(o);
         match host.as_deref() {
             Some(h) if origin_authority == h => next.run(req).await,
             Some(_) => cross_origin_forbidden(),
@@ -260,7 +260,7 @@ mod origin_guard_tests {
     //! running instance).
 
     fn authority(origin: &str) -> &str {
-        origin.splitn(2, "://").nth(1).unwrap_or(origin)
+        origin.split_once("://").map(|x| x.1).unwrap_or(origin)
     }
 
     #[test]

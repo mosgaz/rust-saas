@@ -2,6 +2,8 @@
 name = "seed"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "Bootstrap binary: platform owner, demo tenant/workspace/users/roles"
 
 [[bin]]

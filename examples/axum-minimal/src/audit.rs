@@ -28,17 +28,12 @@ use audit_pg::PgAuditLogger;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+
 
 use crate::error::AppError;
 use crate::extract::CurrentUser;
+use crate::pagination::PaginationQuery;
 use crate::state::AppState;
-
-/// Default `limit` when the query param is absent.
-const DEFAULT_LIMIT: i64 = 100;
-
-/// Inclusive upper bound for `limit` (same as `saas-leptos`).
-const LIMIT_MAX: i64 = 200;
 
 /// Query params of `GET /audit`.
 ///
@@ -47,11 +42,7 @@ const LIMIT_MAX: i64 = 200;
 /// clamped to `1`; a caller that supplies `> LIMIT_MAX` gets clamped to
 /// [`LIMIT_MAX`]. Out-of-range values are not errors — the clamp is a
 /// safety net, not a validation (same behaviour as `saas-leptos`).
-#[derive(Debug, Deserialize)]
-pub struct ListAuditQuery {
-    #[serde(default)]
-    pub limit: Option<i64>,
-}
+pub type ListAuditQuery = PaginationQuery;
 
 /// Lists the most recent `audit_log` rows.
 ///
@@ -81,21 +72,12 @@ pub async fn list_audit(
         return Err(AppError::Core(saas::CoreError::Forbidden));
     }
 
-    // 4. Clamp and read. The audit table is append-only and unbounded in
-    //    3g; the clamp matches `saas-leptos`'s `LIMIT_MAX = 200`.
-    let clamped = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, LIMIT_MAX);
+    let (limit, offset) = q.clamp();
 
-    // `PgAuditLogger::from_pool` takes a fresh `PgPool` clone — the
-    // example does not store a logger on `AppState` because `AppState` is
-    // otherwise framework-agnostic (same pool, one per process —
-    // Stage 2d). A dedicated `Arc<PgAuditLogger>` on `AppState` would be
-    // equally valid; the choice here matches `saas-leptos`'s
-    // `#[server] list_audit`, which also builds the logger inline.
     let logger = PgAuditLogger::from_pool(state.saas.pool().clone());
-    let rows = logger.list(clamped).await.map_err(|e| {
-        // `AuditError::Internal` — a read-side failure surfaces as 500.
+    let page = logger.list_paged(limit, offset).await.map_err(|e| {
         AppError::Core(saas::CoreError::Internal(e.to_string()))
     })?;
 
-    Ok(Json(rows))
+    Ok(Json(page))
 }

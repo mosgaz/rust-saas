@@ -54,6 +54,7 @@ use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
 use domain::AuthUser;
 use serde::{Deserialize, Serialize};
+use metrics::counter;
 
 use crate::email::EmailResult;
 use crate::error::AppError;
@@ -108,13 +109,23 @@ pub async fn register(
     // 1. Rate limit.
     if let Err(retry_after) = state
         .rate_limit
-        .try_acquire(&body.email, 3, Duration::from_secs(3600))
+        .try_acquire(&body.email, 3, Duration::from_secs(3600)).await
     {
+        counter!("register_total", "status" => "rate_limited").increment(1);
         return Err(AppError::rate_limited(retry_after));
     }
 
     // 2. Register.
-    let user = state.authn.register(&body.email, &body.password).await?;
+    let user = match state.authn.register(&body.email, &body.password).await {
+        Ok(u) => {
+            counter!("register_total", "status" => "success").increment(1);
+            u
+        }
+        Err(e) => {
+            counter!("register_total", "status" => "failed").increment(1);
+            return Err(e.into());
+        }
+    };
 
     // 3. Tokens.
     let access = state.authn.issue_access_token(&user)?;
@@ -165,7 +176,16 @@ pub async fn login(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let user = state.authn.login(&body.email, &body.password).await?;
+    let user = match state.authn.login(&body.email, &body.password).await {
+        Ok(u) => {
+            counter!("login_total", "status" => "success").increment(1);
+            u
+        }
+        Err(e) => {
+            counter!("login_total", "status" => "failed").increment(1);
+            return Err(e.into());
+        }
+    };
 
     let access = state.authn.issue_access_token(&user)?;
     let refresh = state.authn.issue_refresh_token(&user).await?;

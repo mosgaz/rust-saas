@@ -521,3 +521,141 @@ async fn unique_index_rejects_duplicates(pool: PgPool) {
     .await
     .expect("distinct row must succeed");
 }
+
+// ─── Stage 4.5b: cross-process race on `grant_role` ────────────────────────
+
+/// Stage 4.5b: a cross-process unique violation on `casbin_rule_unique_idx`
+/// must be treated as an idempotent success, and the in-memory enforcer
+/// must be reloaded so this replica agrees with the database.
+///
+/// The test simulates "another replica already inserted this row" by
+/// writing **directly** to `casbin_rule` (bypassing the in-memory
+/// enforcer — exactly the state this replica would be in if a different
+/// process had won the race). `grant_role` then runs with the same `p`-row
+/// plus one non-racing `p`-row (`documents:write`) to also verify that the
+/// coalesced `load_policy` does not clobber rows the same call just wrote.
+///
+/// Regressions this catches:
+/// - without the 4.5b fix, `grant_role` returns `AuthzError::Internal`
+///   (HTTP 500 in a multi-replica consumer),
+/// - without the `load_policy()` after the violation, this replica's
+///   `can` / `require` would disagree with the database (they would still
+///   miss the racing row),
+/// - without the `has_policy` pre-check from Stage 3h, this call would
+///   double-insert the racing `p`-row on the `documents:write` side too —
+///   the final uniqueness assertions catch that.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn grant_role_survives_unique_violation(pool: PgPool) {
+    let authz = setup(&pool).await;
+    let user_id = Uuid::new_v4();
+    let domain = "tenant:test-race";
+    let role_key = "editor";
+
+    // Simulate a `p`-row written by *another process*: go straight to
+    // `casbin_rule`, not through `add_policy`. The in-memory enforcer of
+    // *this* replica does not know about it — same state as after a
+    // cross-process race.
+    sqlx::query(
+        r#"
+        insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
+        values ('p', $1, $2, 'documents', 'read', '', '')
+        "#,
+    )
+    .bind(role_key)
+    .bind(domain)
+    .execute(&pool)
+    .await
+    .expect("direct p-row insert simulating another process must succeed");
+
+    // Same for the `g`-row: another replica granted the role first.
+    sqlx::query(
+        r#"
+        insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
+        values ('g', $1, $2, $3, '', '', '')
+        "#,
+    )
+    .bind(user_id.to_string())
+    .bind(role_key)
+    .bind(domain)
+    .execute(&pool)
+    .await
+    .expect("direct g-row insert simulating another process must succeed");
+
+    // This replica's in-memory enforcer knows neither row. `grant_role`
+    // must:
+    //   1. hit `casbin_rule_unique_idx` on `add_grouping_policy`,
+    //   2. hit `casbin_rule_unique_idx` on `add_policy` (documents:read),
+    //   3. successfully insert `documents:write` (no race on that one),
+    //   4. reload once at the end (`needs_reload` coalesces 1–3),
+    //   5. return `Ok(())`.
+    authz
+        .grant_role(
+            user_id,
+            domain,
+            role_key,
+            &[
+                ("documents".to_string(), "read".to_string()),
+                ("documents".to_string(), "write".to_string()),
+            ],
+        )
+        .await
+        .expect("grant_role must tolerate cross-process unique violation (Stage 4.5b)");
+
+    // (a) In-memory model now agrees with DB: the racing row is visible.
+    //     This is the load-bearing assertion — without `load_policy()` after
+    //     the violation, `can` would return `false` here.
+    assert!(
+        authz
+            .can(user_id, domain, "documents", "read")
+            .await
+            .unwrap(),
+        "replica must see the row another process wrote (load_policy after violation)"
+    );
+
+    // (b) The non-racing permission this call inserted also works: the
+    //     coalesced reload must not clobber rows this call wrote itself.
+    assert!(
+        authz
+            .can(user_id, domain, "documents", "write")
+            .await
+            .unwrap(),
+        "non-racing add_policy must still insert and survive the coalesced reload"
+    );
+
+    // (c) `has_role` (raw SQL against `casbin_rule`) sees the g-row. This
+    //     is the DB side of the same check as (a) for the grouping row.
+    assert!(
+        authz.has_role(user_id, domain, role_key).await.unwrap(),
+        "g-row must exist after race"
+    );
+
+    // (d) The unique index held: exactly one row per (ptype, v0..v3).
+    let p_read_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule \
+         where ptype='p' and v0=$1 and v1=$2 and v2='documents' and v3='read'",
+    )
+    .bind(role_key)
+    .bind(domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        p_read_rows, 1,
+        "exactly one p-row for `documents:read` — unique index held across the race"
+    );
+
+    let g_rows: i64 = sqlx::query_scalar(
+        "select count(*) from casbin_rule \
+         where ptype='g' and v0=$1 and v1=$2 and v2=$3",
+    )
+    .bind(user_id.to_string())
+    .bind(role_key)
+    .bind(domain)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        g_rows, 1,
+        "exactly one g-row for `(user, editor, domain)` — unique index held across the race"
+    );
+}

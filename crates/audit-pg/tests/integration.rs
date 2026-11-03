@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! Integration tests for `audit-pg` against a real PostgreSQL.
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
@@ -260,4 +261,36 @@ async fn migrator_is_idempotent_on_repeat_run(pool: PgPool) {
         versions, 2,
         "exactly the two per-crate migrations (000, 001) must be recorded"
     );
+}
+
+// ─── Stage 4.8: Pagination ─────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "../db/migrations")]
+async fn list_paged_works(pool: PgPool) {
+    let logger = PgAuditLogger::from_pool(pool.clone());
+
+    // Insert 5 events
+    for i in 0..5 {
+        let mut ev = AuditEvent::new(format!("test.event_{}", i));
+        ev.metadata = serde_json::json!({ "idx": i });
+        logger.log(&ev).await.unwrap();
+    }
+
+    // Page 1: limit 2, offset 0
+    let page1 = logger.list_paged(2, 0).await.unwrap();
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.items[0].event_type, "test.event_4"); // newest first
+    assert_eq!(page1.items[1].event_type, "test.event_3");
+
+    // Page 2: limit 2, offset 2
+    let page2 = logger.list_paged(2, 2).await.unwrap();
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.items[0].event_type, "test.event_2");
+
+    // Offset beyond total
+    let page3 = logger.list_paged(2, 10).await.unwrap();
+    assert_eq!(page3.total, 5);
+    assert!(page3.items.is_empty());
 }
