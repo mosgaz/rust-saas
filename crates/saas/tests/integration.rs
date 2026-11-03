@@ -1384,6 +1384,10 @@ async fn change_role_partial_failure_leaves_over_permissioned_and_retry_recovers
         async fn purge_role(&self, domain: &str, role_key: &str) -> Result<u64, AuthzError> {
             self.inner.purge_role(domain, role_key).await
         }
+
+        async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+            self.inner.reload_in_memory().await
+        }
     }
 
     let casbin = Arc::new(
@@ -1758,7 +1762,7 @@ async fn accept_addressed_invitation_unverified_returns_email_not_verified(pool:
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(member, 0, "rejected accept must not write *_members");
+    assert_eq!(members, 0, "rejected accept must not write *_members");
 
     let granted = saas
         .authz()
@@ -2515,7 +2519,7 @@ async fn accept_invitation_on_suspended_tenant_returns_tenant_suspended(pool: Pg
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(member, 0, "rejected accept must not write *_members");
+    assert_eq!(members, 0, "rejected accept must not write *_members");
 
     let granted = saas
         .authz()

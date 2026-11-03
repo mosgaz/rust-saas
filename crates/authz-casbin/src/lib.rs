@@ -299,6 +299,15 @@ impl AuthorizationEngine for CasbinAuthz {
 
         Ok(result.rows_affected())
     }
+
+    async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+        let mut enforcer = self.enforcer.write().await;
+        enforcer
+            .load_policy()
+            .await
+            .map_err(|e| AuthzError::ReloadError(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// `true` iff `e` is (or wraps) a PostgreSQL unique violation raised by

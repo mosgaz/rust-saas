@@ -522,6 +522,60 @@ async fn unique_index_rejects_duplicates(pool: PgPool) {
     .expect("distinct row must succeed");
 }
 
+// ─── Stage 5.0-A1: reload_in_memory ───────────────────────────────────────
+
+/// Stage 5.0-A1 (B3): after an external `INSERT` into `casbin_rule` (e.g.
+/// the `owner_sync_casbin` trigger), `reload_in_memory` must pick up the
+/// new `p`-row in this replica's in-memory enforcer — without a process
+/// restart.
+///
+/// This is the exact scenario `bootstrap_resource_type` relies on:
+/// the SQL trigger writes the row, and `authz.reload_in_memory()` makes
+/// the current process see it.
+#[sqlx::test(migrations = "../db/migrations")]
+async fn reload_in_memory_picks_up_external_p_row(pool: PgPool) {
+    let authz = setup(&pool).await;
+    let user_id = Uuid::new_v4();
+    let domain = "tenant:test-reload";
+    let role_key = "owner";
+
+    // Grant a role with no permissions yet.
+    authz.grant_role(user_id, domain, role_key, &[]).await.unwrap();
+
+    // Sanity: `course:read` is not granted before the external write.
+    assert!(
+        !authz.can(user_id, domain, "course", "read").await.unwrap(),
+        "setup: `course:read` must not be granted yet"
+    );
+
+    // Simulate the SQL trigger: write the `p`-row directly into `casbin_rule`.
+    sqlx::query(
+        r#"
+        insert into casbin_rule (ptype, v0, v1, v2, v3, v4, v5)
+        values ('p', $1, $2, 'course', 'read', '', '')
+        "#,
+    )
+    .bind(role_key)
+    .bind(domain)
+    .execute(&pool)
+    .await
+    .expect("external p-row insert must succeed");
+
+    // Still invisible: in-memory enforcer was not reloaded.
+    assert!(
+        !authz.can(user_id, domain, "course", "read").await.unwrap(),
+        "in-memory enforcer must be stale before reload_in_memory()"
+    );
+
+    // Reload — must pick up the row.
+    authz.reload_in_memory().await.expect("reload must succeed");
+
+    assert!(
+        authz.can(user_id, domain, "course", "read").await.unwrap(),
+        "reload_in_memory must pick up the externally written p-row"
+    );
+}
+
 // ─── Stage 4.5b: cross-process race on `grant_role` ────────────────────────
 
 /// Stage 4.5b: a cross-process unique violation on `casbin_rule_unique_idx`

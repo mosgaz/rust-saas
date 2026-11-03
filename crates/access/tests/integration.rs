@@ -87,6 +87,10 @@ impl AuthorizationEngine for MockAuthz {
     async fn purge_role(&self, _domain: &str, _role_key: &str) -> Result<u64, AuthzError> {
         Ok(0)
     }
+
+    async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+        Ok(())
+    }
 }
 
 fn setup(pool: PgPool, deny: bool) -> Arc<AccessState> {

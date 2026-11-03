@@ -103,6 +103,7 @@ impl From<AuthzError> for CoreError {
         match e {
             AuthzError::Forbidden => CoreError::Forbidden,
             AuthzError::Internal(s) => CoreError::Internal(s),
+            AuthzError::ReloadError(s) => CoreError::Internal(s),
         }
     }
 }
@@ -568,6 +569,10 @@ mod tests {
 
         async fn purge_role(&self, _domain: &str, _role_key: &str) -> Result<u64, AuthzError> {
             Ok(0)
+        }
+
+        async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+            Ok(())
         }
     }
 

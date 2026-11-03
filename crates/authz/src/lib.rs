@@ -23,6 +23,8 @@ pub enum AuthzError {
     Forbidden,
     #[error("internal authorization error: {0}")]
     Internal(String),
+    #[error("reload error: {0}")]
+    ReloadError(String),
 }
 
 #[async_trait::async_trait]
@@ -104,6 +106,19 @@ pub trait AuthorizationEngine: Send + Sync {
     /// raw `DELETE` against `casbin_rule` and reload their in-memory model
     /// afterwards (see `authz-casbin` for the concrete strategy).
     async fn purge_role(&self, domain: &str, role_key: &str) -> Result<u64, AuthzError>;
+
+    /// Reload in-memory policy from the backing store.
+    ///
+    /// No-op for engines without in-memory state (OPA, SpiceDB, AllowAll, DenyAll).
+    ///
+    /// # Breaking
+    /// Trait method added in 0.3.0. All impls must implement it.
+    ///
+    /// # Phase B note
+    /// При PDP/PAP split (Phase B) метод переходит в `PolicyAdmin` (кэш
+    /// policy — PAP-состояние). `AuthorizationEngine` (PDP) может иметь
+    /// свой `reload` отдельно, если кэширует.
+    async fn reload_in_memory(&self) -> Result<(), AuthzError>;
 }
 
 // ─── Stage 4.3a: test-only doubles ──────────────────────────────────────────
@@ -195,6 +210,10 @@ pub mod test_support {
         async fn purge_role(&self, _domain: &str, _role_key: &str) -> Result<u64, AuthzError> {
             Ok(0)
         }
+
+        async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+            Ok(())
+        }
     }
 
     /// Every `can` returns `false`; `require` returns
@@ -263,6 +282,10 @@ pub mod test_support {
         async fn purge_role(&self, _domain: &str, _role_key: &str) -> Result<u64, AuthzError> {
             Ok(0)
         }
+
+        async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+            Ok(())
+        }
     }
 }
 
@@ -303,5 +326,6 @@ mod test_support_tests {
             .unwrap();
         a.revoke_role(uid, "d", "editor").await.unwrap();
         a.purge_role("d", "editor").await.unwrap();
+        a.reload_in_memory().await.unwrap();
     }
 }
