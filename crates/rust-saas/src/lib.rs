@@ -52,9 +52,9 @@ pub use saas;
 pub use saas_axum;
 #[cfg(feature = "axum")]
 pub use saas_axum::{
-    build_app, build_app_with_protected, AppError, AxumAppState, AxumAppStateBuilder, BindingScope,
-    CookieConfig, CurrentUser, EmailResult, EmailSender, NoopEmailSender, OwnedAuthzTarget,
-    PathPermissions, RouteBinding, RouteBindings,
+    build_app, build_app_full, build_app_full_with, build_app_with_protected, AppError,
+    AxumAppState, AxumAppStateBuilder, BindingScope, CookieConfig, CurrentUser, EmailResult,
+    EmailSender, NoopEmailSender, OwnedAuthzTarget, PathPermissions, RouteBinding, RouteBindings,
 };
 
 /// Applies the workspace-wide migration set (`crates/db/migrations/`).

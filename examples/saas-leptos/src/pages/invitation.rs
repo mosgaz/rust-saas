@@ -125,7 +125,9 @@ pub async fn create_invitation(
     max_uses: Option<i32>,
 ) -> Result<(Invitation, String, Option<EmailResult>), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
 
     resolve_invitation_target(&state, &user, target).await?;
 
@@ -158,7 +160,9 @@ pub async fn create_invitation(
 #[server]
 pub async fn list_invitations(target: InvitationTarget) -> Result<Vec<Invitation>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::invitation::list_invitations(&state.saas, &user, target)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -173,7 +177,9 @@ pub async fn revoke_invitation(
     invitation_id: Uuid,
 ) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::invitation::revoke_invitation(&state.saas, &user, target, invitation_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -194,7 +200,9 @@ pub async fn revoke_invitation(
 #[server]
 pub async fn accept_invitation(token: String) -> Result<Invitation, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::invitation::accept_invitation(&state.saas, &user, &token)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -226,9 +234,7 @@ async fn resolve_invitation_target(
                     .fetch_optional(state.saas.pool())
                     .await
                     .map_err(|e| ServerFnError::new(e.to_string()))?;
-            tid.ok_or_else(|| {
-                crate::error::core_error_to_server_fn(saas::CoreError::NotFound)
-            })?
+            tid.ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?
         }
     };
 
@@ -508,13 +514,7 @@ struct TenantIdParams {
 #[component]
 pub fn TenantInvitationListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
-    let tenant_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.tenant_id)
-        })
-    };
+    let tenant_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.tenant_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -545,13 +545,7 @@ struct WorkspaceIdParams {
 #[component]
 pub fn WorkspaceInvitationListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
-    let workspace_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.workspace_id)
-        })
-    };
+    let workspace_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -584,13 +578,7 @@ struct InviteTokenParams {
 #[component]
 pub fn InvitationAcceptPage() -> impl IntoView {
     let params = use_params::<InviteTokenParams>();
-    let token = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.token.clone())
-        })
-    };
+    let token = move || params.with(|r| r.as_ref().ok().and_then(|p| p.token.clone()));
 
     let invite_info = RwSignal::new(None::<Option<Invitation>>);
     let who = RwSignal::new(None::<Option<SessionUser>>);
@@ -799,6 +787,6 @@ pub fn InvitationAcceptPage() -> impl IntoView {
                 })
             }}
         </main>
-		
+
     }
 }

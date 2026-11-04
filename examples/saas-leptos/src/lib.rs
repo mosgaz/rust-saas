@@ -387,11 +387,18 @@ async fn readyz(
         _ => "down",
     };
     let ok = db == "ok";
-    let status = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (status, axum::Json(serde_json::json!({
-        "status": if ok { "ok" } else { "fail" },
-        "checks": { "db": db, "redis": "not_configured" },
-    })))
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "status": if ok { "ok" } else { "fail" },
+            "checks": { "db": db, "redis": "not_configured" },
+        })),
+    )
 }
 
 /// `GET /metrics` — Prometheus exposition format (Stage 4.10).

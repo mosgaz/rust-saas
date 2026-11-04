@@ -26,16 +26,16 @@
 
 use std::sync::Arc;
 
+use access::RoleKey;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
-use access::RoleKey;
 use domain::Tenant;
 use serde::Deserialize;
 
 use crate::error::AppError;
-use crate::pagination::PaginationQuery;
 use crate::extract::CurrentUser;
+use crate::pagination::PaginationQuery;
 use crate::state::AppState;
 
 // ─── GET /tenants ──────────────────────────────────────────────────────────
@@ -63,7 +63,12 @@ pub async fn list_my_tenants(
         .skip(offset as usize)
         .take(limit as usize)
         .collect();
-    Ok(Json(domain::Page { items, total, limit, offset }))
+    Ok(Json(domain::Page {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 // ─── POST /tenants ─────────────────────────────────────────────────────────
@@ -90,8 +95,7 @@ pub async fn create_tenant(
     let owner_key = RoleKey::parse("owner").map_err(AppError::Access)?;
 
     let tenant: Tenant =
-        saas::platform::provision_tenant(&state.saas, &user, body.name, &user, &owner_key)
-            .await?;
+        saas::platform::provision_tenant(&state.saas, &user, body.name, &user, &owner_key).await?;
 
     Ok(Json(tenant))
 }

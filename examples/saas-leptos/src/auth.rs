@@ -105,9 +105,9 @@ fn is_safe_return_url(s: &str) -> bool {
     if !s.starts_with('/') || s.starts_with("//") {
         return false;
     }
-    if s.chars().any(|c| {
-        c.is_whitespace() || c == ';' || c == ',' || c == '"' || c == '\\'
-    }) {
+    if s.chars()
+        .any(|c| c.is_whitespace() || c == ';' || c == ',' || c == '"' || c == '\\')
+    {
         return false;
     }
     let after = &s[1..];
@@ -126,8 +126,8 @@ fn append_cookie(
     response: &leptos_axum::ResponseOptions,
     c: Cookie<'static>,
 ) -> Result<(), ServerFnError> {
-    let header = HeaderValue::from_str(&c.to_string())
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let header =
+        HeaderValue::from_str(&c.to_string()).map_err(|e| ServerFnError::new(e.to_string()))?;
     response.append_header(axum::http::header::SET_COOKIE, header);
     Ok(())
 }
@@ -170,8 +170,14 @@ pub async fn register(
         .map_err(crate::error::authn_error_to_server_fn)?;
 
     let response = expect_context::<leptos_axum::ResponseOptions>();
-    append_cookie(&response, crate::middleware::access_cookie(access, &state.cookie))?;
-    append_cookie(&response, crate::middleware::refresh_cookie(refresh, &state.cookie))?;
+    append_cookie(
+        &response,
+        crate::middleware::access_cookie(access, &state.cookie),
+    )?;
+    append_cookie(
+        &response,
+        crate::middleware::refresh_cookie(refresh, &state.cookie),
+    )?;
 
     // Best-effort verification email. `AlreadyVerified` here would mean the
     // user is already verified right after `create_user` (unreachable in
@@ -227,8 +233,14 @@ pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFn
         .map_err(crate::error::authn_error_to_server_fn)?;
 
     let response = expect_context::<leptos_axum::ResponseOptions>();
-    append_cookie(&response, crate::middleware::access_cookie(access, &state.cookie))?;
-    append_cookie(&response, crate::middleware::refresh_cookie(refresh, &state.cookie))?;
+    append_cookie(
+        &response,
+        crate::middleware::access_cookie(access, &state.cookie),
+    )?;
+    append_cookie(
+        &response,
+        crate::middleware::refresh_cookie(refresh, &state.cookie),
+    )?;
 
     Ok(user)
 }
@@ -240,7 +252,9 @@ pub async fn login(email: String, password: String) -> Result<AuthUser, ServerFn
 /// page reload so that new cookies take effect across subsequent requests.
 #[server]
 pub async fn refresh() -> Result<AuthUser, ServerFnError> {
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     Ok(user)
 }
 
@@ -296,11 +310,14 @@ pub async fn request_email_verification() -> Result<EmailResult, ServerFnError> 
     use std::time::Duration;
 
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
 
     if let Err(retry_after) = state
         .rate_limit
-        .try_acquire(&user.email, 3, Duration::from_secs(3600)).await
+        .try_acquire(&user.email, 3, Duration::from_secs(3600))
+        .await
     {
         return Err(crate::error::rate_limited_error(retry_after));
     }
@@ -362,7 +379,8 @@ pub async fn request_password_reset(email: String) -> Result<(), ServerFnError> 
 
     if let Err(retry_after) = state
         .rate_limit
-        .try_acquire(&email, 5, Duration::from_secs(3600)).await
+        .try_acquire(&email, 5, Duration::from_secs(3600))
+        .await
     {
         return Err(crate::error::rate_limited_error(retry_after));
     }

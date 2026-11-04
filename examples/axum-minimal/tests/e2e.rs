@@ -32,10 +32,10 @@ use axum::Router;
 use axum_minimal::build_app;
 use axum_minimal::cookie::CookieConfig;
 use axum_minimal::email::NoopEmailSender;
-use rate_limiter::RateLimiter;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use axum_minimal::state::AppState;
 use http_body_util::BodyExt;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use rate_limiter::RateLimiter;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -79,9 +79,8 @@ async fn setup_app(pool: PgPool) -> (Router, Arc<AppState>) {
     );
     let audit: Arc<dyn audit::AuditLogger> =
         Arc::new(audit_pg::PgAuditLogger::from_pool(pool.clone()));
-    let access = Arc::new(
-        access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
-    );
+    let access =
+        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
     let authn = Arc::new(
         authn::Authn::with_ttl(
             pool.clone(),
@@ -117,9 +116,13 @@ async fn setup_app(pool: PgPool) -> (Router, Arc<AppState>) {
 
 async fn grant_platform_admin(state: &AppState, user_id: Uuid) {
     let owner_key = access::RoleKey::parse("owner").expect("role key");
-    let perms = access::get_permissions_for_role(state.saas.access(), "platform", &owner_key)
-        .await
-        .expect("platform owner perms");
+    let perms = access::get_permissions_for_role(
+        state.saas.access().expect("access"),
+        "platform",
+        &owner_key,
+    )
+    .await
+    .expect("platform owner perms");
     state
         .saas
         .authz()
@@ -219,7 +222,9 @@ async fn post_json_with_csrf(
     body: serde_json::Value,
 ) -> Response {
     let cookie = cookie_header(jar);
-    let csrf = find_cookie(jar, "csrf").expect("csrf cookie in jar").to_string();
+    let csrf = find_cookie(jar, "csrf")
+        .expect("csrf cookie in jar")
+        .to_string();
     router
         .clone()
         .oneshot(
@@ -266,10 +271,7 @@ async fn healthz_returns_200(pool: PgPool) {
         .expect("oneshot");
 
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(resp).await,
-        serde_json::json!({ "status": "ok" })
-    );
+    assert_eq!(body_json(resp).await, serde_json::json!({ "status": "ok" }));
 }
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
@@ -318,9 +320,18 @@ async fn register_sets_auth_cookies(pool: PgPool) {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let jar = parse_set_cookies(&resp);
-    assert!(find_cookie(&jar, "access_token").is_some(), "access_token missing: {jar:?}");
-    assert!(find_cookie(&jar, "refresh_token").is_some(), "refresh_token missing: {jar:?}");
-    assert!(find_cookie(&jar, "csrf").is_some(), "csrf cookie must be issued: {jar:?}");
+    assert!(
+        find_cookie(&jar, "access_token").is_some(),
+        "access_token missing: {jar:?}"
+    );
+    assert!(
+        find_cookie(&jar, "refresh_token").is_some(),
+        "refresh_token missing: {jar:?}"
+    );
+    assert!(
+        find_cookie(&jar, "csrf").is_some(),
+        "csrf cookie must be issued: {jar:?}"
+    );
 
     let json = body_json(resp).await;
     assert_eq!(json["user"]["email"].as_str(), Some(email.as_str()));
@@ -388,8 +399,14 @@ async fn logout_clears_cookies(pool: PgPool) {
                 && (s.contains("Max-Age=0") || s.contains("max-age=0"))
         })
     };
-    assert!(is_removal("access_token"), "no access_token removal in {set_cookies:?}");
-    assert!(is_removal("refresh_token"), "no refresh_token removal in {set_cookies:?}");
+    assert!(
+        is_removal("access_token"),
+        "no access_token removal in {set_cookies:?}"
+    );
+    assert!(
+        is_removal("refresh_token"),
+        "no refresh_token removal in {set_cookies:?}"
+    );
 }
 
 // ─── Tenant & workspace flow ───────────────────────────────────────────────
@@ -421,7 +438,11 @@ async fn tenant_and_workspace_flow(pool: PgPool) {
         serde_json::json!({ "tenant_id": tenant_id, "name": "Engineering" }),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK, "POST /workspaces must succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "POST /workspaces must succeed"
+    );
     let ws = body_json(resp).await;
     assert_eq!(ws["name"], "Engineering");
     assert_eq!(ws["tenant_id"], tenant_id);
@@ -548,9 +569,16 @@ async fn audit_requires_platform_audit_read(pool: PgPool) {
     // 2. Grant platform admin → 200 + array.
     grant_platform_admin(&state, user_id).await;
     let resp = get_with_jar(&router, "/audit?limit=10", &jar).await;
-    assert_eq!(resp.status(), StatusCode::OK, "platform admin must see audit");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "platform admin must see audit"
+    );
     let json = body_json(resp).await;
-    assert!(json["items"].is_array(), "audit body must be a Page with items array: {json:?}");
+    assert!(
+        json["items"].is_array(),
+        "audit body must be a Page with items array: {json:?}"
+    );
 }
 
 // ─── Rate limiting ─────────────────────────────────────────────────────────
@@ -710,5 +738,8 @@ async fn metrics_returns_prometheus_format(pool: PgPool) {
         "expected marker metric, got: {}",
         &body[..body.len().min(300)]
     );
-    assert!(body.contains("# TYPE"), "expected Prometheus exposition format");
+    assert!(
+        body.contains("# TYPE"),
+        "expected Prometheus exposition format"
+    );
 }

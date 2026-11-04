@@ -41,7 +41,9 @@ use crate::pages::member::my_permissions;
 #[server]
 pub async fn list_my_tenants() -> Result<Vec<domain::Tenant>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::tenant::list_memberships(&state.saas, &user)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -55,7 +57,9 @@ pub async fn list_my_tenants() -> Result<Vec<domain::Tenant>, ServerFnError> {
 #[server]
 pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     let owner_key =
         access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
 
@@ -64,9 +68,16 @@ pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace
         .map_err(crate::error::core_error_to_server_fn)?;
     let tenant_id = active.id;
 
-    saas::tenant::create_workspace_with_owner(&state.saas, &user, tenant_id, name, &user, &owner_key)
-        .await
-        .map_err(crate::error::core_error_to_server_fn)
+    saas::tenant::create_workspace_with_owner(
+        &state.saas,
+        &user,
+        tenant_id,
+        name,
+        &user,
+        &owner_key,
+    )
+    .await
+    .map_err(crate::error::core_error_to_server_fn)
 }
 
 // ─── Tenant list (`/tenants`) ───────────────────────────────────────────────
@@ -161,13 +172,7 @@ struct TenantParams {
 #[component]
 pub fn TenantPage() -> impl IntoView {
     let params = use_params::<TenantParams>();
-    let tenant_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.tenant_id)
-        })
-    };
+    let tenant_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.tenant_id));
 
     let can_create_workspace = RwSignal::new(false);
     let can_members = RwSignal::new(false);
@@ -180,9 +185,7 @@ pub fn TenantPage() -> impl IntoView {
         spawn_local(async move {
             match my_permissions(domain).await {
                 Ok(perms) => {
-                    let has = |r: &str, a: &str| {
-                        perms.iter().any(|(pr, pa)| pr == r && pa == a)
-                    };
+                    let has = |r: &str, a: &str| perms.iter().any(|(pr, pa)| pr == r && pa == a);
                     can_create_workspace.set(has("workspace", "create"));
                     can_members.set(has("member", "list"));
                     can_roles.set(has("role", "list"));

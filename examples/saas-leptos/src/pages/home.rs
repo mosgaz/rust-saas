@@ -1,7 +1,7 @@
 //! Landing page: links to log in / register / platform and the user's lists
 //! of tenants and workspaces. Also exposes a "jump to tenant" input.
 
-use icons::leptos::{Building2, LogIn, LayoutList, UserPlus};
+use icons::leptos::{Building2, LayoutList, LogIn, UserPlus};
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 

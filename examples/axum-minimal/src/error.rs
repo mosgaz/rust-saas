@@ -120,9 +120,9 @@ fn status_for_core(e: &CoreError) -> StatusCode {
     match e {
         CoreError::Validation(_) => StatusCode::BAD_REQUEST,
         CoreError::Unauthorized => StatusCode::UNAUTHORIZED,
-        CoreError::Forbidden
-        | CoreError::EmailNotVerified
-        | CoreError::TenantSuspended => StatusCode::FORBIDDEN,
+        CoreError::Forbidden | CoreError::EmailNotVerified | CoreError::TenantSuspended => {
+            StatusCode::FORBIDDEN
+        }
         CoreError::NotFound => StatusCode::NOT_FOUND,
         CoreError::Internal(_) | CoreError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -189,11 +189,7 @@ impl IntoResponse for AppError {
             AppError::Authn(e) => (status_for_authn(e), e.to_string(), None),
             AppError::Access(e) => (status_for_access(e), e.to_string(), None),
             AppError::Identity(e) => (status_for_identity(e), e.to_string(), None),
-            AppError::Unauthorized => (
-                StatusCode::UNAUTHORIZED,
-                "unauthorized".to_string(),
-                None,
-            ),
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string(), None),
             AppError::RateLimited { retry_after_secs } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("rate limited; try again in {retry_after_secs}s"),
