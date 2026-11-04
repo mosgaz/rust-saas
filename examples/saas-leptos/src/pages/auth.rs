@@ -254,13 +254,7 @@ enum VerifyStatus {
 #[component]
 pub fn VerifyEmailPage() -> impl IntoView {
     let params = use_params::<VerifyTokenParams>();
-    let token = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.token.clone())
-        })
-    };
+    let token = move || params.with(|r| r.as_ref().ok().and_then(|p| p.token.clone()));
 
     let status = RwSignal::new(VerifyStatus::Loading);
 
@@ -399,13 +393,7 @@ struct ResetTokenParams {
 #[component]
 pub fn ResetPasswordPage() -> impl IntoView {
     let params = use_params::<ResetTokenParams>();
-    let token = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.token.clone())
-        })
-    };
+    let token = move || params.with(|r| r.as_ref().ok().and_then(|p| p.token.clone()));
 
     let password = RwSignal::new(String::new());
     let confirm = RwSignal::new(String::new());

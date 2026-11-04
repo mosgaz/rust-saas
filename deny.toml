@@ -47,24 +47,43 @@ name = "leptos_router"
 [[bans.deny]]
 name = "leptos_meta"
 
-# HTTP (examples only).
+# HTTP: `saas-axum` (internal HTTP adapter; consumer-facing via `rust-saas::features = ["axum"]`).
+# `examples/*` are in `workspace.exclude` — `cargo deny` does not see them.
 [[bans.deny]]
+# Direct parents: `saas-axum` (the adapter), `axum-extra` (which itself
+# depends on `axum`), and `rust-saas` (dev-dep on `axum` for the
+# compile-only `feature_axum.rs` test).
 name = "axum"
+wrappers = ["axum-extra", "saas-axum", "rust-saas"]
 
 [[bans.deny]]
 name = "axum-extra"
+wrappers = ["saas-axum"]
 
 [[bans.deny]]
 name = "tower-http"
+wrappers = ["saas-axum"]
 
 [[bans.deny]]
+name = "matchit"
+# Directly by `saas-axum` (`RouteBindings::resolve`); transitively by `axum`.
+wrappers = ["saas-axum", "axum"]
+
+[[bans.deny]]
+# Direct parents: `axum` (which itself is wrapped via `saas-axum` /
+# `axum-extra` / `rust-saas`) and `hyper-util` (transitive through
+# `axum`). `saas-axum` reaches `hyper` only via `axum`.
 name = "hyper"
+wrappers = ["axum", "hyper-util"]
 
 [[bans.deny]]
 name = "reqwest"
 
-# SMTP (examples only).
+# SMTP: `saas-leptos` only (`SmtpEmailSender`).
 [[bans.deny]]
+# `saas-leptos` (SMTP) is under `examples/*` (`workspace.exclude`), so
+# `cargo deny` never sees it. Bare ban keeps `lettre` out of any workspace
+# crate; the example uses its own dep graph.
 name = "lettre"
 
 # Casbin — only authz-casbin and sqlx-adapter.

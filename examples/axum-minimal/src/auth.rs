@@ -53,8 +53,8 @@ use axum::response::IntoResponse;
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
 use domain::AuthUser;
-use serde::{Deserialize, Serialize};
 use metrics::counter;
+use serde::{Deserialize, Serialize};
 
 use crate::email::EmailResult;
 use crate::error::AppError;
@@ -109,7 +109,8 @@ pub async fn register(
     // 1. Rate limit.
     if let Err(retry_after) = state
         .rate_limit
-        .try_acquire(&body.email, 3, Duration::from_secs(3600)).await
+        .try_acquire(&body.email, 3, Duration::from_secs(3600))
+        .await
     {
         counter!("register_total", "status" => "rate_limited").increment(1);
         return Err(AppError::rate_limited(retry_after));

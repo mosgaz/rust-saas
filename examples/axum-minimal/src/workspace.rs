@@ -45,8 +45,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::pagination::PaginationQuery;
 use crate::extract::CurrentUser;
+use crate::pagination::PaginationQuery;
 use crate::state::AppState;
 
 // ─── GET /workspaces ────────────────────────────────────────────────────────
@@ -67,7 +67,12 @@ pub async fn list_my_workspaces(
         .skip(offset as usize)
         .take(limit as usize)
         .collect();
-    Ok(Json(domain::Page { items, total, limit, offset }))
+    Ok(Json(domain::Page {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 // ─── POST /workspaces ───────────────────────────────────────────────────────
@@ -97,8 +102,7 @@ pub async fn create_workspace(
 
     let owner_key = RoleKey::parse("owner").map_err(AppError::Access)?;
 
-    let active =
-        saas::platform::resolve_active_tenant(&state.saas, &user, body.tenant_id).await?;
+    let active = saas::platform::resolve_active_tenant(&state.saas, &user, body.tenant_id).await?;
     let tenant_id = active.id;
 
     let ws: Workspace = saas::tenant::create_workspace_with_owner(

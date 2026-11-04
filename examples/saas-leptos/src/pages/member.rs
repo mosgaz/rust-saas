@@ -58,7 +58,9 @@ use access::RoleKey;
 #[server]
 pub async fn list_members(domain: String) -> Result<Vec<Member>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     let scope = parse_scope(&domain)?;
     let page = saas::member::list_paged(&state.saas, &user, scope, i64::MAX, 0)
         .await
@@ -72,7 +74,9 @@ pub async fn list_members(domain: String) -> Result<Vec<Member>, ServerFnError> 
 #[server]
 pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::access::my_permissions(&state.saas, &user, &domain)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -90,7 +94,9 @@ pub async fn assign_member_role(
     role_key: String,
 ) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
     saas::access::assign_role(&state.saas, &user, user_id, &domain, &key)
@@ -110,7 +116,9 @@ pub async fn remove_member_role(
     role_key: String,
 ) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
     let scope = parse_scope(&domain)?;
@@ -155,11 +163,12 @@ pub(crate) async fn resolve_domain_tenant(
         Uuid::parse_str(id).map_err(|e| ServerFnError::new(e.to_string()))?
     } else if let Some(id) = domain.strip_prefix("workspace:") {
         let workspace_id = Uuid::parse_str(id).map_err(|e| ServerFnError::new(e.to_string()))?;
-        let tid: Option<Uuid> = sqlx::query_scalar("select tenant_id from workspaces where id = $1")
-            .bind(workspace_id)
-            .fetch_optional(state.saas.pool())
-            .await
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let tid: Option<Uuid> =
+            sqlx::query_scalar("select tenant_id from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(state.saas.pool())
+                .await
+                .map_err(|e| ServerFnError::new(e.to_string()))?;
         tid.ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?
     } else {
         return Err(ServerFnError::new(format!("invalid domain: {domain}")));
@@ -235,9 +244,8 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
         });
     });
 
-    let can_manage = move || {
-        perms.with(|p| p.contains(&("member".to_string(), "manage".to_string())))
-    };
+    let can_manage =
+        move || perms.with(|p| p.contains(&("member".to_string(), "manage".to_string())));
 
     let cache_submit = cache.clone();
     let submit_assign = move |_| {
@@ -423,13 +431,7 @@ struct TenantIdParams {
 #[component]
 pub fn TenantMemberListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
-    let tenant_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.tenant_id)
-        })
-    };
+    let tenant_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.tenant_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -460,13 +462,7 @@ struct WorkspaceIdParams {
 #[component]
 pub fn WorkspaceMemberListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
-    let workspace_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.workspace_id)
-        })
-    };
+    let workspace_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">

@@ -29,7 +29,6 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
 
-
 use crate::error::AppError;
 use crate::extract::CurrentUser;
 use crate::pagination::PaginationQuery;
@@ -65,9 +64,7 @@ pub async fn list_audit(
     let perms = saas::access::my_permissions(&state.saas, &user, domain::PLATFORM_DOMAIN).await?;
 
     // 3. Enforce `(audit, read)`.
-    let allowed = perms
-        .iter()
-        .any(|(r, a)| r == "audit" && a == "read");
+    let allowed = perms.iter().any(|(r, a)| r == "audit" && a == "read");
     if !allowed {
         return Err(AppError::Core(saas::CoreError::Forbidden));
     }
@@ -75,9 +72,10 @@ pub async fn list_audit(
     let (limit, offset) = q.clamp();
 
     let logger = PgAuditLogger::from_pool(state.saas.pool().clone());
-    let page = logger.list_paged(limit, offset).await.map_err(|e| {
-        AppError::Core(saas::CoreError::Internal(e.to_string()))
-    })?;
+    let page = logger
+        .list_paged(limit, offset)
+        .await
+        .map_err(|e| AppError::Core(saas::CoreError::Internal(e.to_string())))?;
 
     Ok(Json(page))
 }

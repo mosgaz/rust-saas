@@ -1,6 +1,6 @@
 //! `build_app(state)` — router assembly for `saas-axum` (Stage 5.0-A4.3b).
 //!
-//! **Two entry points.**
+//! **Three entry points.**
 //!
 //! - [`build_app`] — public surface only (`/healthz`, `/readyz`,
 //!   `/metrics`, `404 fallback`). Suitable for a consumer that does not
@@ -10,6 +10,13 @@
 //!   routes, with `csrf_guard` → `auto_refresh` → `auth_layer` applied
 //!   to the protected router (A4.4 uses this; a consumer with custom
 //!   endpoints uses it too).
+//! - [`build_app_full`] — public + the standard `saas-axum` endpoints
+//!   (`/auth/*`, `/my_permissions`, `/my_permissions/grouped`,
+//!   `/resource_types`) wired in one call. Additive to `build_app` /
+//!   `build_app_with_protected` (handoff §4.1, variant B). A consumer
+//!   with custom protected routes still uses
+//!   `build_app_with_protected`; a consumer that needs only the
+//!   standard surface uses `build_app_full`.
 //!
 //! **Why the split.** `axum::Router::route_layer` panics if the router
 //! has no routes ("Adding a route_layer before any routes is a no-op").
@@ -98,6 +105,71 @@ pub fn build_app_with_protected(
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         .route("/metrics", get(health::metrics))
+        .fallback(not_found);
+
+    protected
+        .merge(public)
+        .layer(TraceLayer::new_for_http())
+        .layer(from_fn_with_state(state.clone(), csrf::csrf_issue))
+        .with_state(state)
+}
+
+/// Public surface **plus** the standard `saas-axum` endpoints (Stage
+/// 5.0-A4.4): `/auth/{register,login,logout,refresh}`, `/my_permissions`,
+/// `/my_permissions/grouped`, `/resource_types`.
+///
+/// **Additive.** `build_app` (public-only) and `build_app_with_protected`
+/// (caller-supplied protected routes) are unchanged. A consumer picks one:
+/// - `build_app` — minimal; add your own protected routes via
+///   `build_app_with_protected` if you need them.
+/// - `build_app_with_protected` — public + custom protected; no standard
+///   endpoints.
+/// - `build_app_full` — public + standard endpoints; no custom protected.
+///
+/// **Public vs protected.**
+/// - **Public:** `/healthz`, `/readyz`, `/metrics`, `/auth/{register,
+///   login,logout}`. `csrf_issue` runs on the merged router (bootstraps
+///   the `csrf` cookie on first GET; skips `/healthz` internally).
+/// - **Protected** (middleware chain `csrf_guard` → `auto_refresh` →
+///   `auth_layer` → handler): `/auth/refresh`, `/my_permissions`,
+///   `/my_permissions/grouped`, `/resource_types`.
+///
+/// **Layer order** (identical to `build_app_with_protected`): the
+/// protected router is populated **first**, then `route_layer` calls run
+/// in reverse of registration, so `auth_layer` is registered first
+/// (innermost) and `csrf_guard` last (outermost).
+pub fn build_app_full(state: Arc<AxumAppState>) -> Router {
+    // `get` is module-level; only `post` needs a local import.
+    use axum::routing::post;
+
+    let protected: Router<Arc<AxumAppState>> = Router::new()
+        .route("/auth/refresh", post(crate::endpoints::refresh))
+        .route(
+            "/my_permissions",
+            get(crate::endpoints::my_permissions_flat),
+        )
+        .route(
+            "/my_permissions/grouped",
+            get(crate::endpoints::my_permissions_grouped),
+        )
+        .route("/resource_types", get(crate::endpoints::resource_types))
+        // Innermost (registered first — `route_layer` reverses order).
+        .route_layer(from_fn_with_state(state.clone(), auth_layer::auth_layer))
+        // Middle: verify access / rotate refresh, populate Extension<AuthUser>.
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            auto_refresh::auto_refresh,
+        ))
+        // Outermost: reject cross-origin mutations before any auth work.
+        .route_layer(axum::middleware::from_fn(csrf::csrf_guard));
+
+    let public: Router<Arc<AxumAppState>> = Router::new()
+        .route("/healthz", get(health::healthz))
+        .route("/readyz", get(health::readyz))
+        .route("/metrics", get(health::metrics))
+        .route("/auth/register", post(crate::endpoints::register))
+        .route("/auth/login", post(crate::endpoints::login))
+        .route("/auth/logout", post(crate::endpoints::logout))
         .fallback(not_found);
 
     protected

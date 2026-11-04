@@ -35,8 +35,8 @@ use axum::Router;
 use http_body_util::BodyExt;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use saas_axum::{
-    build_app, build_app_with_protected, AxumAppState, AxumAppStateBuilder, BindingScope,
-    OwnedAuthzTarget, PathPermissions, RouteBinding,
+    build_app, build_app_full, build_app_with_protected, AxumAppState, AxumAppStateBuilder,
+    BindingScope, OwnedAuthzTarget, PathPermissions, RouteBinding,
 };
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -1049,4 +1049,389 @@ async fn auth_layer_invalid_uuid_param_400(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = body_json(resp).await;
     assert_eq!(json["error"], "invalid path parameter");
+}
+
+// ─── A4.4: `build_app_full` endpoints (9 tests) ────────────────────────
+//
+// The endpoints added in step 6 are now mounted by `build_app_full`
+// (step 7). These tests pin:
+// - the public/protected split (`/auth/{register,login,logout}` public;
+//   `/auth/refresh`, `/my_permissions*`, `/resource_types` protected);
+// - CSRF (mutations require the double-submit token);
+// - auth cookies (`access_token`, `refresh_token`, `csrf`);
+// - `/my_permissions` flat `Vec<String>` (`"document:read"`) + grouped
+//   object — divergence from `saas-leptos` (`Vec<(String, String)>`)
+//   is documented in `endpoints/my_permissions.rs`, tracked as Phase D §D9;
+// - `/resource_types` DTO shape (`{ name, scope, default_actions }`);
+// - `bootstrap_all_core` in `AxumAppStateBuilder::build()`.
+
+// ─── Helpers (A4.4-only; existing tests have their own) ──
+
+fn parse_set_cookies(resp: &Response) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for hv in resp.headers().get_all(header::SET_COOKIE) {
+        if let Ok(s) = hv.to_str() {
+            let first = s.split(';').next().unwrap_or("");
+            let Some((name, value)) = first.split_once('=') else {
+                continue;
+            };
+            let is_removal = s.contains("Max-Age=0") || s.contains("max-age=0");
+            if !is_removal {
+                out.push((name.trim().to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn find_cookie<'a>(jar: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    jar.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+}
+
+async fn register_authenticated(router: &Router, email: &str) -> (Vec<(String, String)>, Uuid) {
+    let body = serde_json::json!({ "email": email, "password": "Password123!" }).to_string();
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("register oneshot");
+    assert_eq!(resp.status(), StatusCode::OK, "register must succeed");
+    let jar = parse_set_cookies(&resp);
+    let json = body_json(resp).await;
+    let uid = json["user"]["id"]
+        .as_str()
+        .expect("user.id must be present")
+        .parse()
+        .expect("user.id must be UUID");
+    (jar, uid)
+}
+
+async fn grant_platform_admin(state: &AxumAppState, user_id: Uuid) {
+    let owner_key = access::RoleKey::parse("owner").expect("owner key");
+    let perms = access::get_permissions_for_role(
+        state.saas.access().expect("access"),
+        "platform",
+        &owner_key,
+    )
+    .await
+    .expect("platform perms");
+    state
+        .saas
+        .authz()
+        .grant_role(user_id, "platform", "owner", &perms)
+        .await
+        .expect("grant platform owner");
+}
+
+// ─── 1. register sets auth cookies (public, rate-limited) ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn register_sets_auth_cookies(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let router = build_app_full(Arc::new(state));
+    let email = format!("reg-{}@test.local", Uuid::new_v4());
+
+    let body = serde_json::json!({ "email": email, "password": "Password123!" }).to_string();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let jar = parse_set_cookies(&resp);
+    assert!(
+        find_cookie(&jar, "access_token").is_some(),
+        "access_token missing: {jar:?}"
+    );
+    assert!(
+        find_cookie(&jar, "refresh_token").is_some(),
+        "refresh_token missing: {jar:?}"
+    );
+    assert!(find_cookie(&jar, "csrf").is_some(), "csrf missing: {jar:?}");
+
+    let json = body_json(resp).await;
+    assert_eq!(json["user"]["email"].as_str(), Some(email.as_str()));
+    assert_eq!(json["user"]["email_verified"].as_bool(), Some(false));
+    assert_eq!(json["email_result"], "Disabled");
+}
+
+// ─── 2. refresh returns the current user (protected, CSRF-checked) ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn refresh_returns_current_user(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let router = build_app_full(Arc::new(state));
+    let email = format!("ref-{}@test.local", Uuid::new_v4());
+    let (jar, _uid) = register_authenticated(&router, &email).await;
+
+    let access = find_cookie(&jar, "access_token").expect("access_token");
+    let csrf = find_cookie(&jar, "csrf").expect("csrf");
+    let cookie_hdr = format!("csrf={csrf}; access_token={access}");
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/refresh")
+                .header(header::COOKIE, &cookie_hdr)
+                .header("x-csrf-token", csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["email"].as_str(), Some(email.as_str()));
+}
+
+// ─── 3. `/my_permissions` requires auth ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn my_permissions_requires_auth(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let router = build_app_full(Arc::new(state));
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/my_permissions?domain=platform")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "error": "unauthorized" })
+    );
+}
+
+// ─── 4. flat list: `Vec<String>` (`"document:read"`), sorted ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn my_permissions_returns_flat_list_singular(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let state_arc = Arc::new(state);
+    let router = build_app_full(state_arc.clone());
+    let email = format!("pm-{}@test.local", Uuid::new_v4());
+    let (jar, uid) = register_authenticated(&router, &email).await;
+    grant_platform_admin(&state_arc, uid).await;
+
+    let access = find_cookie(&jar, "access_token").expect("access_token");
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/my_permissions?domain=platform")
+                .header(header::COOKIE, format!("access_token={access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let arr = json.as_array().expect("must be an array");
+    assert!(
+        !arr.is_empty(),
+        "platform owner must have a non-empty permission list"
+    );
+
+    for item in arr {
+        let s = item.as_str().expect("items must be strings");
+        assert!(
+            s.contains(':'),
+            "flat item must be `resource:action`, got {s:?}"
+        );
+    }
+
+    let items: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+    let mut sorted = items.clone();
+    sorted.sort();
+    assert_eq!(items, sorted, "flat list must be sorted lexicographically");
+}
+
+// ─── 5. grouped: JSON object `{ "resource": ["action", …] }` ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn my_permissions_grouped_returns_hashmap_singular(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let state_arc = Arc::new(state);
+    let router = build_app_full(state_arc.clone());
+    let email = format!("pmg-{}@test.local", Uuid::new_v4());
+    let (jar, uid) = register_authenticated(&router, &email).await;
+    grant_platform_admin(&state_arc, uid).await;
+
+    let access = find_cookie(&jar, "access_token").expect("access_token");
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/my_permissions/grouped?domain=platform")
+                .header(header::COOKIE, format!("access_token={access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let obj = json.as_object().expect("must be an object");
+    assert!(
+        !obj.is_empty(),
+        "platform owner must have a non-empty grouped map"
+    );
+
+    let audit = obj
+        .get("audit")
+        .expect("platform owner must hold `audit` permissions")
+        .as_array()
+        .expect("values must be arrays");
+    assert!(
+        audit.iter().any(|v| v.as_str() == Some("read")),
+        "`audit` must contain `read`"
+    );
+
+    for (_, v) in obj {
+        let arr = v.as_array().expect("values must be arrays");
+        for item in arr {
+            assert!(item.is_string(), "actions must be strings");
+        }
+    }
+}
+
+// ─── 6. invalid domain → 200 `[]` (documented; not a 4xx) ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn my_permissions_invalid_domain(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let router = build_app_full(Arc::new(state));
+    let email = format!("pmi-{}@test.local", Uuid::new_v4());
+    let (jar, _uid) = register_authenticated(&router, &email).await;
+
+    let access = find_cookie(&jar, "access_token").expect("access_token");
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/my_permissions?domain=garbage-format")
+                .header(header::COOKIE, format!("access_token={access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await, serde_json::json!([]));
+}
+
+// ─── 7. `/resource_types` requires auth ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn resource_types_requires_auth(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let router = build_app_full(Arc::new(state));
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/resource_types")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── 8. `/resource_types`: list of `{ name, scope, default_actions }` ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn resource_types_returns_list_singular(pool: PgPool) {
+    let state = builder(pool).build().await.expect("build must succeed");
+    let router = build_app_full(Arc::new(state));
+    let email = format!("rt-{}@test.local", Uuid::new_v4());
+    let (jar, _uid) = register_authenticated(&router, &email).await;
+
+    let access = find_cookie(&jar, "access_token").expect("access_token");
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/resource_types")
+                .header(header::COOKIE, format!("access_token={access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let arr = json.as_array().expect("must be an array");
+    assert!(
+        arr.len() >= 8,
+        "must include at least the 8 core types, got {}",
+        arr.len()
+    );
+
+    let names: Vec<&str> = arr
+        .iter()
+        .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+        .collect();
+    for expected in ["tenant", "workspace", "document", "member", "role"] {
+        assert!(
+            names.contains(&expected),
+            "missing core type {expected:?}; got {names:?}"
+        );
+    }
+
+    for item in arr {
+        assert!(
+            item.get("scope").and_then(|v| v.as_str()).is_some(),
+            "each item must have `scope: String`"
+        );
+        assert!(
+            item.get("default_actions")
+                .and_then(|v| v.as_array())
+                .is_some(),
+            "each item must have `default_actions: [String]`"
+        );
+    }
+}
+
+// ─── 9. `bootstrap_all_core` runs in `build()` ──
+
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn resource_types_available_immediately_after_startup(pool: PgPool) {
+    // No HTTP request is served — this pins the builder contract:
+    // `AxumAppStateBuilder::build()` calls `bootstrap_all_core`, so the 8
+    // core types are already in the DB when the process starts listening.
+    let state = builder(pool).build().await.expect("build must succeed");
+    let count: i64 = sqlx::query_scalar("select count(*) from resource_types")
+        .fetch_one(state.saas.pool())
+        .await
+        .expect("count query");
+    assert_eq!(
+        count, 8,
+        "bootstrap_all_core must create the 8 core types during build()"
+    );
 }

@@ -124,7 +124,5 @@ pub fn unauthorized_error() -> ServerFnError {
 /// `ServerFnError` with HTTP 429 for "rate limited; retry later".
 pub fn rate_limited_error(retry_after_secs: u64) -> ServerFnError {
     set_status(429);
-    ServerFnError::new(format!(
-        "rate limited; try again in {retry_after_secs}s"
-    ))
+    ServerFnError::new(format!("rate limited; try again in {retry_after_secs}s"))
 }

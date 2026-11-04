@@ -83,7 +83,7 @@ fn build_cookie(token: String, cfg: &CookieConfig) -> Cookie<'static> {
         .secure(cfg.secure)
         .same_site(SameSite::Lax)
         .max_age(CookieDuration::seconds(
-            cfg.refresh_max_age().as_secs() as i64,
+            cfg.refresh_max_age().as_secs() as i64
         ))
         .build()
 }
