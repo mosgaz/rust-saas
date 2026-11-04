@@ -36,6 +36,7 @@
 //! `bindings` field stores user bindings verbatim; `path_permissions` is
 //! stored as-is.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -300,6 +301,36 @@ impl AxumAppStateBuilder {
                 .await
                 .map_err(|e| AppError::Core(CoreError::from(e)))?;
             }
+        }
+
+        // 7b. Fail-fast (A4.3a): every non-`AuthenticatedOnly` user
+        //     binding must reference a declared `(resource_type, action)`.
+        //     Runs after bootstrap (steps 6–7), so custom types declared
+        //     via `with_resource_types(...)` are visible.
+        //
+        //     Skipped on `without_rbac()` builds: there is no
+        //     `resource_types` / `permissions` registry to validate
+        //     against, and `bootstrap_*` was not called. A `with_binding`
+        //     on such a build is accepted verbatim; `auth_layer` will
+        //     attempt the check at request time and likely 403 — the
+        //     consumer opted out of RBAC and is on their own for the
+        //     binding's resource/action.
+        if let Some(a) = &access_state {
+            let rt_set: HashSet<String> = sqlx::query_scalar("select name from resource_types")
+                .fetch_all(a.pool())
+                .await
+                .map_err(|e| AppError::Core(CoreError::from(e)))?
+                .into_iter()
+                .collect();
+            let perm_set: HashSet<(String, String)> =
+                sqlx::query_as::<_, (String, String)>("select resource, action from permissions")
+                    .fetch_all(a.pool())
+                    .await
+                    .map_err(|e| AppError::Core(CoreError::from(e)))?
+                    .into_iter()
+                    .collect();
+            crate::bindings::validate(&self.bindings, &rt_set, &perm_set)
+                .map_err(|msg| AppError::Core(CoreError::Validation(msg)))?;
         }
 
         // 8. Route bindings (user-supplied; built-ins — A4.3a).

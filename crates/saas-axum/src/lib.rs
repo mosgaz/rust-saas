@@ -44,5 +44,5 @@ pub use cookie::CookieConfig;
 pub use email::{EmailResult, EmailSender, NoopEmailSender};
 pub use error::AppError;
 pub use extract::CurrentUser;
-pub use router::build_app;
+pub use router::{build_app, build_app_with_protected};
 pub use state::{AxumAppState, AxumAppStateBuilder};
