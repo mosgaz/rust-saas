@@ -40,6 +40,23 @@ pub use identity;
 #[cfg(feature = "ssr")]
 pub use saas;
 
+// ── Stage 5.0-A4.0: `axum` feature ────────────────────────────────────────
+//
+// Re-exports `saas-axum` (internal Axum HTTP adapter) under one feature
+// flag. Enabled together with `ssr`; the adapter is server-only.
+//
+// **Consumer surface.** The adapter is an internal crate; consumers pull
+// `rust-saas = { features = ["axum"] }` and get everything they need from
+// `rust_saas::*`. `saas-axum` itself is not a dependency of any consumer.
+#[cfg(feature = "axum")]
+pub use saas_axum;
+#[cfg(feature = "axum")]
+pub use saas_axum::{
+    build_app, build_app_full, build_app_full_with, build_app_with_protected, AppError,
+    AxumAppState, AxumAppStateBuilder, BindingScope, CookieConfig, CurrentUser, EmailResult,
+    EmailSender, NoopEmailSender, OwnedAuthzTarget, PathPermissions, RouteBinding, RouteBindings,
+};
+
 /// Applies the workspace-wide migration set (`crates/db/migrations/`).
 ///
 /// Thin wrapper over [`db::migrate`]; the name is the

@@ -60,7 +60,9 @@ pub fn access_cookie(token: String, cfg: &CookieConfig) -> Cookie<'static> {
         .http_only(true)
         .secure(cfg.secure)
         .same_site(SameSite::Lax)
-        .max_age(CookieDuration::seconds(cfg.access_max_age().as_secs() as i64))
+        .max_age(CookieDuration::seconds(
+            cfg.access_max_age().as_secs() as i64
+        ))
         .build()
 }
 
@@ -72,7 +74,9 @@ pub fn refresh_cookie(token: String, cfg: &CookieConfig) -> Cookie<'static> {
         .http_only(true)
         .secure(cfg.secure)
         .same_site(SameSite::Lax)
-        .max_age(CookieDuration::seconds(cfg.refresh_max_age().as_secs() as i64))
+        .max_age(CookieDuration::seconds(
+            cfg.refresh_max_age().as_secs() as i64
+        ))
         .build()
 }
 

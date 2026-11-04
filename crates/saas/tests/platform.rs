@@ -45,13 +45,10 @@ async fn make_user(pool: &PgPool, label: &str) -> AuthUser {
 
 async fn grant_platform_admin(state: &SaasState, user: &AuthUser) {
     let owner_key = RoleKey::parse("owner").unwrap();
-    let perms = ::access::get_permissions_for_role(
-        state.access().expect("access"),
-        "platform",
-        &owner_key,
-    )
-    .await
-    .unwrap();
+    let perms =
+        ::access::get_permissions_for_role(state.access().expect("access"), "platform", &owner_key)
+            .await
+            .unwrap();
     state
         .authz()
         .grant_role(user.id, "platform", "owner", &perms)
@@ -63,10 +60,7 @@ fn unique_name(label: &str) -> String {
     format!("{label}-{}", Uuid::new_v4())
 }
 
-async fn provision_tenant_and_workspace(
-    pool: &PgPool,
-    saas: &SaasState,
-) -> (Uuid, Uuid, AuthUser) {
+async fn provision_tenant_and_workspace(pool: &PgPool, saas: &SaasState) -> (Uuid, Uuid, AuthUser) {
     let admin = make_user(pool, "admin").await;
     grant_platform_admin(saas, &admin).await;
     let owner = make_user(pool, "owner").await;
@@ -266,7 +260,6 @@ async fn is_workspace_member_true_false(pool: PgPool) {
         "random workspace_id → false"
     );
 }
-
 
 // ─── Stage 5.0-A2.3: without_access + create_workspace_with_owner ──────────
 

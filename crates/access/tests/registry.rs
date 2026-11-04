@@ -20,11 +20,10 @@ use sqlx::PgPool;
 /// types, update this list — the test is the contract.
 #[sqlx::test(migrations = "../db/migrations")]
 async fn resource_types_has_8_core(pool: PgPool) {
-    let names: Vec<String> =
-        sqlx::query_scalar("select name from resource_types order by name")
-            .fetch_all(&pool)
-            .await
-            .expect("query resource_types");
+    let names: Vec<String> = sqlx::query_scalar("select name from resource_types order by name")
+        .fetch_all(&pool)
+        .await
+        .expect("query resource_types");
 
     assert_eq!(
         names,
@@ -137,7 +136,10 @@ async fn fk_permissions_resource_type_prevents_delete(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(exists, "document resource type must survive the rejected delete");
+    assert!(
+        exists,
+        "document resource type must survive the rejected delete"
+    );
 }
 
 /// A1.3 step 1: legacy import. Simulates a consumer database that

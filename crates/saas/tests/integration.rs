@@ -140,13 +140,10 @@ async fn make_user_with_email(pool: &PgPool, email: &str, verified: bool) -> Aut
 /// Grants `platform` owner to the given user.
 async fn grant_platform_admin(state: &SaasState, user: &AuthUser) {
     let owner_key = RoleKey::parse("owner").unwrap();
-    let perms = ::access::get_permissions_for_role(
-        state.access().expect("access"),
-        "platform",
-        &owner_key,
-    )
-    .await
-    .unwrap();
+    let perms =
+        ::access::get_permissions_for_role(state.access().expect("access"), "platform", &owner_key)
+            .await
+            .unwrap();
     state
         .authz()
         .grant_role(user.id, "platform", "owner", &perms)
@@ -3249,7 +3246,6 @@ async fn member_list_paged_works(pool: PgPool) {
     assert_eq!(page2.items.len(), 2);
 }
 
-
 // ─── Stage 5.0-A2.2d: new create_workspace / without_access ──────────────
 
 /// Stage 5.0-A2.2d: `tenant::create_workspace` (4-arg, no owner) must
@@ -3295,13 +3291,12 @@ async fn create_workspace_without_owner_does_not_assign(pool: PgPool) {
         "bare create_workspace must not create owner role"
     );
 
-    let g_rows: i64 = sqlx::query_scalar(
-        "select count(*) from casbin_rule where ptype = 'g' and v2 = $1",
-    )
-    .bind(domain::workspace_domain(ws.id))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let g_rows: i64 =
+        sqlx::query_scalar("select count(*) from casbin_rule where ptype = 'g' and v2 = $1")
+            .bind(domain::workspace_domain(ws.id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         g_rows, 0,
         "bare create_workspace must not write casbin g-rows"
@@ -3325,10 +3320,9 @@ async fn create_workspace_works_without_access(pool: PgPool) {
     grant_platform_admin(&saas, &admin).await;
     let owner = make_user(&pool, "owner").await;
     let owner_key = RoleKey::parse("owner").unwrap();
-    let tenant =
-        platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
-            .await
-            .unwrap();
+    let tenant = platform::provision_tenant(&saas, &admin, unique_name("Acme"), &owner, &owner_key)
+        .await
+        .unwrap();
 
     // Phase 2: build a no-RBAC state sharing the same pool. The fresh
     // `CasbinAuthz::from_pool` reloads from `casbin_rule`, so the

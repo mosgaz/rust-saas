@@ -65,8 +65,8 @@ use ::access::RoleKey;
 use audit::{events, AuditEvent};
 use domain::{AuthUser, Member, Page};
 use sqlx::types::chrono::{DateTime, Utc};
-use uuid::Uuid;
 use tracing::instrument;
+use uuid::Uuid;
 
 use crate::{access as saas_access, CoreError, SaasState};
 

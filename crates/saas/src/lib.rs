@@ -174,9 +174,7 @@ impl SaasState {
     /// by construction.
     pub fn access(&self) -> Result<&AccessState, CoreError> {
         self.access.as_deref().ok_or_else(|| {
-            CoreError::Internal(
-                "RBAC not configured: built with without_access()".into(),
-            )
+            CoreError::Internal("RBAC not configured: built with without_access()".into())
         })
     }
 
@@ -289,9 +287,9 @@ impl SaasBuilder {
             // last call wins. Keeping the arm explicit (not `_ =>`) so
             // an accidental third combination is a compile-time surprise
             // rather than silent behaviour.
-            (Some(_), true) => unreachable!(
-                "SaasBuilder: with_access/without_access must be mutually exclusive"
-            ),
+            (Some(_), true) => {
+                unreachable!("SaasBuilder: with_access/without_access must be mutually exclusive")
+            }
         };
         let audit = self.audit.unwrap_or_else(|| Arc::new(NoopAuditLogger));
         Ok(SaasState {
@@ -785,10 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_access_without_authz_fails() {
-        let err = match SaasBuilder::new(lazy_pool())
-            .without_access()
-            .build()
-        {
+        let err = match SaasBuilder::new(lazy_pool()).without_access().build() {
             Err(e) => e,
             Ok(_) => panic!("without_authz + without_access must fail"),
         };

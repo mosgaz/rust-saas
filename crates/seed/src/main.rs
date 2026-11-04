@@ -83,9 +83,7 @@ async fn main() -> anyhow::Result<()> {
     // Grant platform admin the `owner` role in the `platform` domain.
     // Bootstrap-only: direct `authz.grant_role`, no `member.role_assigned`
     // audit event (matching `provision_tenant`/`create_workspace`).
-    let access_state = state
-        .access()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let access_state = state.access().map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let platform_perms =
         ::access::get_permissions_for_role(access_state, "platform", &owner_key).await?;
     state

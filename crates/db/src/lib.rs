@@ -81,10 +81,7 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
 /// - `MigrateError::VersionNotGreater` (wrapped) — if a consumer version
 ///   is not greater than `max(rust-saas version)`.
 /// - Any `sqlx::Error` from the underlying `run`.
-pub async fn migrate_composed(
-    pool: &PgPool,
-    consumers: &[&Migrator],
-) -> anyhow::Result<()> {
+pub async fn migrate_composed(pool: &PgPool, consumers: &[&Migrator]) -> anyhow::Result<()> {
     // 1. Collect rust-saas versions and their maximum.
     let ours: HashSet<i64> = MIGRATOR.migrations.iter().map(|m| m.version).collect();
     let our_max = ours.iter().copied().max().unwrap_or(0);
@@ -167,13 +164,9 @@ pub async fn migrate_composed(
     note = "use `migrate_composed` for the `rust-saas + consumer migrations` case; \
             `migrate_with` remains only for per-crate sets that need no rust-saas schema"
 )]
-pub async fn migrate_with(
-    pool: &PgPool,
-    migrators: &[&Migrator],
-) -> anyhow::Result<()> {
+pub async fn migrate_with(pool: &PgPool, migrators: &[&Migrator]) -> anyhow::Result<()> {
     for m in migrators {
         m.run(pool).await?;
     }
     Ok(())
 }
-

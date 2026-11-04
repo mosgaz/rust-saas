@@ -540,7 +540,10 @@ async fn reload_in_memory_picks_up_external_p_row(pool: PgPool) {
     let role_key = "owner";
 
     // Grant a role with no permissions yet.
-    authz.grant_role(user_id, domain, role_key, &[]).await.unwrap();
+    authz
+        .grant_role(user_id, domain, role_key, &[])
+        .await
+        .unwrap();
 
     // Sanity: `course:read` is not granted before the external write.
     assert!(

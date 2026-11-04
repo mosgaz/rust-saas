@@ -79,7 +79,14 @@ pub async fn auth_layer(
     // Path-level permission check, where the domain is known from path.
     let method = req.method().clone();
     let checked = if method == Method::POST && path == "/tenants" {
-        check_perm(&app_state, &user, domain::PLATFORM_DOMAIN, "tenant", "create").await
+        check_perm(
+            &app_state,
+            &user,
+            domain::PLATFORM_DOMAIN,
+            "tenant",
+            "create",
+        )
+        .await
     } else if method == Method::GET && path == "/audit" {
         check_perm(&app_state, &user, domain::PLATFORM_DOMAIN, "audit", "read").await
     } else {
@@ -111,10 +118,7 @@ async fn check_perm(
             return Err(Box::new(internal_error()));
         }
     };
-    if perms
-        .iter()
-        .any(|(r, a)| r == resource && a == action)
-    {
+    if perms.iter().any(|(r, a)| r == resource && a == action) {
         Ok(())
     } else {
         Err(Box::new(forbidden()))

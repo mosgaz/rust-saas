@@ -101,7 +101,9 @@ impl From<audit_pg::AuditRow> for AuditRowView {
 pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
 
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     let owner_key =
         access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
 
@@ -117,7 +119,9 @@ pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
 #[server]
 pub async fn list_tenants(limit: i64, offset: i64) -> Result<domain::Page<Tenant>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::platform::list_tenants_paged(&state.saas, &user, limit, offset)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -129,7 +133,9 @@ pub async fn list_tenants(limit: i64, offset: i64) -> Result<domain::Page<Tenant
 #[server]
 pub async fn suspend_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::platform::suspend_tenant(&state.saas, &user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -141,7 +147,9 @@ pub async fn suspend_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
 #[server]
 pub async fn activate_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::platform::activate_tenant(&state.saas, &user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -157,9 +165,14 @@ pub async fn activate_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
 /// so a UI-side cap prevents accidental large reads before pagination
 /// (Stage 4).
 #[server]
-pub async fn list_audit(limit: i64, offset: i64) -> Result<domain::Page<AuditRowView>, ServerFnError> {
+pub async fn list_audit(
+    limit: i64,
+    offset: i64,
+) -> Result<domain::Page<AuditRowView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
 
     let perms = saas::access::my_permissions(&state.saas, &user, domain::PLATFORM_DOMAIN)
         .await
@@ -234,9 +247,8 @@ pub fn PlatformTenantListPage() -> impl IntoView {
         });
     });
 
-    let can_manage = move || {
-        perms.with(|p| p.contains(&("tenant".to_string(), "manage".to_string())))
-    };
+    let can_manage =
+        move || perms.with(|p| p.contains(&("tenant".to_string(), "manage".to_string())));
 
     let submit = move |_| {
         spawn_local(async move {

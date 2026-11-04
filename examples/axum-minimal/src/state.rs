@@ -27,8 +27,8 @@ use saas::SaasState;
 
 use crate::cookie::CookieConfig;
 use crate::email::EmailSender;
-use rate_limiter::RateLimiter;
 use metrics_exporter_prometheus::PrometheusHandle;
+use rate_limiter::RateLimiter;
 
 /// Process-wide state, cloned into every request handler.
 ///
