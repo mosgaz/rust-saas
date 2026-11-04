@@ -29,8 +29,8 @@
 use audit::{events, AuditEvent};
 use domain::{AuthUser, Page};
 use sqlx::PgPool;
-use uuid::Uuid;
 use tracing::instrument;
+use uuid::Uuid;
 
 use crate::{AccessError, AccessState, Permission, Role, RoleKey};
 

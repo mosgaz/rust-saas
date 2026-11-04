@@ -1,0 +1,46 @@
+[package]
+name = "saas-axum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Axum HTTP adapter for rust-saas (Stage 5.0-A4)"
+
+[dependencies]
+domain = { path = "../domain", features = ["ssr"] }
+authz = { path = "../authz" }
+authz-casbin = { path = "../authz-casbin" }
+access = { path = "../access" }
+identity = { path = "../identity" }
+authn = { path = "../authn" }
+saas = { path = "../saas" }
+db = { path = "../db" }
+audit = { path = "../audit" }
+audit-pg = { path = "../audit-pg" }
+rate-limiter = { path = "../rate-limiter" }
+
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["cookie"] }
+cookie = "0.18"
+tower-http = { version = "0.6", features = ["trace"] }
+tokio = { version = "1", features = ["full"] }
+sqlx.workspace = true
+# Used only by `health::check_redis()` (`PING` on `/readyz`). `saas-axum`
+# does not pull `rate-limiter/redis` — that stays an opt-in feature of the
+# consumer (see `examples/axum-minimal/Cargo.toml`).
+redis = { workspace = true }
+serde.workspace = true
+serde_json = "1"
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+matchit = "0.8"
+
+[dev-dependencies]
+tokio.workspace = true
+sqlx = { workspace = true, features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

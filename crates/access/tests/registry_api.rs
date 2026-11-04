@@ -42,11 +42,7 @@ fn actor() -> AuthUser {
 
 /// Grant the `platform` `owner` role to `user_id` using the current
 /// `permissions` reference table. Mirrors what `seed` does in `main.rs`.
-async fn grant_platform_owner(
-    pool: &PgPool,
-    authz: &Arc<dyn AuthorizationEngine>,
-    user_id: Uuid,
-) {
+async fn grant_platform_owner(pool: &PgPool, authz: &Arc<dyn AuthorizationEngine>, user_id: Uuid) {
     let owner_key = access::RoleKey::parse("owner").unwrap();
     let perms = access::get_permissions_for_role(
         &AccessState::new(pool.clone(), authz.clone()),
@@ -119,13 +115,15 @@ async fn bootstrap_resource_type_idempotent(pool: PgPool) {
             .unwrap();
     assert_eq!(count, 1, "second bootstrap must not add a duplicate row");
 
-    let perms: i64 = sqlx::query_scalar(
-        "select count(*) from permissions where resource = 'course'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(perms, 2, "second bootstrap must not add duplicate permissions");
+    let perms: i64 =
+        sqlx::query_scalar("select count(*) from permissions where resource = 'course'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        perms, 2,
+        "second bootstrap must not add duplicate permissions"
+    );
 }
 
 #[sqlx::test(migrations = "../db/migrations")]
@@ -152,7 +150,10 @@ async fn bootstrap_resource_type_merges_actions_and_metadata(pool: PgPool) {
     .unwrap();
     assert_eq!(actions, vec!["read", "write"], "actions are unioned");
     assert_eq!(metadata["tag"], "lms", "metadata is merged (old key kept)");
-    assert_eq!(metadata["tier"], "pro", "metadata is merged (new value wins)");
+    assert_eq!(
+        metadata["tier"], "pro",
+        "metadata is merged (new value wins)"
+    );
 }
 
 #[sqlx::test(migrations = "../db/migrations")]
@@ -266,13 +267,9 @@ async fn owner_sees_new_resource_type_in_enforce_same_process(pool: PgPool) {
         "setup: `course:read` must not be granted yet"
     );
 
-    registry::bootstrap_resource_type(
-        &pool,
-        &authz,
-        &ResourceType::workspace("course", &["read"]),
-    )
-    .await
-    .unwrap();
+    registry::bootstrap_resource_type(&pool, &authz, &ResourceType::workspace("course", &["read"]))
+        .await
+        .unwrap();
 
     // Regression for B3: the in-memory enforcer must see the new
     // `(course, read)` permission without a process restart.
@@ -350,27 +347,19 @@ async fn runtime_add_action_propagates_to_owner_same_process(pool: PgPool) {
     grant_platform_owner(&pool, &authz, admin.id).await;
 
     // Declare a resource type with one action, then add a second.
-    registry::bootstrap_resource_type(
-        &pool,
-        &authz,
-        &ResourceType::workspace("course", &["read"]),
-    )
-    .await
-    .unwrap();
+    registry::bootstrap_resource_type(&pool, &authz, &ResourceType::workspace("course", &["read"]))
+        .await
+        .unwrap();
 
     // Owner sees `course:read` but not `course:publish` yet.
-    assert!(
-        authz
-            .can(admin.id, domain::PLATFORM_DOMAIN, "course", "read")
-            .await
-            .unwrap()
-    );
-    assert!(
-        !authz
-            .can(admin.id, domain::PLATFORM_DOMAIN, "course", "publish")
-            .await
-            .unwrap()
-    );
+    assert!(authz
+        .can(admin.id, domain::PLATFORM_DOMAIN, "course", "read")
+        .await
+        .unwrap());
+    assert!(!authz
+        .can(admin.id, domain::PLATFORM_DOMAIN, "course", "publish")
+        .await
+        .unwrap());
 
     registry::add_action(&state, &admin, "course", "publish")
         .await
@@ -397,18 +386,17 @@ async fn list_resource_types_returns_all(pool: PgPool) {
     assert_eq!(core.len(), 8, "8 core types from A1.1");
 
     // Add one custom type; now 9.
-    registry::bootstrap_resource_type(
-        &pool,
-        &authz,
-        &ResourceType::workspace("course", &["read"]),
-    )
-    .await
-    .unwrap();
+    registry::bootstrap_resource_type(&pool, &authz, &ResourceType::workspace("course", &["read"]))
+        .await
+        .unwrap();
 
     let all = registry::list_resource_types(&pool).await.unwrap();
     assert_eq!(all.len(), 9);
     let course = all.iter().find(|r| r.name == "course").unwrap();
-    assert!(matches!(course.scope, access::registry::ResourceScope::Workspace));
+    assert!(matches!(
+        course.scope,
+        access::registry::ResourceScope::Workspace
+    ));
 }
 
 #[sqlx::test(migrations = "../db/migrations")]

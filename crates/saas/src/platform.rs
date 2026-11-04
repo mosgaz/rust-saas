@@ -50,8 +50,8 @@
 use ::access::RoleKey;
 use audit::{events, AuditEvent};
 use domain::{AuthUser, Page, Tenant, TenantStatus, Workspace, PLATFORM_DOMAIN};
-use uuid::Uuid;
 use tracing::instrument;
+use uuid::Uuid;
 
 use crate::{CoreError, SaasState};
 
@@ -586,4 +586,3 @@ pub async fn is_workspace_member(
     .await?;
     Ok(exists)
 }
-

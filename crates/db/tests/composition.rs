@@ -56,11 +56,10 @@ async fn migrate_composed_happy(pool: PgPool) -> anyhow::Result<()> {
     assert!(exists, "consumer table `foo` must exist");
 
     // `_sqlx_migrations` records all versions, rust-saas + consumer.
-    let total: i64 = sqlx::query_scalar(
-        "select count(*) from _sqlx_migrations where success = true",
-    )
-    .fetch_one(&pool)
-    .await?;
+    let total: i64 =
+        sqlx::query_scalar("select count(*) from _sqlx_migrations where success = true")
+            .fetch_one(&pool)
+            .await?;
     let our_count = db::MIGRATOR.migrations.len() as i64;
     assert_eq!(
         total,
@@ -109,9 +108,7 @@ async fn migrate_composed_rejects_collision(pool: PgPool) -> anyhow::Result<()> 
 }
 
 #[sqlx::test(migrations = false)]
-async fn migrate_composed_consumer_versions_must_be_greater(
-    pool: PgPool,
-) -> anyhow::Result<()> {
+async fn migrate_composed_consumer_versions_must_be_greater(pool: PgPool) -> anyhow::Result<()> {
     let low = fixture("consumer_low_version").await;
 
     let err = migrate_composed(&pool, &[&low])
@@ -153,9 +150,7 @@ async fn migrate_composed_idempotent(pool: PgPool) -> anyhow::Result<()> {
 // ─── Survives a "new rust-saas migration" in `_sqlx_migrations` ───────────
 
 #[sqlx::test(migrations = false)]
-async fn migrate_composed_survives_new_rust_saas_migration(
-    pool: PgPool,
-) -> anyhow::Result<()> {
+async fn migrate_composed_survives_new_rust_saas_migration(pool: PgPool) -> anyhow::Result<()> {
     // Imagine `_sqlx_migrations` already contains a version that the
     // *current* `MIGRATOR` does not know about (e.g. consumer pinned an
     // older rust-saas, that one had a migration later removed, or a
@@ -185,9 +180,7 @@ async fn migrate_composed_survives_new_rust_saas_migration(
 // ─── Consumer migration with FK to rust-saas table ────────────────────────
 
 #[sqlx::test(migrations = false)]
-async fn migrate_composed_consumer_can_fk_rust_saas_table(
-    pool: PgPool,
-) -> anyhow::Result<()> {
+async fn migrate_composed_consumer_can_fk_rust_saas_table(pool: PgPool) -> anyhow::Result<()> {
     let fk = fixture("consumer_fk").await;
 
     migrate_composed(&pool, &[&fk]).await?;
