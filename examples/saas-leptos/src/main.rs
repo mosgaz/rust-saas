@@ -19,11 +19,11 @@ use audit_pg::PgAuditLogger;
 #[cfg(feature = "ssr")]
 use authz::AuthorizationEngine;
 #[cfg(feature = "ssr")]
-use rate_limiter::RateLimiter;
-#[cfg(feature = "ssr")]
 use leptos::config::get_configuration;
 #[cfg(feature = "ssr")]
 use metrics_exporter_prometheus::PrometheusBuilder;
+#[cfg(feature = "ssr")]
+use rate_limiter::RateLimiter;
 
 #[cfg(feature = "ssr")]
 #[tokio::main]
@@ -32,8 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -84,9 +83,8 @@ async fn main() -> anyhow::Result<()> {
 
     let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
-    let access = Arc::new(
-        access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
-    );
+    let access =
+        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
 
     let authn = Arc::new(
         authn::Authn::with_ttl(
@@ -117,19 +115,22 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "noreply@example.test".to_string());
 
-    let email: Arc<dyn saas_leptos::email::EmailSender> =
-        match std::env::var("SMTP_URL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            Some(smtp_url) => Arc::new(
-                saas_leptos::email::SmtpEmailSender::new(&smtp_url, &smtp_from, &base_url)
-                    .map_err(|e| anyhow::anyhow!("failed to build SmtpEmailSender: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
+    let email: Arc<dyn saas_leptos::email::EmailSender> = match std::env::var("SMTP_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(smtp_url) => Arc::new(
+            saas_leptos::email::SmtpEmailSender::new(&smtp_url, &smtp_from, &base_url)
+                .map_err(|e| anyhow::anyhow!("failed to build SmtpEmailSender: {e}"))?,
+        ),
+        None => {
+            tracing::warn!(
                     "SMTP_URL is not set; using NoopEmailSender (verification emails will not be delivered)"
                 );
-                Arc::new(saas_leptos::email::NoopEmailSender)
-            }
-        };
+            Arc::new(saas_leptos::email::NoopEmailSender)
+        }
+    };
 
     let rate_limit: Arc<dyn RateLimiter> = match std::env::var("REDIS_URL") {
         Ok(url) if !url.trim().is_empty() => Arc::new(

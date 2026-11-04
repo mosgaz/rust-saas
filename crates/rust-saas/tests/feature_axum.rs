@@ -18,9 +18,9 @@
 // readable; the compiler still errors if a name is missing.
 #[allow(unused_imports)]
 use rust_saas::{
-    build_app, build_app_with_protected, AppError, AxumAppState, AxumAppStateBuilder, BindingScope,
-    CookieConfig, CurrentUser, EmailResult, EmailSender, NoopEmailSender, OwnedAuthzTarget,
-    PathPermissions, RouteBinding, RouteBindings,
+    build_app, build_app_full, build_app_with_protected, AppError, AxumAppState,
+    AxumAppStateBuilder, BindingScope, CookieConfig, CurrentUser, EmailResult, EmailSender,
+    NoopEmailSender, OwnedAuthzTarget, PathPermissions, RouteBinding, RouteBindings,
 };
 
 #[test]
@@ -31,6 +31,7 @@ fn axum_feature_reexports_compile() {
     let _: fn(sqlx::PgPool, String) -> AxumAppStateBuilder = AxumAppStateBuilder::new;
     let _: fn(sqlx::PgPool, String) -> AxumAppStateBuilder = AxumAppState::builder;
     let _: fn(std::sync::Arc<AxumAppState>) -> axum::Router = build_app;
+    let _: fn(std::sync::Arc<AxumAppState>) -> axum::Router = build_app_full;
     let _: fn(
         std::sync::Arc<AxumAppState>,
         axum::Router<std::sync::Arc<AxumAppState>>,

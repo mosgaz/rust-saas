@@ -91,7 +91,9 @@ impl From<access::Role> for RoleView {
 #[server]
 pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     let page = saas::access::list_roles_paged(&state.saas, &user, &domain, i64::MAX, 0)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
@@ -107,7 +109,9 @@ pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> 
 #[server]
 pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let _user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let _user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     let role = access::get_role_by_id(
         state
             .saas
@@ -115,8 +119,8 @@ pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> 
             .map_err(crate::error::core_error_to_server_fn)?,
         role_id,
     )
-        .await
-        .map_err(crate::error::access_error_to_server_fn)?;
+    .await
+    .map_err(crate::error::access_error_to_server_fn)?;
     Ok(role.map(RoleView::from))
 }
 
@@ -128,7 +132,8 @@ pub async fn list_permissions() -> Result<Vec<(String, String, String)>, ServerF
     let page = saas::access::list_permissions_paged(&state.saas, i64::MAX, 0)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
-    Ok(page.items
+    Ok(page
+        .items
         .into_iter()
         .map(|p| (p.resource, p.action, p.description))
         .collect())
@@ -147,24 +152,19 @@ pub async fn create_role(
     permissions: Vec<String>,
 ) -> Result<RoleView, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
 
     resolve_domain_tenant(&state, &user, &domain).await?;
 
     let key = access::RoleKey::parse(key).map_err(crate::error::access_error_to_server_fn)?;
     let pairs = parse_permission_pairs(&permissions)?;
 
-    let role = saas::access::create_role(
-        &state.saas,
-        &user,
-        &domain,
-        &key,
-        name,
-        description,
-        &pairs,
-    )
-    .await
-    .map_err(crate::error::core_error_to_server_fn)?;
+    let role =
+        saas::access::create_role(&state.saas, &user, &domain, &key, name, description, &pairs)
+            .await
+            .map_err(crate::error::core_error_to_server_fn)?;
     Ok(RoleView::from(role))
 }
 
@@ -182,7 +182,9 @@ pub async fn update_role(
     permissions: Vec<String>,
 ) -> Result<RoleView, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
 
     let existing = access::get_role_by_id(
         state
@@ -191,11 +193,9 @@ pub async fn update_role(
             .map_err(crate::error::core_error_to_server_fn)?,
         role_id,
     )
-        .await
-        .map_err(crate::error::access_error_to_server_fn)?
-        .ok_or_else(|| {
-            crate::error::core_error_to_server_fn(saas::CoreError::NotFound)
-        })?;
+    .await
+    .map_err(crate::error::access_error_to_server_fn)?
+    .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
     resolve_domain_tenant(&state, &user, &existing.domain).await?;
 
     let pairs = parse_permission_pairs(&permissions)?;
@@ -213,7 +213,9 @@ pub async fn update_role(
 #[server]
 pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
 
     let existing = access::get_role_by_id(
         state
@@ -222,11 +224,9 @@ pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
             .map_err(crate::error::core_error_to_server_fn)?,
         role_id,
     )
-        .await
-        .map_err(crate::error::access_error_to_server_fn)?
-        .ok_or_else(|| {
-            crate::error::core_error_to_server_fn(saas::CoreError::NotFound)
-        })?;
+    .await
+    .map_err(crate::error::access_error_to_server_fn)?
+    .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
     resolve_domain_tenant(&state, &user, &existing.domain).await?;
 
     saas::access::delete_role(&state.saas, &user, role_id)
@@ -240,7 +240,9 @@ pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
 #[server]
 pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::access::my_permissions(&state.saas, &user, &domain)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -718,13 +720,7 @@ struct TenantIdParams {
 #[component]
 pub fn TenantRoleListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
-    let tenant_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.tenant_id)
-        })
-    };
+    let tenant_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.tenant_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -752,13 +748,7 @@ struct WorkspaceIdParams {
 #[component]
 pub fn WorkspaceRoleListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
-    let workspace_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.workspace_id)
-        })
-    };
+    let workspace_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -791,13 +781,7 @@ struct TenantRoleFormParams {
 #[component]
 pub fn TenantRoleFormPage() -> impl IntoView {
     let params = use_params::<TenantRoleFormParams>();
-    let ids = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.tenant_id.zip(p.role_id))
-        })
-    };
+    let ids = move || params.with(|r| r.as_ref().ok().and_then(|p| p.tenant_id.zip(p.role_id)));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -832,13 +816,7 @@ struct WorkspaceRoleFormParams {
 #[component]
 pub fn WorkspaceRoleFormPage() -> impl IntoView {
     let params = use_params::<WorkspaceRoleFormParams>();
-    let ids = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.workspace_id.zip(p.role_id))
-        })
-    };
+    let ids = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id.zip(p.role_id)));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">

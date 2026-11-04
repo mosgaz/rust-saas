@@ -37,7 +37,9 @@ use crate::pages::member::my_permissions;
 #[server]
 pub async fn list_my_workspaces() -> Result<Vec<domain::Workspace>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::list_memberships(&state.saas, &user)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -51,7 +53,9 @@ pub async fn list_my_workspaces() -> Result<Vec<domain::Workspace>, ServerFnErro
 #[server]
 pub async fn create_document(workspace_id: Uuid, title: String) -> Result<Document, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
 
     let _tenant_id = resolve_ws_tenant(&state, &user, workspace_id).await?;
 
@@ -66,7 +70,9 @@ pub async fn create_document(workspace_id: Uuid, title: String) -> Result<Docume
 #[server]
 pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::list_documents(&state.saas, &user, workspace_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -81,7 +87,9 @@ pub async fn get_document(
     document_id: Uuid,
 ) -> Result<Document, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::get_document(&state.saas, &user, workspace_id, document_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
@@ -314,13 +322,7 @@ struct WorkspaceParams {
 #[component]
 pub fn WorkspacePage() -> impl IntoView {
     let params = use_params::<WorkspaceParams>();
-    let workspace_id = move || {
-        params.with(|r| {
-            r.as_ref()
-                .ok()
-                .and_then(|p| p.workspace_id)
-        })
-    };
+    let workspace_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id));
 
     let can_write = RwSignal::new(false);
     let can_members = RwSignal::new(false);
@@ -334,9 +336,7 @@ pub fn WorkspacePage() -> impl IntoView {
         spawn_local(async move {
             match my_permissions(domain).await {
                 Ok(perms) => {
-                    let has = |r: &str, a: &str| {
-                        perms.iter().any(|(pr, pa)| pr == r && pa == a)
-                    };
+                    let has = |r: &str, a: &str| perms.iter().any(|(pr, pa)| pr == r && pa == a);
                     can_write.set(has("document", "write"));
                     can_members.set(has("member", "list"));
                     can_roles.set(has("role", "list"));

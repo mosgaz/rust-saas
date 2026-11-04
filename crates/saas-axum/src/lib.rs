@@ -31,6 +31,7 @@
 pub mod bindings;
 pub mod cookie;
 pub mod email;
+pub mod endpoints;
 pub mod error;
 pub mod extract;
 pub mod health;
@@ -42,7 +43,12 @@ pub mod state;
 pub use bindings::{BindingScope, OwnedAuthzTarget, PathPermissions, RouteBinding, RouteBindings};
 pub use cookie::CookieConfig;
 pub use email::{EmailResult, EmailSender, NoopEmailSender};
+pub use endpoints::auth::{login, logout, refresh, register, RegisterRequest, RegisterResponse};
+pub use endpoints::my_permissions::{
+    my_permissions_flat, my_permissions_grouped, MyPermissionsQuery,
+};
+pub use endpoints::resource_types::{resource_types, ResourceTypeView};
 pub use error::AppError;
 pub use extract::CurrentUser;
-pub use router::{build_app, build_app_with_protected};
+pub use router::{build_app, build_app_full, build_app_with_protected};
 pub use state::{AxumAppState, AxumAppStateBuilder};

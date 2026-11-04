@@ -20,10 +20,10 @@ use ::audit::AuditLogger;
 use audit_pg::PgAuditLogger;
 use authz::AuthorizationEngine;
 use axum_minimal::email::NoopEmailSender;
-use rate_limiter::RateLimiter;
 use axum_minimal::state::AppState;
-use axum_minimal::{cookie, build_app};
+use axum_minimal::{build_app, cookie};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use rate_limiter::RateLimiter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,8 +31,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -70,9 +69,8 @@ async fn main() -> anyhow::Result<()> {
     let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
     // \u2500\u2500 AccessState (access crate) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    let access = Arc::new(
-        access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
-    );
+    let access =
+        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
 
     // \u2500\u2500 Authn \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     let authn = Arc::new(

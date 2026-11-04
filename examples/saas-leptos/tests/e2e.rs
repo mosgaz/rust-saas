@@ -46,11 +46,11 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use rate_limiter::RateLimiter;
 use saas_leptos::build_app;
 use saas_leptos::cookie::CookieConfig;
 use saas_leptos::email::NoopEmailSender;
-use rate_limiter::RateLimiter;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use saas_leptos::state::AppState;
 
 // ─── Setup ─────────────────────────────────────────────────────────────────
@@ -91,9 +91,8 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
     );
     let audit: Arc<dyn audit::AuditLogger> =
         Arc::new(audit_pg::PgAuditLogger::from_pool(pool.clone()));
-    let access = Arc::new(
-        access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
-    );
+    let access =
+        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
     let authn = Arc::new(
         authn::Authn::with_ttl(
             pool.clone(),
@@ -130,9 +129,13 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
 
 async fn grant_platform_admin(state: &AppState, user_id: Uuid) {
     let owner_key = access::RoleKey::parse("owner").expect("role key");
-    let perms = access::get_permissions_for_role(state.saas.access(), "platform", &owner_key)
-        .await
-        .expect("platform owner perms");
+    let perms = access::get_permissions_for_role(
+        state.saas.access().expect("access"),
+        "platform",
+        &owner_key,
+    )
+    .await
+    .expect("platform owner perms");
     state
         .saas
         .authz()
@@ -182,10 +185,7 @@ async fn healthz_returns_200(pool: PgPool) {
         .expect("oneshot");
 
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(resp).await,
-        serde_json::json!({ "status": "ok" })
-    );
+    assert_eq!(body_json(resp).await, serde_json::json!({ "status": "ok" }));
 }
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
@@ -209,7 +209,10 @@ async fn root_renders_ssr_html(pool: PgPool) {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    assert!(ct.starts_with("text/html"), "expected text/html, got {ct:?}");
+    assert!(
+        ct.starts_with("text/html"),
+        "expected text/html, got {ct:?}"
+    );
     let html = body_string(resp).await;
     assert!(
         html.contains("Multitenant MVP"),
@@ -223,16 +226,27 @@ async fn guarded_route_renders_ssr_content(pool: PgPool) {
 
     // Register an authenticated user
     let email = format!("user-{}@test.local", Uuid::new_v4());
-    let user = state.authn.register(&email, "Password123!").await.expect("register");
+    let user = state
+        .authn
+        .register(&email, "Password123!")
+        .await
+        .expect("register");
     let access = state.authn.issue_access_token(&user).expect("issue token");
-    let refresh = state.authn.issue_refresh_token(&user).await.expect("issue refresh");
+    let refresh = state
+        .authn
+        .issue_refresh_token(&user)
+        .await
+        .expect("issue refresh");
 
     let resp = router
         .oneshot(
             Request::builder()
                 .uri("/tenants")
                 .header(header::HOST, TEST_HOST)
-                .header(header::COOKIE, format!("access_token={access}; refresh_token={refresh}"))
+                .header(
+                    header::COOKIE,
+                    format!("access_token={access}; refresh_token={refresh}"),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -371,10 +385,7 @@ async fn login_issues_access_token(pool: PgPool) {
         .login(&email, "Password123!")
         .await
         .expect("login");
-    let token = state
-        .authn
-        .issue_access_token(&user)
-        .expect("issue access");
+    let token = state.authn.issue_access_token(&user).expect("issue access");
     assert_eq!(token.split('.').count(), 3, "JWT must have 3 parts");
 }
 
@@ -412,7 +423,7 @@ async fn provision_tenant_and_create_workspace(pool: PgPool) {
     .await
     .expect("provision_tenant");
 
-    let workspace = saas::tenant::create_workspace(
+    let workspace = saas::tenant::create_workspace_with_owner(
         &state.saas,
         &owner,
         tenant.id,
@@ -472,7 +483,10 @@ async fn suspended_tenant_blocks_resolve_active_tenant(pool: PgPool) {
     let err = saas::platform::resolve_active_tenant(&state.saas, &owner, tenant.id)
         .await
         .expect_err("suspended tenant must be rejected");
-    assert!(matches!(err, saas::CoreError::TenantSuspended), "got {err:?}");
+    assert!(
+        matches!(err, saas::CoreError::TenantSuspended),
+        "got {err:?}"
+    );
 }
 
 // ─── Audit access ──────────────────────────────────────────────────────────
@@ -498,11 +512,8 @@ async fn audit_permission_gated_by_platform_owner(pool: PgPool) {
         .await
         .expect("register regular");
 
-    let has_audit_read = |perms: &[(String, String)]| {
-        perms
-            .iter()
-            .any(|(r, a)| r == "audit" && a == "read")
-    };
+    let has_audit_read =
+        |perms: &[(String, String)]| perms.iter().any(|(r, a)| r == "audit" && a == "read");
 
     let admin_perms = saas::access::my_permissions(&state.saas, &admin, domain::PLATFORM_DOMAIN)
         .await
@@ -512,9 +523,10 @@ async fn audit_permission_gated_by_platform_owner(pool: PgPool) {
         "platform admin must hold `(audit, read)`"
     );
 
-    let regular_perms = saas::access::my_permissions(&state.saas, &regular, domain::PLATFORM_DOMAIN)
-        .await
-        .expect("regular perms");
+    let regular_perms =
+        saas::access::my_permissions(&state.saas, &regular, domain::PLATFORM_DOMAIN)
+            .await
+            .expect("regular perms");
     assert!(
         !has_audit_read(&regular_perms),
         "regular user must NOT hold `(audit, read)`"
@@ -535,12 +547,14 @@ async fn register_rate_limiter_blocks_after_three(pool: PgPool) {
     for i in 0..3 {
         state
             .rate_limit
-            .try_acquire(&email, 3, window).await
+            .try_acquire(&email, 3, window)
+            .await
             .unwrap_or_else(|_| panic!("attempt {i} must be under the limit"));
     }
     let retry_after = state
         .rate_limit
-        .try_acquire(&email, 3, window).await
+        .try_acquire(&email, 3, window)
+        .await
         .expect_err("4th attempt must be rejected");
     assert!(retry_after > 0 && retry_after <= 3600);
 }
@@ -551,11 +565,19 @@ async fn register_rate_limiter_blocks_after_three(pool: PgPool) {
 async fn pagination_via_state(pool: PgPool) {
     let (_, state) = setup_app(pool).await;
     let admin_email = format!("admin-{}@test.local", Uuid::new_v4());
-    let admin = state.authn.register(&admin_email, "Password123!").await.unwrap();
+    let admin = state
+        .authn
+        .register(&admin_email, "Password123!")
+        .await
+        .unwrap();
     grant_platform_admin(&state, admin.id).await;
 
     let owner_email = format!("owner-{}@test.local", Uuid::new_v4());
-    let owner = state.authn.register(&owner_email, "Password123!").await.unwrap();
+    let owner = state
+        .authn
+        .register(&owner_email, "Password123!")
+        .await
+        .unwrap();
     let owner_key = access::RoleKey::parse("owner").unwrap();
 
     // Create 3 tenants
@@ -566,16 +588,22 @@ async fn pagination_via_state(pool: PgPool) {
             format!("Acme-{}-{}", Uuid::new_v4(), i),
             &owner,
             &owner_key,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     // Page 1: limit 2, offset 0
-    let page1 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 0).await.unwrap();
+    let page1 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 0)
+        .await
+        .unwrap();
     assert_eq!(page1.total, 3);
     assert_eq!(page1.items.len(), 2);
 
     // Page 2: limit 2, offset 2
-    let page2 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 2).await.unwrap();
+    let page2 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 2)
+        .await
+        .unwrap();
     assert_eq!(page2.total, 3);
     assert_eq!(page2.items.len(), 1);
 
@@ -636,5 +664,8 @@ async fn metrics_returns_prometheus_format(pool: PgPool) {
         "expected marker metric, got: {}",
         &body[..body.len().min(300)]
     );
-    assert!(body.contains("# TYPE"), "expected Prometheus exposition format");
+    assert!(
+        body.contains("# TYPE"),
+        "expected Prometheus exposition format"
+    );
 }
