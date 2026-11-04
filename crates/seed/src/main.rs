@@ -2,23 +2,49 @@
 //!
 //! Creates a platform admin, tenant Acme, its owner, workspace Engineering,
 //! editor, viewer, the first document, and the Casbin policies. Idempotent:
-//! re-running re-hashes passwords and re-applies policies without creating
-//! duplicate rows.
+//! re-running re-hashes passwords, skips existing tenants/workspaces, and
+//! re-applies roles and policies without creating duplicates.
 //!
-//! **Policy re-grant (Stage 2a).** This binary calls `grant_platform_admin`,
-//! `grant_tenant_owner`, and `grant_workspace_role` on every invocation.
-//! `add_policy` in Casbin deduplicates existing `p`-rows and adds new ones;
-//! this is how existing seed tenants/workspaces pick up permission sets
-//! introduced by later library versions (for example, `invitations:*` in
-//! Stage 2a) without a separate migration. Fresh databases get the same
-//! policies on first run; re-runs only extend, never duplicate.
+//! Bootstrap flow:
+//! - Platform admin is granted the `owner` role in the `platform` domain.
+//! - Tenant and workspace are created via `saas::platform::provision_tenant`
+//!   and `saas::tenant::create_workspace` with `owner_role_key = "owner"`.
+//! - Demo custom roles (`editor`, `viewer`) are created via
+//!   `saas::access::create_role` and assigned via `saas::access::assign_role`.
 //!
-//! **Why not `saas::*` services?** `seed` does not use `saas::*` (see handoff
-//! §11): `authz.require` would deny bootstrap operations, since the admin has
-//! no policies yet at that point. Business rows are written with inline SQL;
-//! policies are granted through `authz-casbin`.
+//! The `AuthorizationEngine` shares the same `PgPool` as `saas`/`access`
+//! (`CasbinAuthz::from_pool`), so a single connection pool serves the whole
+//! process (Stage 2d).
+//!
+//! Stage 3b: every demo account created by this binary is marked
+//! email-verified (`users.email_verified_at = COALESCE(existing, now())`).
+//! Rationale: demo accounts are trusted — they are documented in the README
+//! and used by smoke-checklists. Marking them verified keeps the Stage 3b
+//! email-verification banner out of the way and prepares for Stage 3c
+//! (`accept_invitation` requires `actor.email_verified`). Idempotent: an
+//! already-verified account keeps its original timestamp.
+//!
+//! **Stage 3e (ADR-0004):** a real `PgAuditLogger` is plugged into the
+//! bootstrap path (via `AccessState::with_audit` and
+//! `SaasBuilder::with_audit`). Seed-produced audit events are the visible
+//! proof that `audit_log` is wired: `tenant.created`, `workspace.created`,
+//! `role.created` (for `editor`/`viewer`), and `member.role_assigned`
+//! (for their grant). The `platform` owner grant is a direct
+//! `authz.grant_role` call — this is bootstrap and does not emit
+//! `member.role_assigned` (matching the `provision_tenant` /
+//! `create_workspace` behaviour, where the owner's role grant is also
+//! silent). `authn::Authn` is **not** constructed here — the seed binary
+//! only needs `authn::hash_password` — so there is nothing to plug into
+//! `Authn::with_audit` on this path.
 
-use authz::{AuthorizationEngine, WorkspaceRole};
+use std::sync::Arc;
+
+use access::{AccessState, RoleKey};
+use audit::AuditLogger;
+use audit_pg::PgAuditLogger;
+use authz::AuthorizationEngine;
+use domain::{AuthUser, Tenant, Workspace};
+use saas::{access as saas_access, platform, tenant, workspace, SaasBuilder};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -30,101 +56,159 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
-    let authz = authz_casbin::CasbinAuthz::new(&database_url).await?;
+    let authz: Arc<dyn AuthorizationEngine> =
+        Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
+
+    // Stage 3e: real audit logger. Shared with `AccessState` and
+    // `SaasState` — one pool, one logger, one audit_log table.
+    let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
+
+    let access_state =
+        Arc::new(AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
+
+    let state = SaasBuilder::new(pool.clone())
+        .with_authz(authz.clone())
+        .with_access(access_state)
+        .with_audit(audit)
+        .build()?;
 
     let platform_admin =
-        upsert_user(&pool, "platform-admin@example.test", "PlatformAdmin123!").await?;
+        upsert_verified_user(&pool, "platform-admin@example.test", "PlatformAdmin123!").await?;
+    let tenant_owner = upsert_verified_user(&pool, "owner@acme.test", "Owner123!").await?;
+    let editor_user = upsert_verified_user(&pool, "editor@acme.test", "Editor123!").await?;
+    let viewer_user = upsert_verified_user(&pool, "viewer@acme.test", "Viewer123!").await?;
 
-    let tenant_owner = upsert_user(&pool, "owner@acme.test", "Owner123!").await?;
-    let editor = upsert_user(&pool, "editor@acme.test", "Editor123!").await?;
-    let viewer = upsert_user(&pool, "viewer@acme.test", "Viewer123!").await?;
+    let owner_key = RoleKey::parse("owner")?;
 
-    authz.grant_platform_admin(platform_admin).await?;
+    // Grant platform admin the `owner` role in the `platform` domain.
+    // Bootstrap-only: direct `authz.grant_role`, no `member.role_assigned`
+    // audit event (matching `provision_tenant`/`create_workspace`).
+    let access_state = state.access().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let platform_perms =
+        ::access::get_permissions_for_role(access_state, "platform", &owner_key).await?;
+    state
+        .authz()
+        .grant_role(
+            platform_admin.id,
+            "platform",
+            owner_key.as_str(),
+            &platform_perms,
+        )
+        .await?;
 
-    let tenant_id: Uuid = if let Some(id) = sqlx::query_scalar(
-        r#"select id from tenants where name = 'Acme' order by created_at limit 1"#,
+    // Ensure tenant exists.
+    let tenant = match sqlx::query_as::<_, Tenant>(
+        "select id, name, status, created_at from tenants where name = 'Acme' order by created_at limit 1",
     )
     .fetch_optional(&pool)
     .await?
     {
-        id
-    } else {
-        sqlx::query_scalar(r#"insert into tenants (name) values ('Acme') returning id"#)
-            .fetch_one(&pool)
+        Some(t) => t,
+        None => {
+            platform::provision_tenant(
+                &state,
+                &platform_admin,
+                "Acme".to_string(),
+                &tenant_owner,
+                &owner_key,
+            )
             .await?
+        }
     };
 
-    sqlx::query(
-        r#"
-        insert into tenant_members (tenant_id, user_id, role)
-        values ($1, $2, 'owner')
-        on conflict do nothing
-        "#,
+    // Ensure workspace exists.
+    let ws = match sqlx::query_as::<_, Workspace>(
+        "select id, tenant_id, name, created_at from workspaces where tenant_id = $1 and name = 'Engineering'",
     )
-    .bind(tenant_id)
-    .bind(tenant_owner)
-    .execute(&pool)
+    .bind(tenant.id)
+    .fetch_optional(&pool)
+    .await?
+    {
+        Some(w) => w,
+        None => {
+            tenant::create_workspace_with_owner(
+                &state,
+                &tenant_owner,
+                tenant.id,
+                "Engineering".to_string(),
+                &tenant_owner,
+                &owner_key,
+            )
+            .await?
+        }
+    };
+
+    let ws_domain = domain::workspace_domain(ws.id);
+    let editor_key = RoleKey::parse("editor")?;
+    let viewer_key = RoleKey::parse("viewer")?;
+
+    let roles = saas_access::list_roles_paged(&state, &tenant_owner, &ws_domain, i64::MAX, 0)
+        .await?
+        .items;
+
+    // Create custom roles if they don't exist yet. `saas_access::create_role`
+    // goes through `access::create_role` (which emits `role.created` when
+    // `AccessState::with_audit` was called — see Stage 3e above).
+    if !roles.iter().any(|r| r.key == editor_key) {
+        saas_access::create_role(
+            &state,
+            &tenant_owner,
+            &ws_domain,
+            &editor_key,
+            "Editor".to_string(),
+            "Can edit documents".to_string(),
+            &[
+                ("document".to_string(), "read".to_string()),
+                ("document".to_string(), "write".to_string()),
+            ],
+        )
+        .await?;
+    }
+
+    if !roles.iter().any(|r| r.key == viewer_key) {
+        saas_access::create_role(
+            &state,
+            &tenant_owner,
+            &ws_domain,
+            &viewer_key,
+            "Viewer".to_string(),
+            "Can read documents".to_string(),
+            &[("document".to_string(), "read".to_string())],
+        )
+        .await?;
+    }
+
+    // Assign roles. `assign_role` is idempotent (ON CONFLICT DO NOTHING for
+    // `*_members` and `add_policy` for `casbin_rule`). Each call emits
+    // `member.role_assigned` when `SaasState` has a real audit logger.
+    saas_access::assign_role(
+        &state,
+        &tenant_owner,
+        editor_user.id,
+        &ws_domain,
+        &editor_key,
+    )
+    .await?;
+    saas_access::assign_role(
+        &state,
+        &tenant_owner,
+        viewer_user.id,
+        &ws_domain,
+        &viewer_key,
+    )
     .await?;
 
-    authz.grant_tenant_owner(tenant_owner, tenant_id).await?;
-
-    let workspace_id: Uuid = sqlx::query_scalar(
-        r#"
-        insert into workspaces (tenant_id, name)
-        values ($1, 'Engineering')
-        on conflict (tenant_id, name) do update set name = excluded.name
-        returning id
-        "#,
+    // Create the first document if it doesn't exist.
+    let doc_exists: bool = sqlx::query_scalar(
+        "select exists(select 1 from documents where workspace_id = $1 and title = 'Welcome')",
     )
-    .bind(tenant_id)
+    .bind(ws.id)
     .fetch_one(&pool)
     .await?;
 
-    sqlx::query(
-        r#"
-        insert into workspace_members (workspace_id, user_id, role)
-        values ($1, $2, 'editor')
-        on conflict do nothing
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(editor)
-    .execute(&pool)
-    .await?;
-
-    authz
-        .grant_workspace_role(editor, workspace_id, WorkspaceRole::Editor)
-        .await?;
-
-    sqlx::query(
-        r#"
-        insert into workspace_members (workspace_id, user_id, role)
-        values ($1, $2, 'viewer')
-        on conflict do nothing
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(viewer)
-    .execute(&pool)
-    .await?;
-
-    authz
-        .grant_workspace_role(viewer, workspace_id, WorkspaceRole::Viewer)
-        .await?;
-
-    sqlx::query(
-        r#"
-        insert into documents (workspace_id, title, body)
-        select $1, 'Welcome', 'This is the first document.'
-        where not exists (
-            select 1 from documents
-            where workspace_id = $1 and title = 'Welcome'
-        )
-        "#,
-    )
-    .bind(workspace_id)
-    .execute(&pool)
-    .await?;
+    if !doc_exists {
+        workspace::create_document(&state, &tenant_owner, ws.id, "Welcome".to_string()).await?;
+    }
 
     println!("Seed complete");
     println!("platform admin:   platform-admin@example.test / PlatformAdmin123!");
@@ -132,17 +216,37 @@ async fn main() -> anyhow::Result<()> {
     println!("workspace editor: editor@acme.test / Editor123!");
     println!("workspace viewer: viewer@acme.test / Viewer123!");
     println!();
-    println!("tenant id:    {tenant_id}");
-    println!("workspace id: {workspace_id}");
+    println!("tenant id:    {}", tenant.id);
+    println!("workspace id: {}", ws.id);
 
     Ok(())
 }
 
-/// Creates or updates a user by email; returns its `id`.
+/// Creates or updates a user by email; returns its `AuthUser`.
 ///
 /// Idempotent: re-running re-hashes the password and updates the existing row.
-async fn upsert_user(pool: &PgPool, email: &str, password: &str) -> anyhow::Result<Uuid> {
+/// Stage 3b: also marks the account email-verified (`COALESCE(existing,
+/// now())`) so demo accounts do not show the "verify your email" banner.
+async fn upsert_verified_user(
+    pool: &PgPool,
+    email: &str,
+    password: &str,
+) -> anyhow::Result<AuthUser> {
     let hash = authn::hash_password(password)?;
     let user = identity::upsert_user(pool, email, &hash).await?;
-    Ok(user.id)
+    mark_verified(pool, user.id).await?;
+    Ok(user)
+}
+
+/// Marks a user's email as verified if it is not already. Idempotent:
+/// `COALESCE(email_verified_at, now())` preserves the original timestamp on
+/// repeat runs.
+async fn mark_verified(pool: &PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        "update users set email_verified_at = coalesce(email_verified_at, now()) where id = $1",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

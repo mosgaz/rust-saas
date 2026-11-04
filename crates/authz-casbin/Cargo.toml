@@ -1,12 +1,13 @@
 [package]
 name = "authz-casbin"
-version = "0.1.0"
-edition = "2021"
-description = "Реализация AuthorizationEngine на Casbin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Casbin implementation of the AuthorizationEngine trait"
 
 [dependencies]
 authz = { path = "../authz" }
-domain = { path = "../domain" }
 
 casbin.workspace = true
 sqlx.workspace = true

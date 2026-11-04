@@ -1,0 +1,24 @@
+# Pinned toolchain for the whole workspace (Stage 4.6a).
+#
+# - `channel = "1.98"` — tracks the latest `1.98.x` patch. Chosen over an
+#   exact `1.98.0` / `1.98.1` pin because `examples/*/Dockerfile` uses
+#   `RUST_VERSION=1.98`, i.e. the Docker Hub tag `rust:1.98-slim-bookworm`
+#   also tracks the latest `1.98.x` patch. Keeping both on `1.98` avoids
+#   silent drift between local dev (which has 1.98.1) and container
+#   builds (which fetch whatever 1.98.x is current on Docker Hub).
+# - `wasm32-unknown-unknown` is required by `examples/saas-leptos`
+#   (`cargo leptos build` compiles the client half for wasm32;
+#   `cargo check --features hydrate` also needs the target).
+# - `rustfmt` + `clippy` are used by the CI `test` job
+#   (`cargo fmt --check` / `cargo clippy -- -D warnings`).
+#
+# `profile` is left at the rustup default (`default`), which already
+# includes rustfmt + clippy + rust-docs; listing `components` explicitly
+# makes the requirement auditable if the default ever changes.
+#
+# Maintenance: bump the `1.98` prefix in the same commit as
+# `RUST_VERSION` in both Dockerfiles and `README.md` «Technology stack».
+[toolchain]
+channel = "1.98"
+targets = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]

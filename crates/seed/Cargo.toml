@@ -1,20 +1,26 @@
 [package]
 name = "seed"
-version = "0.1.0"
-edition = "2021"
-description = "Bootstrap данных"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Bootstrap binary: platform owner, demo tenant/workspace/users/roles"
 
 [[bin]]
 name = "seed"
 path = "src/main.rs"
 
 [dependencies]
-domain = { path = "../domain" }
+access = { path = "../access" }
 authz = { path = "../authz" }
 authz-casbin = { path = "../authz-casbin" }
 authn = { path = "../authn" }
 identity = { path = "../identity" }
 db = { path = "../db" }
+domain = { path = "../domain" }
+saas = { path = "../saas" }
+audit = { path = "../audit" }
+audit-pg = { path = "../audit-pg" }
 
 sqlx.workspace = true
 tokio.workspace = true

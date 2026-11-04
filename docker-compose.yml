@@ -22,8 +22,69 @@ services:
     networks:
       - rust_saas_net
 
+  # Stage 3b: Mailpit — local SMTP server + web UI for inspecting emails.
+  # Used by `examples/saas-leptos` (`SmtpEmailSender`) when `SMTP_URL` is set
+  # to `smtp://localhost:1025`. Open http://localhost:8025 to read messages.
+  # No volume: the inbox is dev-only and may be discarded on `down`.
+  mailpit:
+    image: axllent/mailpit:v1.20
+    container_name: rust-saas-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP — lettre (SmtpEmailSender) connects here
+      - "8025:8025"   # Web UI — http://localhost:8025
+    environment:
+      # Dev-only: raise if you hit the default cap during a demo.
+      MP_MAX_MESSAGES: 5000
+    networks:
+      - rust_saas_net
+
+  # Stage 4.8: Redis для distributed rate limiter.
+  # Если REDIS_URL не задан, приложения используют InMemoryRateLimiter.
+  redis:
+    image: redis:7-alpine
+    container_name: rust-saas-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - rust_saas_net
+
+  # pgAdmin 4 — web GUI для Postgres.
+  # UI:     http://localhost:5050
+  # Login:  admin@example.com / admin
+  # Server (внутри docker-сети): host=postgres port=5432 db=rust_saas user=postgres password=postgres
+  # Volume pgadmin_data сохраняет настройки/сохранённые серверы между рестартами.
+  pgadmin:
+    image: dpage/pgadmin4:9.8
+    container_name: rust-saas-pgadmin
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      # Desktop-режим: без master-password и без логина в команду.
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+      # Права на /var/lib/pgadmin (иначе падает с permission denied на свежем volume).
+      PGADMIN_CONFIG_UPGRADE_CHECK_ENABLED: 'False'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - rust_saas_net
+
 volumes:
   rust_saas_pg_data:
+  pgadmin_data:
 
 networks:
   rust_saas_net:

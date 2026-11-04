@@ -1,4 +1,4 @@
-@import "tailwindcss";
+@reference 'tailwindcss';
 
 body {
   @apply bg-neutral-950 text-neutral-100 antialiased;

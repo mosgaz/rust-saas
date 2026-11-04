@@ -3,14 +3,26 @@ resolver = "3"
 members = [
     "crates/domain",
     "crates/authz",
+    "crates/access",
     "crates/authz-casbin",
     "crates/identity",
     "crates/authn",
     "crates/saas",
     "crates/db",
     "crates/seed",
+    "crates/audit",
+    "crates/audit-pg",
+    "crates/rate-limiter",
+    "crates/rust-saas",
+    "crates/saas-axum",
 ]
 exclude = ["examples/*"]
+
+[workspace.package]
+publish = false
+license = "MIT"
+version = "0.3.0"
+edition = "2021"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,3 +40,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 sha2 = "0.10"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

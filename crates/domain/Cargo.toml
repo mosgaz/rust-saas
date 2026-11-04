@@ -1,8 +1,10 @@
 [package]
 name = "domain"
-version = "0.1.0"
-edition = "2021"
-description = "Общие бизнес-типы и правила именования доменов авторизации"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared business types and authorization domain name helpers"
 
 [dependencies]
 serde.workspace = true
@@ -12,3 +14,7 @@ sqlx = { workspace = true, optional = true }
 
 [features]
 ssr = ["dep:sqlx"]
+# Test-only helpers (`AuthUser::test_verified` / `AuthUser::test_unverified`).
+# Enabled exclusively from `[dev-dependencies]` of crates with tests; never
+# part of a production build.
+test-support = []

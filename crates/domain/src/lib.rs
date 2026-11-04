@@ -52,12 +52,46 @@ pub struct Document {
 }
 
 /// A global platform user (no `password_hash`; internal in `identity`).
+///
+/// `email_verified` is a **derived** boolean: `true` iff
+/// `users.email_verified_at IS NOT NULL`. It is populated by SQL
+/// (`email_verified_at IS NOT NULL AS email_verified`) in every `SELECT`
+/// that maps a `users` row to `AuthUser`; see the `identity` crate. There is
+/// no `email_verified_at` field on this DTO — the timestamp is an internal
+/// concern of `identity`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
 pub struct AuthUser {
     pub id: Uuid,
     pub email: String,
+    pub email_verified: bool,
     pub created_at: DateTime<Utc>,
+}
+
+/// Test-only constructors; enabled via the `test-support` feature (added to
+/// `[dev-dependencies]` of the crates that need them). Production builds
+/// must not enable this feature.
+#[cfg(feature = "test-support")]
+impl AuthUser {
+    /// Test-only: an `AuthUser` with `email_verified = true`.
+    pub fn test_verified() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            email: format!("verified-{}@test.local", Uuid::new_v4()),
+            email_verified: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Test-only: an `AuthUser` with `email_verified = false`.
+    pub fn test_unverified() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            email: format!("unverified-{}@test.local", Uuid::new_v4()),
+            email_verified: false,
+            created_at: Utc::now(),
+        }
+    }
 }
 
 /// An invitation row.
@@ -93,6 +127,37 @@ pub struct Invitation {
 pub enum InvitationTarget {
     Tenant(Uuid),
     Workspace(Uuid),
+}
+
+/// A membership entry: a user together with all `role_key`s they hold in a
+/// scope (tenant or workspace).
+///
+/// `roles` holds raw `role_key` strings rather than `access::RoleKey` so
+/// that `domain` does not depend on `access` (see the forbidden edges in
+/// handoff §4). The `access::*` layer validates keys at write time; the
+/// bookkeeping rows copied here are already validated.
+///
+/// No `sqlx::FromRow` derive: `roles` is an aggregate over `*_members` rows
+/// and is assembled in `saas::member::list` from flat `(user_id, email,
+/// role, created_at)` tuples grouped by `user_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Member {
+    pub user_id: Uuid,
+    pub email: String,
+    pub roles: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A page of results from a paginated list endpoint.
+///
+/// `total` is the total number of matching rows (for UI pagination controls);
+/// `limit` and `offset` echo the request. Stage 4.8 (ADR-0005).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 pub const PLATFORM_DOMAIN: &str = "platform";

@@ -1,8 +1,10 @@
 [package]
 name = "identity"
-version = "0.1.0"
-edition = "2021"
-description = "Сущность пользователя: AuthUser, UserRecord, валидация email/password, CRUD users"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "User entity: AuthUser, UserRecord, email/password validation, users CRUD"
 
 [dependencies]
 domain = { path = "../domain", features = ["ssr"] }

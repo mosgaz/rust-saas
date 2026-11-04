@@ -1,11 +1,17 @@
-//! Global layout: header with navigation and auth controls (Logout, Renew).
+//! Global layout: header with navigation and auth controls (Logout).
 //!
 //! Wraps every page rendered inside `<Router>`. Auth controls are shown only
-//! when the user is logged in (`who_am_i` on mount, refreshed by `Renew`).
+//! when the user is logged in (`who_am_i` on mount).
 //!
-//! The `Renew` button is a **demo** for the auto-refresh middleware.
 //! The navigation uses `<A>` from `leptos_router` for active highlighting
 //! and client-side navigation (no full page reload).
+//!
+//! **Stage 4.0:** on logout the shared `PermsCache` is cleared
+//! (`invalidate_all`) — otherwise the next user in the same tab would see
+//! the previous user's cached permissions for up to 30 s (the TTL of the
+//! `my_permissions` cache). The cache is optional (`use_context`), so this
+//! component also compiles if a consumer mounts `Layout` outside the
+//! reference `App` and does not provide `PermsCache`.
 
 use leptos::callback::Callback;
 use leptos::prelude::*;
@@ -13,8 +19,9 @@ use leptos::task::spawn_local;
 use leptos_router::components::A;
 use leptos_router::hooks::{use_location, use_navigate};
 
-use crate::auth::{logout, refresh};
+use crate::auth::logout;
 use crate::pages::invitation::who_am_i;
+use crate::perms_cache::PermsCache;
 
 /// Wraps every page: renders the header and puts `children` inside `<main>`.
 #[component]
@@ -23,10 +30,11 @@ pub fn Layout(children: Children) -> impl IntoView {
     let status = RwSignal::new(None::<String>);
     let navigate = use_navigate();
     let location = use_location();
+    let perms_cache = use_context::<PermsCache>();
 
     Effect::new(move |_| {
         let _ = location.pathname.get();
-        
+
         spawn_local(async move {
             match who_am_i().await {
                 Ok(email) => logged_in.set(Some(email.is_some())),
@@ -35,9 +43,13 @@ pub fn Layout(children: Children) -> impl IntoView {
         });
     });
 
-    let on_logout = Callback::new({
+    let on_logout = {
         let navigate = navigate.clone();
-        move |_: ()| {
+        let perms_cache = perms_cache.clone();
+        Callback::new(move |_: ()| {
+            if let Some(cache) = &perms_cache {
+                cache.invalidate_all();
+            }
             let navigate = navigate.clone();
             spawn_local(async move {
                 let _ = logout().await;
@@ -45,26 +57,13 @@ pub fn Layout(children: Children) -> impl IntoView {
                 status.set(None);
                 navigate("/login", Default::default());
             });
-        }
-    });
-
-    let on_renew = Callback::new(move |_: ()| {
-        spawn_local(async move {
-            match refresh().await {
-                Ok(u) => {
-                    logged_in.set(Some(true));
-                    status.set(Some(format!("Renewed as {}", u.email)));
-                }
-                Err(e) => status.set(Some(e.to_string())),
-            }
-        });
-    });
+        })
+    };
 
     view! {
         <header class="border-b border-neutral-800 px-6 py-3 flex flex-wrap items-center gap-4">
             <A href="/" attr:class="font-semibold">"Rust SAAS"</A>
             <nav class="flex gap-3 text-sm text-neutral-400">
-                // <A> automatically adds an `aria-current="page"` and active state
                 <A href="/tenants" attr:class="hover:text-white">"Tenants"</A>
                 <A href="/workspaces" attr:class="hover:text-white">"Workspaces"</A>
                 <A href="/platform" attr:class="hover:text-white">"Platform"</A>
@@ -77,12 +76,6 @@ pub fn Layout(children: Children) -> impl IntoView {
                         <a class="btn text-sm" href="/register">"Register"</a>
                     }.into_any(),
                     Some(true) => view! {
-                        <button
-                            class="btn text-sm"
-                            on:click=move |_| on_renew.run(())
-                        >
-                            "Renew (demo)"
-                        </button>
                         <button
                             class="btn text-sm"
                             on:click=move |_| on_logout.run(())

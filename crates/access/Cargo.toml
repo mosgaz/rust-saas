@@ -1,0 +1,28 @@
+[package]
+name = "access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Role and permission ownership: permissions, roles, role_permissions (ADR-0001)"
+
+[dependencies]
+domain = { path = "../domain", features = ["ssr"] }
+authz = { path = "../authz" }
+audit = { path = "../audit" }
+
+sqlx.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+sqlx = { workspace = true, features = ["macros"] }
+audit-pg = { path = "../audit-pg" }
+anyhow.workspace = true
+authz-casbin = { path = "../authz-casbin" }

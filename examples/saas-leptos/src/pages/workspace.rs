@@ -1,7 +1,25 @@
-//! Workspace pages: the list of workspaces the current user belongs to, and
-//! a single-workspace page (documents + open invitations).
+//! Workspace pages: the list of workspaces the current user belongs to, a
+//! single-workspace page (documents + links to invitations/members/roles),
+//! and a single-document page.
+//!
+//! **Stage 3f (ADR-0002 rev.2):** `create_document` resolves the tenant
+//! that owns the workspace (via `SELECT tenant_id FROM workspaces WHERE
+//! id = $1`) and calls `saas::platform::resolve_active_tenant` before
+//! delegating to `saas::workspace::create_document`. A non-member or a
+//! member of a suspended tenant gets HTTP 403 (`Forbidden` /
+//! `TenantSuspended`). Reads (`list_documents`, `get_document`,
+//! `list_my_workspaces`) do **not** resolve — see the module doc on
+//! `pages::tenant` for the reasoning (history is readable; UI gating is
+//! convenience, backend `require` is authoritative).
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<Uuid>`
+//! for the id fields. The `IntoParam` impl for bare `Uuid` is gated behind
+//! Leptos's `nightly` feature; the `Option<Uuid>` impl works on stable.
+//! Closures unwrap with `.and_then(|p| p.field)` — or, for pairs,
+//! `p.a.zip(p.b)` to produce `Option<(A, B)>`.
 
 use domain::Document;
+use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
@@ -9,53 +27,210 @@ use leptos_router::hooks::use_params;
 use leptos_router::params::Params;
 use uuid::Uuid;
 
+use crate::pages::member::my_permissions;
+
 // ─── Server functions ───────────────────────────────────────────────────────
 
 /// Lists workspaces the current user is a member of.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_my_workspaces() -> Result<Vec<domain::Workspace>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::list_memberships(&state.saas, &user)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Creates a document in a workspace.
+///
+/// Stage 3f: resolves the tenant that owns the workspace first
+/// (membership + active status); a suspended tenant returns
+/// `TenantSuspended` (HTTP 403). See the module doc.
 #[server]
 pub async fn create_document(workspace_id: Uuid, title: String) -> Result<Document, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    let _tenant_id = resolve_ws_tenant(&state, &user, workspace_id).await?;
+
     saas::workspace::create_document(&state.saas, &user, workspace_id, title)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Lists documents in a workspace.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::list_documents(&state.saas, &user, workspace_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Gets a single document.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
-pub async fn get_document(workspace_id: Uuid, document_id: Uuid) -> Result<Document, ServerFnError> {
+pub async fn get_document(
+    workspace_id: Uuid,
+    document_id: Uuid,
+) -> Result<Document, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::get_document(&state.saas, &user, workspace_id, document_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
+}
+
+/// Resolves the tenant that owns `workspace_id` and verifies it is active
+/// for `user` (Stage 3f).
+///
+/// Two steps: (1) `SELECT tenant_id FROM workspaces WHERE id = $1`
+/// (`NotFound` if the workspace is gone); (2) `saas::platform::resolve_active_tenant`
+/// (membership + `status = 'active'`). Returns the tenant id — the caller
+/// does not need it today, but keeping the return value makes the helper
+/// usable from other mutations that must pass `tenant_id` downstream.
+///
+/// `#[cfg(feature = "ssr")]` — the helper reads `AppState.saas` and calls
+/// into `saas::platform::*`; both are SSR-only. It is called from
+/// `#[server]`-functions, which are also SSR-only at runtime.
+#[cfg(feature = "ssr")]
+async fn resolve_ws_tenant(
+    state: &crate::state::AppState,
+    user: &domain::AuthUser,
+    workspace_id: Uuid,
+) -> Result<Uuid, ServerFnError> {
+    let tenant_id: Option<Uuid> =
+        sqlx::query_scalar("select tenant_id from workspaces where id = $1")
+            .bind(workspace_id)
+            .fetch_optional(state.saas.pool())
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tenant_id = tenant_id
+        .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
+
+    let active = saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(active.id)
+}
+
+// ─── Document list (nested) ─────────────────────────────────────────────────
+
+/// Nested document list for a workspace. Refetches whenever `refresh`
+/// changes; `WorkspacePage` bumps `refresh` after creating a document.
+#[component]
+pub fn DocumentListPage(workspace_id: Uuid, refresh: ReadSignal<u32>) -> impl IntoView {
+    let documents = RwSignal::new(Vec::<Document>::new());
+    let error = RwSignal::new(None::<String>);
+
+    Effect::new(move |_| {
+        let _ = refresh.get();
+        spawn_local(async move {
+            match list_documents(workspace_id).await {
+                Ok(docs) => {
+                    documents.set(docs);
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+        });
+    });
+
+    view! {
+        <div class="mt-8">
+            <h2 class="text-xl font-semibold">"Documents"</h2>
+            {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
+            <ul class="mt-3 divide-y divide-neutral-800">
+                {move || {
+                    let docs = documents.get();
+                    if docs.is_empty() {
+                        view! {
+                            <li class="py-2 text-neutral-500">"No documents yet."</li>
+                        }
+                            .into_any()
+                    } else {
+                        docs.into_iter()
+                            .map(|d| {
+                                let ws_id = d.workspace_id;
+                                let doc_id = d.id;
+                                view! {
+                                    <li class="py-3">
+                                        <A
+                                            href=format!("/workspaces/{ws_id}/documents/{doc_id}")
+                                            attr:class="font-medium text-blue-400 hover:underline text-lg block"
+                                        >
+                                            {d.title}
+                                        </A>
+                                    </li>
+                                }
+                            })
+                            .collect_view()
+                            .into_any()
+                    }
+                }}
+            </ul>
+        </div>
+    }
+}
+
+// ─── Document form (nested) ─────────────────────────────────────────────────
+
+/// Nested document-creation form. Calls `on_created` after a successful
+/// server call; the parent bumps its refresh signal.
+#[component]
+pub fn DocumentFormPage(workspace_id: Uuid, on_created: Callback<()>) -> impl IntoView {
+    let title = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+
+    let submit = move |_| {
+        let t = title.get();
+        spawn_local(async move {
+            match create_document(workspace_id, t).await {
+                Ok(_) => {
+                    title.set(String::new());
+                    error.set(None);
+                    on_created.run(());
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+        });
+    };
+
+    view! {
+        <div class="card mt-6 border p-4 rounded">
+            <h2 class="text-lg font-semibold">"Create document"</h2>
+            <input
+                class="input mt-2 border p-2 w-full"
+                placeholder="Document title"
+                bind:value=title
+            />
+            <button class="btn mt-3 border p-2 rounded" on:click=submit>
+                "Create document"
+            </button>
+            {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
+        </div>
+    }
 }
 
 // ─── Workspace list (`/workspaces`) ─────────────────────────────────────────
 
 /// `/workspaces` — list of workspaces the current user belongs to.
 #[component]
-pub fn WorkspacesListPage() -> impl IntoView {
+pub fn WorkspaceListPage() -> impl IntoView {
     let workspaces = RwSignal::new(Vec::<domain::Workspace>::new());
     let error = RwSignal::new(None::<String>);
 
@@ -134,54 +309,50 @@ pub fn WorkspacesListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
-/// `/workspaces/:workspace_id` — single workspace page: documents + link to
-/// invitations.
+/// `/workspaces/:workspace_id` — single workspace page: document list,
+/// create form (only when permitted), and links to invitations/members/
+/// roles (only when permitted).
+///
+/// `my_permissions` is read-only and does not resolve the tenant; the
+/// `create_document` server function itself rejects with `TenantSuspended`
+/// (HTTP 403) when the tenant is not active.
 #[component]
 pub fn WorkspacePage() -> impl IntoView {
     let params = use_params::<WorkspaceParams>();
-    let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
+    let workspace_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id));
 
-    let title = RwSignal::new(String::new());
-    let documents = RwSignal::new(Vec::<Document>::new());
-    let error = RwSignal::new(None::<String>);
+    let can_write = RwSignal::new(false);
+    let can_members = RwSignal::new(false);
+    let can_roles = RwSignal::new(false);
+    let can_invitations = RwSignal::new(false);
     let refresh = RwSignal::new(0u32);
 
     Effect::new(move |_| {
-        let _ = refresh.get();
-        let id = workspace_id();
+        let Some(id) = workspace_id() else { return };
+        let domain = domain::workspace_domain(id);
         spawn_local(async move {
-            let Some(id) = id else {
-                return;
-            };
-            match list_documents(id).await {
-                Ok(docs) => {
-                    documents.set(docs);
-                    error.set(None);
+            match my_permissions(domain).await {
+                Ok(perms) => {
+                    let has = |r: &str, a: &str| perms.iter().any(|(pr, pa)| pr == r && pa == a);
+                    can_write.set(has("document", "write"));
+                    can_members.set(has("member", "list"));
+                    can_roles.set(has("role", "list"));
+                    can_invitations.set(has("invitation", "list"));
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(_) => {
+                    can_write.set(false);
+                    can_members.set(false);
+                    can_roles.set(false);
+                    can_invitations.set(false);
+                }
             }
         });
     });
 
-    let submit = move |_| {
-        let id = workspace_id();
-        spawn_local(async move {
-            let Some(id) = id else {
-                return;
-            };
-            match create_document(id, title.get()).await {
-                Ok(_) => {
-                    title.set(String::new());
-                    error.set(None);
-                    refresh.update(|n| *n += 1);
-                }
-                Err(e) => error.set(Some(e.to_string())),
-            }
-        });
-    };
+    let on_created = Callback::new(move |_| refresh.update(|n| *n += 1));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -194,57 +365,45 @@ pub fn WorkspacePage() -> impl IntoView {
                     .unwrap_or_else(|| "invalid workspace id".into())}
             </p>
 
-            <div class="mt-4 flex gap-2">
-                {move || workspace_id().map(|id| view! {
-                    <A
-                        href=format!("/workspaces/{id}/invitations")
-                        attr:class="btn text-sm"
-                    >
-                        "Invitations"
-                    </A>
-                })}
+            <div class="mt-4 flex gap-2 flex-wrap">
+                {move || {
+                    let id = workspace_id()?;
+                    let mut links = Vec::new();
+                    if can_invitations.get() {
+                        links.push(view! {
+                            <A href=format!("/workspaces/{id}/invitations") attr:class="btn text-sm">
+                                "Invitations"
+                            </A>
+                        });
+                    }
+                    if can_members.get() {
+                        links.push(view! {
+                            <A href=format!("/workspaces/{id}/members") attr:class="btn text-sm">
+                                "Members"
+                            </A>
+                        });
+                    }
+                    if can_roles.get() {
+                        links.push(view! {
+                            <A href=format!("/workspaces/{id}/roles") attr:class="btn text-sm">
+                                "Roles"
+                            </A>
+                        });
+                    }
+                    Some(links)
+                }}
             </div>
 
-            <div class="card mt-6 border p-4 rounded">
-                <h2 class="text-lg font-semibold">"Create document"</h2>
-                <input class="input mt-2 border p-2 w-full" placeholder="Document title" bind:value=title />
-                <button class="btn mt-3 border p-2 rounded" on:click=submit>"Create document"</button>
-                {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
-            </div>
+            {move || {
+                let id = workspace_id()?;
+                can_write.get().then(|| view! {
+                    <DocumentFormPage workspace_id=id on_created=on_created />
+                })
+            }}
 
-            <div class="mt-8">
-                <h2 class="text-xl font-semibold">"Documents"</h2>
-                <ul class="mt-3 divide-y divide-neutral-800">
-                    {move || {
-                        let docs = documents.get();
-                        if docs.is_empty() {
-                            view! {
-                                <li class="py-2 text-neutral-500">"No documents yet."</li>
-                            }
-                                .into_any()
-                        } else {
-                            docs.into_iter()
-                                .map(|d| {
-                                    let ws_id = d.workspace_id;
-                                    let doc_id = d.id;
-                                    view! {
-                                        <li class="py-3">
-                                            // Ссылка на отдельную страницу документа
-                                            <A
-                                                href=format!("/workspaces/{ws_id}/documents/{doc_id}")
-                                                attr:class="font-medium text-blue-400 hover:underline text-lg block"
-                                            >
-                                                {d.title}
-                                            </A>
-                                        </li>
-                                    }
-                                })
-                                .collect_view()
-                                .into_any()
-                        }
-                    }}
-                </ul>
-            </div>
+            {move || workspace_id().map(|id| view! {
+                <DocumentListPage workspace_id=id refresh=refresh.read_only() />
+            })}
         </main>
     }
 }
@@ -253,21 +412,27 @@ pub fn WorkspacePage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct DocumentParams {
-    workspace_id: Uuid,
-    document_id: Uuid,
+    workspace_id: Option<Uuid>,
+    document_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id/documents/:document_id` — single document page.
 #[component]
 pub fn DocumentPage() -> impl IntoView {
     let params = use_params::<DocumentParams>();
-    let ids = move || params.with(|r| r.as_ref().ok().map(|p| (p.workspace_id, p.document_id)));
+    let ids = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.workspace_id.zip(p.document_id))
+        })
+    };
 
     let document = RwSignal::new(None::<Document>);
     let error = RwSignal::new(None::<String>);
 
     Effect::new(move |_| {
-        let Some((ws_id, doc_id)) = ids() else { return; };
+        let Some((ws_id, doc_id)) = ids() else { return };
         spawn_local(async move {
             match get_document(ws_id, doc_id).await {
                 Ok(doc) => document.set(Some(doc)),

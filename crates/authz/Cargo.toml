@@ -1,11 +1,22 @@
 [package]
 name = "authz"
-version = "0.1.0"
-edition = "2021"
-description = "Абстракция авторизации: трейт AuthorizationEngine и типы ошибок"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Authorization abstraction: the AuthorizationEngine trait and error types"
 
 [dependencies]
 uuid.workspace = true
 thiserror.workspace = true
 
 async-trait.workspace = true
+
+[features]
+# Test-only `AllowAllAuthz` / `DenyAllAuthz` (Stage 4.3a).
+# Enabled from `[dev-dependencies]` of crates whose tests do not need a
+# real Casbin backend. Never enabled from a production build.
+test-support = []
+
+[dev-dependencies]
+tokio.workspace = true
