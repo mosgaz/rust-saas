@@ -101,9 +101,7 @@ impl std::str::FromStr for ResourceScope {
             "platform" => Ok(ResourceScope::Platform),
             "tenant" => Ok(ResourceScope::Tenant),
             "workspace" => Ok(ResourceScope::Workspace),
-            other if other.starts_with("custom:") => {
-                Ok(ResourceScope::Custom(other.to_string()))
-            }
+            other if other.starts_with("custom:") => Ok(ResourceScope::Custom(other.to_string())),
             other => Err(AccessError::Validation(format!(
                 "invalid resource scope: {other}"
             ))),
@@ -381,12 +379,11 @@ pub async fn add_action(
         .require(actor.id, domain::PLATFORM_DOMAIN, "resource", "manage")
         .await?;
 
-    let exists: bool = sqlx::query_scalar(
-        "select exists(select 1 from resource_types where name = $1)",
-    )
-    .bind(resource_name)
-    .fetch_one(state.pool())
-    .await?;
+    let exists: bool =
+        sqlx::query_scalar("select exists(select 1 from resource_types where name = $1)")
+            .bind(resource_name)
+            .fetch_one(state.pool())
+            .await?;
 
     if !exists {
         return Err(AccessError::UnknownResourceType {
