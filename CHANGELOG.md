@@ -8,6 +8,33 @@ Every crate in `crates/` shares one version (enforced by
 `[workspace.package]`); consumers must pin all crates to the same
 revision.
 
+## [0.3.0] - 2026-11-03
+
+### Stage 5.0 — Phase A, part 1 (A1 + A2 + A3)
+
+**Breaking changes (5 items; see `COMPATIBILITY.md` §0.3.0 for migration guide):**
+- `authz::AuthorizationEngine::reload_in_memory()` — new required method (A1.4).
+- `access::AccessError::{UnknownResourceType, ScopeMismatch}` — new variants (A1.5a).
+- `saas::SaasState::access()` — returns `Result<&AccessState, CoreError>` instead of `&AccessState` (A2.2a).
+- `saas::SaasBuilder::build()` — requires `with_access(..)` or `without_access()` (A2.2b).
+- `saas::tenant::create_workspace` — split into `create_workspace` (4-arg) and `create_workspace_with_owner` (6-arg) (A2.2c).
+
+**A1 — Resource Registry (B2, B3, B4 closed):**
+- Added `resource_types` table and 8 core types (migration `20261130000001_resource_types.sql`).
+- Fixed `owner_sync_permission` trigger to also write `casbin_rule.p` (migration `20261130000002_owner_sync_casbin.sql`).
+- Added legacy import, `resource:manage`, and FK to `permissions` (migration `20261130000003_legacy_import_and_fk.sql`).
+- Added `access::registry` (`bootstrap_resource_type`, `register_resource_type`, `add_action`, etc.) and `AuthorizationEngine::reload_in_memory()`.
+
+**A2 — `without_access` + `create_workspace` split (B8, B9, B10 closed):**
+- Added `saas::platform::{resolve_tenant, resolve_workspace, is_tenant_member, is_workspace_member}` and `ActiveWorkspace`.
+- Added `SaasBuilder::without_access()` for RBAC-free setups.
+
+**A3 — `migrate_composed` (B1 closed):**
+- Added `db::migrate_composed` and public `db::MIGRATOR`. Deprecated `db::migrate_with`.
+- Meta-crate `rust-saas`: added `migrate_all` / `migrate_extended`.
+
+**Tests:** 174 → 197 workspace tests.
+
 ## [0.2.2] - 2026-11-03
 
 ### Stage 4.10 — Observability

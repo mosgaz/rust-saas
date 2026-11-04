@@ -36,7 +36,7 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - `AuthLayer` (Stage 4.1d): server-side defense-in-depth in `axum-minimal` — 401 for anonymous, path-level permission for `POST /tenants` (`(tenant, create)`), `GET /audit` (`(audit, read)`); pass-through for body-scoped paths.
 - `/healthz` (Stage 4.4a): liveness probe in both examples — `200 {"status":"ok"}`, no DB hit, no auth, no CSRF cookie. `/readyz` (Stage 4.10) is the readiness counterpart: it checks the DB (`SELECT 1`) and, in `axum-minimal`, Redis (`PING` when `REDIS_URL` is set); returns `503` if any check is `down`.
 - Prometheus `/metrics` + `tracing` spans (Stage 4.10): public `/metrics` (exposition format, no PII) and `#[instrument]` spans on mutations in `authn`, `saas::platform`, `saas::member`, `access::role`. Counter examples: `login_total{status}`, `register_total{status}`. See `ADR-0007-Observability.md`.
-- `db::migrate_with` + `audit-pg::MIGRATOR` (Stage 4.3c): additive per-crate migration set. Composition with `db::migrate()` on the same database is not supported (sqlx → `VersionMissing`).
+- `db::migrate_composed` + `db::MIGRATOR` (Stage 5.0-A3): merge consumer migrations with the workspace set. `db::migrate_with` is deprecated.
 - `authz::test_support` (Stage 4.3a): `AllowAllAuthz` / `DenyAllAuthz` under feature `test-support` — consumer tests no longer need inline mocks.
 - Pagination (Stage 4.8): `domain::Page<T>` + `list_*_paged` across `access`, `saas`, `audit-pg`. Offset-based (`?limit=&offset=`); old `list_*` are deprecated but remain for compatibility.
 - Distributed rate limiter (Stage 4.8): `crates/rate-limiter` with `RateLimiter` trait, `InMemoryRateLimiter` (default), and `RedisRateLimiter` (feature `redis`). Examples use `Arc<dyn RateLimiter>`; `REDIS_URL` toggles Redis.
@@ -608,7 +608,7 @@ From the repository root:
 cargo test
 ```
 
-**174 tests, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 15+38 = 53; `saas` 11+46 = 57; `access` 0+6 = 6; `authz-casbin` 0+12 = 12; `audit` 3+0 = 3; `audit-pg` 0+6 = 6. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
+**197 workspace tests + 29 E2E, all green** (code — source of truth; `cargo test` output wins over this estimate if they differ). Distribution (rough): `authn` 15+38 = 53; `saas` 11+46 = 57; `access` 0+6 = 6; `authz-casbin` 0+12 = 12; `audit` 3+0 = 3; `audit-pg` 0+6 = 6. Stage 3h added 4 tests: 2 in `authz-casbin` (`grant_role_is_idempotent_on_p_rows`, `unique_index_rejects_duplicates`) and 2 in `saas` (`owner_guard_race_serialized_by_advisory_lock`, `advisory_lock_does_not_block_other_roles`). Stage 4.0 added 1 test in `saas` (`delete_role_emits_role_deleted`).
 
 Stage 3g (`axum-minimal`) does **not** change the library test counter — `crates/*` is untouched (0 migrations, 0 breaking changes, 0 new library tests). The example ships no `tests/` directory (binary-only crate; the plan marks example smoke tests optional). Its smoke coverage is the curl checklist above, which exercises the same `saas::*` / `authn::*` calls as `saas-leptos`.
 
@@ -846,17 +846,14 @@ Second consumer — pure Axum, no Leptos; the portability proof.
 - **Stage 4.0 (done): sync & cleanup.** Meta-crate `crates/rust-saas`; `[workspace.package]` + `COMPATIBILITY.md`; `delete_role_emits_role_deleted`; `PermsCache::invalidate_all()` on logout; `domain` removed from `authz-casbin`.
 - **Stage 4.1 (done): auth hardening.** `authn::verify_token` rejects pre-password-change tokens (`iat` vs `password_changed_at`). Cookie config (`CookieConfig`, `Secure`, `SameSite`, `Max-Age`). CSRF: `axum-minimal` double-submit; `saas-leptos` `Origin`/`Host` guard. `AuthLayer` in `axum-minimal`.
 - **Stage 4.2 (done, breaking): error isolation.** `Db(String)` in all public error types; `AuthnError::Identity(IdentityErrorKind)`. Documented in `COMPATIBILITY.md` (`0.2.0`).
-- **Stage 4.3 (done): isolation.** `authz::test_support` (`AllowAllAuthz` / `DenyAllAuthz`); `db::migrate_with` + `audit-pg::MIGRATOR`.
+- **Stage 4.3 (done): isolation.** `authz::test_support` (`AllowAllAuthz` / `DenyAllAuthz`).
 - **Stage 4.4a (done): `/healthz`** in both examples.
 - **Stage 4.4b (partial): Dockerfile + WASM bundle.** Dockerfile for `saas-leptos` (multi-stage, non-root, `cargo-leptos =0.3.11`, binaryen 133, `wasm-bindgen =0.2.129`, `[profile.wasm-release]`). WASM: 1.7 MB (from 2.6 MB); **target 400 KB not met** — `wasm-opt` plateaus; further reduction requires removing dependencies. See `saas-19.md` §16.
 - **Stage 4 CLOSED (4.0–4.11).** Security fixes, CI, E2E HTTP tests, pagination,
   distributed rate limiter, SSR-correct guards, AuthLayer, observability, close-out.
-- **Stage 5 (open):** RLS (Postgres row-level security), cursor-based pagination,
-  OTel OTLP / distributed tracing, SSO (OIDC), 2FA (TOTP), cleanup TTL tables
-  (`refresh_tokens`, `email_verifications`, `password_reset_tokens`), outbox pattern
-  for audit, audit retention/immutability, distributed single-flight refresh,
-  escape hatch `_or_platform_admin`, `SaasBuilder::without_access`, UI pagination
-  for `member`/`role` pages, SSR-correct guards for `DocumentPage`/`RoleFormPage`.
+- **Stage 5.0 (Phase A part 1, done):** Resource Registry (`resource_types`), `without_access`, `migrate_composed`.
+- **Stage 5.0 (Phase A part 2, next):** `saas-axum` (HTTP adapter), `examples/minimal-lms`.
+- **Stage 5.1+ (open):** ABAC/ReBAC, OIDC, TOTP, RLS, etc.
 
 
 ## Pluggability: what can be replaced, what cannot
@@ -884,10 +881,10 @@ concrete implementations elsewhere. This section is the honest contract.
 
 ### Composition & migrations
 
-- **Full schema** — `db::migrate` (workspace set, 12 migrations in
+- **Full schema** — `db::migrate` (workspace set, 15 migrations in
   `crates/db/migrations/`). All crates share one database.
-- **Partial schema** — `db::migrate_with(pool, &[&Migrator])` against a
-  **fresh** database. Example: `db::migrate_with(&pool, &[audit_pg::MIGRATOR])`
+- **Composed schema** — `db::migrate_composed(pool, &[&Migrator])` merges
+  consumer migrations with the workspace set.
   creates only `users` (FK target) + `audit_log`. A consumer picks **one**
   path per database; composition of `migrate()` and a per-crate set on the
   same database is **not** supported (sqlx → `VersionMissing`).
@@ -926,7 +923,7 @@ of these should not treat their absence as a bug:
 ## Compatibility
 
 All `crates/*` share **one version** (`[workspace.package] version =
-"0.2.2"`). Consumers must pin every path / git dependency to the same
+"0.3.0"` (unreleased)). Consumers must pin every path / git dependency to the same
 revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change
 log.
 
