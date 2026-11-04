@@ -4,9 +4,24 @@
 //! Password hashing is not performed here — `create_user`/`upsert_user`
 //! accept a precomputed `password_hash` produced by `authn`. JWT, cookie,
 //! HTTP, and Casbin are not part of this crate.
+//!
+//! Stage 3b: `users.email_verified_at` is the source of truth for whether
+//! an email address has been verified. `domain::AuthUser.email_verified` is
+//! a **derived** boolean (`email_verified_at IS NOT NULL`), computed in
+//! every `SELECT` that maps a `users` row into `AuthUser`. The timestamp
+//! itself is internal to this crate (`UserRecord`); it is not exposed on
+//! `AuthUser`.
+//!
+//! Stage 3d: `users.password_changed_at` is the source of truth for "when
+//! was the password last set". `UserRecord` carries it; `update_password_tx`
+//! is the only writer that mutates `password_hash`, and it updates
+//! `password_changed_at = clock_timestamp()` in the same statement (Stage 4.5a
+//! extension — see the `update_password_tx` doc-comment for why not `now()`).
+//! Stage 4 uses it to invalidate access tokens issued before a password
+//! change (iat-vs-`password_changed_at`); Stage 3d only maintains it.
 
 use domain::AuthUser;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -17,16 +32,26 @@ pub enum IdentityError {
     DuplicateEmail,
     #[error("validation error: {0}")]
     Validation(String),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("db error: {0}")]
+    Db(String),
 }
 
-/// Full `users` row, including `password_hash`.
+/// Full `users` row, including `password_hash`, `email_verified_at`, and
+/// `password_changed_at`.
+///
+/// Internal to `identity`/`authn`: `UserRecord` never crosses the crate
+/// boundary (`AuthUser` is the public DTO; `From<UserRecord>` is the only
+/// bridge).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserRecord {
     pub id: Uuid,
     pub email: String,
     pub password_hash: String,
+    pub email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the password was last changed (Stage 3d). Source of truth for
+    /// the iat-vs-`password_changed_at` check in Stage 4; this stage only
+    /// maintains it.
+    pub password_changed_at: chrono::DateTime<chrono::Utc>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -35,8 +60,15 @@ impl From<UserRecord> for AuthUser {
         Self {
             id: r.id,
             email: r.email,
+            email_verified: r.email_verified_at.is_some(),
             created_at: r.created_at,
         }
+    }
+}
+
+impl From<sqlx::Error> for IdentityError {
+    fn from(e: sqlx::Error) -> Self {
+        IdentityError::Db(e.to_string())
     }
 }
 
@@ -58,11 +90,16 @@ pub fn validate_password(password: &str) -> Result<(), IdentityError> {
 }
 
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<AuthUser>, IdentityError> {
-    let user =
-        sqlx::query_as::<_, AuthUser>("select id, email, created_at from users where id = $1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+    let user = sqlx::query_as::<_, AuthUser>(
+        r#"
+        select id, email, (email_verified_at is not null) as email_verified, created_at
+        from users
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     Ok(user)
 }
 
@@ -71,7 +108,11 @@ pub async fn find_by_email(
     email: &str,
 ) -> Result<Option<UserRecord>, IdentityError> {
     let user = sqlx::query_as::<_, UserRecord>(
-        "select id, email, password_hash, created_at from users where email = $1",
+        r#"
+        select id, email, password_hash, email_verified_at, password_changed_at, created_at
+        from users
+        where email = $1
+        "#,
     )
     .bind(email)
     .fetch_optional(pool)
@@ -79,8 +120,38 @@ pub async fn find_by_email(
     Ok(user)
 }
 
+/// Like [`find_by_id`], but returns the full [`UserRecord`], including
+/// `password_hash`, `email_verified_at`, and `password_changed_at`.
+///
+/// Used by `authn::verify_token` (Stage 4.1) to compare the access-JWT
+/// `iat` claim with `users.password_changed_at` — a token issued before the
+/// last password change is rejected, closing the gap where a stolen
+/// access-token survived a `reset_password` for up to `access_ttl`.
+///
+/// Public because it is the only way to obtain `password_changed_at` from
+/// outside `identity`; `UserRecord` is already `pub` (with the same
+/// "internal to identity/authn" caveat).
+pub async fn find_record_by_id(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<UserRecord>, IdentityError> {
+    let user = sqlx::query_as::<_, UserRecord>(
+        r#"
+        select id, email, password_hash, email_verified_at, password_changed_at, created_at
+        from users
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(user)
+}
+
 /// Creates a user. `password_hash` must already be computed (Argon2 is in
-/// `authn`).
+/// `authn`). The new user is unverified (`email_verified_at IS NULL`);
+/// `password_changed_at` defaults to `now()` via the column default from
+/// migration `20261106000001_authn_password_reset.sql`.
 pub async fn create_user(
     pool: &PgPool,
     email: &str,
@@ -89,7 +160,11 @@ pub async fn create_user(
     validate_email(email)?;
 
     let result = sqlx::query_as::<_, AuthUser>(
-        "insert into users (email, password_hash) values ($1, $2) returning id, email, created_at",
+        r#"
+        insert into users (email, password_hash)
+        values ($1, $2)
+        returning id, email, (email_verified_at is not null) as email_verified, created_at
+        "#,
     )
     .bind(email)
     .bind(password_hash)
@@ -100,12 +175,21 @@ pub async fn create_user(
         sqlx::Error::Database(db) if db.constraint() == Some("users_email_key") => {
             IdentityError::DuplicateEmail
         }
-        other => IdentityError::Db(other),
+        other => IdentityError::Db(other.to_string()),
     })
 }
 
 /// Idempotent upsert: if a user with this email exists, update
 /// `password_hash`; otherwise create. Used by `seed`.
+///
+/// Does **not** touch `email_verified_at` or `password_changed_at`: seed
+/// uses `upsert_user` followed by an explicit `UPDATE` to set
+/// `email_verified_at = COALESCE(...)` for demo accounts (see
+/// `crates/seed/src/main.rs`). Not updating `password_changed_at` here is
+/// intentional — a seed re-run is not treated as a security-relevant
+/// password change (Stage 4's iat-vs-`password_changed_at` check would
+/// otherwise invalidate freshly-issued demo access tokens after every
+/// seed run).
 pub async fn upsert_user(
     pool: &PgPool,
     email: &str,
@@ -119,7 +203,7 @@ pub async fn upsert_user(
         values ($1, $2)
         on conflict (email) do update
         set password_hash = excluded.password_hash
-        returning id, email, created_at
+        returning id, email, (email_verified_at is not null) as email_verified, created_at
         "#,
     )
     .bind(email)
@@ -128,4 +212,64 @@ pub async fn upsert_user(
     .await?;
 
     Ok(user)
+}
+
+/// Updates a user's password inside a caller-supplied transaction (Stage 3d).
+///
+/// Sets `password_hash = $1` and `password_changed_at = clock_timestamp()`
+/// in a single `UPDATE`. The caller (`authn::reset_password`) is
+/// responsible for revoking refresh tokens and expiring outstanding reset
+/// tokens in the same transaction; this function writes only the `users`
+/// row, preserving the §2.9 single-writer invariant (`identity` writes
+/// `users`; `authn` orchestrates the transaction via this helper — the
+/// same pattern as `verify_email` writing `email_verified_at`).
+///
+/// **`clock_timestamp()`, not `now()` (Stage 4.5a extension).** `now()`
+/// in PostgreSQL returns the transaction-start time
+/// (`transaction_timestamp()`), not the time the `UPDATE` actually runs.
+/// Using it here creates two problems:
+///
+/// 1. **Test flake** (`authn/tests/integration.rs::reset_password_marks_token_used_and_changes_password`).
+///    The test sleeps 20 ms between register and reset, then asserts
+///    `password_changed_at` moved forward. With `now()`, a `reset_password`
+///    transaction that started before the sleep (e.g. SQLx pool scheduling
+///    under parallel test load) lands `T1 <= T0`, and the assertion fails
+///    intermittently.
+/// 2. **Security gap for the Stage 4.1 `iat`-vs-`password_changed_at` check.**
+///    If an access JWT is issued between `BEGIN` and the `UPDATE` inside
+///    `reset_password`, its `iat` is in `[T_BEGIN, T_UPDATE]`, and
+///    `password_changed_at = T_BEGIN` would let the token survive the
+///    reset. `clock_timestamp()` makes `password_changed_at` strictly
+///    greater than any token issued before the `UPDATE` statement itself.
+///
+/// Both are closed by the single substitution. No schema change
+/// (`clock_timestamp()` returns `timestamptz`, same as `now()`); outside
+/// behaviour of `reset_password` is unchanged apart from the narrower
+/// window.
+///
+/// Returns [`IdentityError::NotFound`] if no row matches `user_id`; in
+/// `authn::reset_password` the user id comes from a reset token that was
+/// just read under `FOR UPDATE`, so a miss is treated as an internal error
+/// (the user cannot normally disappear between those two statements).
+pub async fn update_password_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    new_hash: &str,
+) -> Result<(), IdentityError> {
+    let updated = sqlx::query(
+        r#"
+        update users
+        set password_hash = $1, password_changed_at = clock_timestamp()
+        where id = $2
+        "#,
+    )
+    .bind(new_hash)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        return Err(IdentityError::NotFound);
+    }
+    Ok(())
 }

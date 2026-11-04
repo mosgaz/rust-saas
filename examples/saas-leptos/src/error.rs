@@ -5,10 +5,32 @@
 //! - `Validation`, `InvalidRoleKey`                              -> 400
 //! - `Unauthorized`, `InvalidCredentials`, `TokenInvalid`,
 //!   `TokenExpired`, `RefreshInvalid`, `RefreshReused`           -> 401
-//! - `Forbidden`, `Protected`, `Immutable`                       -> 403
+//! - `Forbidden`, `EmailNotVerified`, `TenantSuspended`,
+//!   `Protected`, `Immutable`                                    -> 403
 //! - `NotFound`, `RoleNotFound`, `PermissionNotFound`            -> 404
-//! - `DuplicateEmail` (Identity)                                 -> 409
+//! - `DuplicateEmail` (Identity), `AlreadyVerified` (Authn)      -> 409
+//! - `rate_limited_error(...)`                                   -> 429
 //! - `Internal`, `Db`                                            -> 500
+//!
+//! Stage 3c: `CoreError::EmailNotVerified` (addressed invitation with an
+//! unverified actor) maps to 403; the message is distinct
+//! (`"email not verified"`) so the UI can offer "resend verification email"
+//! instead of a generic forbidden.
+//!
+//! Stage 3d: no new variants were introduced. The password-reset flow is
+//! covered by the existing arms:
+//! - `reset_password` → `AuthnError::TokenInvalid` (401, unknown or replayed
+//!   token), `AuthnError::TokenExpired` (401, expired token),
+//!   `AuthnError::Identity(IdentityError::Validation(_))` (400, password
+//!   too short — validation runs before the token is consumed).
+//! - `request_password_reset` is silent (`Ok(())` for unknown emails) and is
+//!   only surfaced through `rate_limited_error(...)` → 429.
+//!
+//! Stage 3f: `CoreError::TenantSuspended` (ADR-0002 rev.2; returned by
+//! `saas::platform::resolve_active_tenant` and the invitation services when
+//! the tenant's `status != 'active'`) maps to 403. The message
+//! (`"tenant is suspended"`) is distinct from `Forbidden` so the UI can
+//! show a dedicated banner instead of a generic permission-denied message.
 //!
 //! The body of `ServerFnError` is the error's `Display` string. The HTTP
 //! status is set via `leptos_axum::ResponseOptions` before the `#[server]`
@@ -20,25 +42,25 @@ use leptos::prelude::*;
 
 use access::AccessError;
 use authn::AuthnError;
-use identity::IdentityError;
 use saas::CoreError;
 
 fn status_for_core(e: &CoreError) -> u16 {
     match e {
         CoreError::Validation(_) => 400,
         CoreError::Unauthorized => 401,
-        CoreError::Forbidden => 403,
+        CoreError::Forbidden | CoreError::EmailNotVerified | CoreError::TenantSuspended => 403,
         CoreError::NotFound => 404,
         CoreError::Internal(_) | CoreError::Db(_) => 500,
     }
 }
 
-fn status_for_identity(e: &IdentityError) -> u16 {
+fn status_for_identity_kind(e: &authn::IdentityErrorKind) -> u16 {
+    use authn::IdentityErrorKind;
     match e {
-        IdentityError::Validation(_) => 400,
-        IdentityError::NotFound => 404,
-        IdentityError::DuplicateEmail => 409,
-        IdentityError::Db(_) => 500,
+        IdentityErrorKind::Validation(_) => 400,
+        IdentityErrorKind::NotFound => 404,
+        IdentityErrorKind::DuplicateEmail => 409,
+        IdentityErrorKind::Internal(_) => 500,
     }
 }
 
@@ -47,15 +69,19 @@ fn status_for_authn(e: &AuthnError) -> u16 {
         AuthnError::InvalidCredentials => 401,
         AuthnError::TokenInvalid | AuthnError::TokenExpired => 401,
         AuthnError::RefreshInvalid | AuthnError::RefreshReused => 401,
+        AuthnError::AlreadyVerified => 409,
         AuthnError::Internal(_) => 500,
-        AuthnError::Identity(inner) => status_for_identity(inner),
+        AuthnError::Identity(inner) => status_for_identity_kind(inner),
         AuthnError::Db(_) => 500,
     }
 }
 
 fn status_for_access(e: &AccessError) -> u16 {
     match e {
-        AccessError::Validation(_) | AccessError::InvalidRoleKey(_) => 400,
+        AccessError::Validation(_)
+        | AccessError::InvalidRoleKey(_)
+        | AccessError::UnknownResourceType { .. }
+        | AccessError::ScopeMismatch { .. } => 400,
         AccessError::Forbidden | AccessError::Protected | AccessError::Immutable => 403,
         AccessError::RoleNotFound(_) | AccessError::PermissionNotFound(_, _) => 404,
         AccessError::Internal(_) | AccessError::Db(_) => 500,
@@ -93,4 +119,10 @@ pub fn access_error_to_server_fn(e: AccessError) -> ServerFnError {
 pub fn unauthorized_error() -> ServerFnError {
     set_status(401);
     ServerFnError::new("unauthorized")
+}
+
+/// `ServerFnError` with HTTP 429 for "rate limited; retry later".
+pub fn rate_limited_error(retry_after_secs: u64) -> ServerFnError {
+    set_status(429);
+    ServerFnError::new(format!("rate limited; try again in {retry_after_secs}s"))
 }

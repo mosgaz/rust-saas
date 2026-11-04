@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration tests for `access` against a real PostgreSQL.
 //!
 //! `#[sqlx::test]` creates an isolated database per test, applies
@@ -86,6 +87,10 @@ impl AuthorizationEngine for MockAuthz {
     async fn purge_role(&self, _domain: &str, _role_key: &str) -> Result<u64, AuthzError> {
         Ok(0)
     }
+
+    async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+        Ok(())
+    }
 }
 
 fn setup(pool: PgPool, deny: bool) -> Arc<AccessState> {
@@ -97,6 +102,7 @@ fn actor() -> AuthUser {
     AuthUser {
         id: Uuid::new_v4(),
         email: "admin@example.test".to_string(),
+        email_verified: true,
         created_at: Utc::now(),
     }
 }
@@ -144,8 +150,8 @@ async fn create_role_persists_role_and_permissions(pool: PgPool) {
     let key = RoleKey::parse("test_role").unwrap();
 
     let permissions = vec![
-        ("documents".to_string(), "read".to_string()),
-        ("documents".to_string(), "write".to_string()),
+        ("document".to_string(), "read".to_string()),
+        ("document".to_string(), "write".to_string()),
     ];
 
     let role = access::create_role(
@@ -230,7 +236,7 @@ async fn get_role_and_get_permissions_for_role(pool: PgPool) {
         &key,
         "Custom".to_string(),
         "".to_string(),
-        &[("documents".to_string(), "read".to_string())],
+        &[("document".to_string(), "read".to_string())],
     )
     .await
     .unwrap();
@@ -243,7 +249,7 @@ async fn get_role_and_get_permissions_for_role(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(perms.len(), 1);
-    assert_eq!(perms[0], ("documents".to_string(), "read".to_string()));
+    assert_eq!(perms[0], ("document".to_string(), "read".to_string()));
 
     let missing = access::get_role(&state, domain, &RoleKey::parse("missing").unwrap())
         .await
@@ -270,4 +276,54 @@ async fn require_fails_if_authz_denies(pool: PgPool) {
     .expect_err("require must deny");
 
     assert!(matches!(err, AccessError::Forbidden));
+}
+
+#[sqlx::test(migrations = "../db/migrations")]
+async fn list_roles_paged_works(pool: PgPool) {
+    let state = setup(pool.clone(), false);
+    let actor = actor();
+    let domain = "tenant:test-paged";
+
+    // Create 5 roles
+    for i in 0..5 {
+        let key = RoleKey::parse(format!("role_{}", i)).unwrap();
+        access::create_role(
+            &state,
+            &actor,
+            domain,
+            &key,
+            format!("Role {}", i),
+            "".to_string(),
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Page 1: limit 2, offset 0
+    let page1 = access::list_roles_paged(&state, &actor, domain, 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.limit, 2);
+    assert_eq!(page1.offset, 0);
+    assert_eq!(page1.items[0].key.as_str(), "role_0");
+    assert_eq!(page1.items[1].key.as_str(), "role_1");
+
+    // Page 2: limit 2, offset 2
+    let page2 = access::list_roles_paged(&state, &actor, domain, 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.offset, 2);
+    assert_eq!(page2.items[0].key.as_str(), "role_2");
+
+    // Page 3: offset beyond total
+    let page3 = access::list_roles_paged(&state, &actor, domain, 2, 10)
+        .await
+        .unwrap();
+    assert_eq!(page3.total, 5);
+    assert!(page3.items.is_empty());
 }

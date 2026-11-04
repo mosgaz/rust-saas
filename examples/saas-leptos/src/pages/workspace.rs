@@ -1,6 +1,22 @@
 //! Workspace pages: the list of workspaces the current user belongs to, a
 //! single-workspace page (documents + links to invitations/members/roles),
 //! and a single-document page.
+//!
+//! **Stage 3f (ADR-0002 rev.2):** `create_document` resolves the tenant
+//! that owns the workspace (via `SELECT tenant_id FROM workspaces WHERE
+//! id = $1`) and calls `saas::platform::resolve_active_tenant` before
+//! delegating to `saas::workspace::create_document`. A non-member or a
+//! member of a suspended tenant gets HTTP 403 (`Forbidden` /
+//! `TenantSuspended`). Reads (`list_documents`, `get_document`,
+//! `list_my_workspaces`) do **not** resolve — see the module doc on
+//! `pages::tenant` for the reasoning (history is readable; UI gating is
+//! convenience, backend `require` is authoritative).
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<Uuid>`
+//! for the id fields. The `IntoParam` impl for bare `Uuid` is gated behind
+//! Leptos's `nightly` feature; the `Option<Uuid>` impl works on stable.
+//! Closures unwrap with `.and_then(|p| p.field)` — or, for pairs,
+//! `p.a.zip(p.b)` to produce `Option<(A, B)>`.
 
 use domain::Document;
 use leptos::callback::Callback;
@@ -16,46 +32,100 @@ use crate::pages::member::my_permissions;
 // ─── Server functions ───────────────────────────────────────────────────────
 
 /// Lists workspaces the current user is a member of.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_my_workspaces() -> Result<Vec<domain::Workspace>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::list_memberships(&state.saas, &user)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Creates a document in a workspace.
+///
+/// Stage 3f: resolves the tenant that owns the workspace first
+/// (membership + active status); a suspended tenant returns
+/// `TenantSuspended` (HTTP 403). See the module doc.
 #[server]
 pub async fn create_document(workspace_id: Uuid, title: String) -> Result<Document, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    let _tenant_id = resolve_ws_tenant(&state, &user, workspace_id).await?;
+
     saas::workspace::create_document(&state.saas, &user, workspace_id, title)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Lists documents in a workspace.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::list_documents(&state.saas, &user, workspace_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Gets a single document.
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn get_document(
     workspace_id: Uuid,
     document_id: Uuid,
 ) -> Result<Document, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::workspace::get_document(&state.saas, &user, workspace_id, document_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
+}
+
+/// Resolves the tenant that owns `workspace_id` and verifies it is active
+/// for `user` (Stage 3f).
+///
+/// Two steps: (1) `SELECT tenant_id FROM workspaces WHERE id = $1`
+/// (`NotFound` if the workspace is gone); (2) `saas::platform::resolve_active_tenant`
+/// (membership + `status = 'active'`). Returns the tenant id — the caller
+/// does not need it today, but keeping the return value makes the helper
+/// usable from other mutations that must pass `tenant_id` downstream.
+///
+/// `#[cfg(feature = "ssr")]` — the helper reads `AppState.saas` and calls
+/// into `saas::platform::*`; both are SSR-only. It is called from
+/// `#[server]`-functions, which are also SSR-only at runtime.
+#[cfg(feature = "ssr")]
+async fn resolve_ws_tenant(
+    state: &crate::state::AppState,
+    user: &domain::AuthUser,
+    workspace_id: Uuid,
+) -> Result<Uuid, ServerFnError> {
+    let tenant_id: Option<Uuid> =
+        sqlx::query_scalar("select tenant_id from workspaces where id = $1")
+            .bind(workspace_id)
+            .fetch_optional(state.saas.pool())
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tenant_id = tenant_id
+        .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
+
+    let active = saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(active.id)
 }
 
 // ─── Document list (nested) ─────────────────────────────────────────────────
@@ -239,16 +309,20 @@ pub fn WorkspaceListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
-/// `/workspaces/:workspace_id` — single workspace page: document list, create
-/// form (only when permitted), and links to invitations/members/roles (only
-/// when permitted).
+/// `/workspaces/:workspace_id` — single workspace page: document list,
+/// create form (only when permitted), and links to invitations/members/
+/// roles (only when permitted).
+///
+/// `my_permissions` is read-only and does not resolve the tenant; the
+/// `create_document` server function itself rejects with `TenantSuspended`
+/// (HTTP 403) when the tenant is not active.
 #[component]
 pub fn WorkspacePage() -> impl IntoView {
     let params = use_params::<WorkspaceParams>();
-    let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
+    let workspace_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id));
 
     let can_write = RwSignal::new(false);
     let can_members = RwSignal::new(false);
@@ -262,13 +336,11 @@ pub fn WorkspacePage() -> impl IntoView {
         spawn_local(async move {
             match my_permissions(domain).await {
                 Ok(perms) => {
-                    let has = |r: &str, a: &str| {
-                        perms.iter().any(|(pr, pa)| pr == r && pa == a)
-                    };
-                    can_write.set(has("documents", "write"));
-                    can_members.set(has("members", "list"));
-                    can_roles.set(has("roles", "list"));
-                    can_invitations.set(has("invitations", "list"));
+                    let has = |r: &str, a: &str| perms.iter().any(|(pr, pa)| pr == r && pa == a);
+                    can_write.set(has("document", "write"));
+                    can_members.set(has("member", "list"));
+                    can_roles.set(has("role", "list"));
+                    can_invitations.set(has("invitation", "list"));
                 }
                 Err(_) => {
                     can_write.set(false);
@@ -295,7 +367,7 @@ pub fn WorkspacePage() -> impl IntoView {
 
             <div class="mt-4 flex gap-2 flex-wrap">
                 {move || {
-                    let Some(id) = workspace_id() else { return None };
+                    let id = workspace_id()?;
                     let mut links = Vec::new();
                     if can_invitations.get() {
                         links.push(view! {
@@ -323,7 +395,7 @@ pub fn WorkspacePage() -> impl IntoView {
             </div>
 
             {move || {
-                let Some(id) = workspace_id() else { return None };
+                let id = workspace_id()?;
                 can_write.get().then(|| view! {
                     <DocumentFormPage workspace_id=id on_created=on_created />
                 })
@@ -340,15 +412,21 @@ pub fn WorkspacePage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct DocumentParams {
-    workspace_id: Uuid,
-    document_id: Uuid,
+    workspace_id: Option<Uuid>,
+    document_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id/documents/:document_id` — single document page.
 #[component]
 pub fn DocumentPage() -> impl IntoView {
     let params = use_params::<DocumentParams>();
-    let ids = move || params.with(|r| r.as_ref().ok().map(|p| (p.workspace_id, p.document_id)));
+    let ids = move || {
+        params.with(|r| {
+            r.as_ref()
+                .ok()
+                .and_then(|p| p.workspace_id.zip(p.document_id))
+        })
+    };
 
     let document = RwSignal::new(None::<Document>);
     let error = RwSignal::new(None::<String>);

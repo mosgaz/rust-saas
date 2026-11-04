@@ -1,0 +1,52 @@
+[package]
+name = "rust-saas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Meta-crate: re-exports the rust-saas library crates under a single Cargo entry (Stage 4.0)"
+
+[dependencies]
+domain = { path = "../domain", default-features = false }
+authz = { path = "../authz" }
+audit = { path = "../audit" }
+
+access = { path = "../access", optional = true }
+authz-casbin = { path = "../authz-casbin", optional = true }
+identity = { path = "../identity", optional = true }
+authn = { path = "../authn", optional = true }
+saas = { path = "../saas", optional = true }
+db = { path = "../db", optional = true }
+rate-limiter = { path = "../rate-limiter" }
+audit-pg = { path = "../audit-pg", optional = true }
+saas-axum = { path = "../saas-axum", optional = true }
+anyhow = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+
+[features]
+default = []
+ssr = [
+    "domain/ssr",
+    "dep:access",
+    "dep:authz-casbin",
+    "dep:identity",
+    "dep:authn",
+    "dep:saas",
+    "dep:db",
+    "dep:audit-pg",
+    "dep:anyhow",
+    "dep:sqlx",
+]
+axum = ["ssr", "dep:saas-axum"]
+hydrate = []
+rate-limiter-redis = ["rate-limiter/redis"]
+
+[dev-dependencies]
+# `feature_axum.rs` (compile-only) names `sqlx::PgPool`, `axum::Router`,
+# `axum::http::Method`, `chrono::TimeDelta` in its type assertions. These
+# are transitive through `saas-axum`, but transitive deps are not nameable
+# in Rust; the meta-crate must list them to reference them in tests. Dev
+# only — consumers of `rust-saas` do not see these.
+axum = "0.8"
+chrono.workspace = true
+sqlx.workspace = true

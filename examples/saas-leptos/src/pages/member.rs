@@ -13,6 +13,26 @@
 //! Role key is passed to the server as a raw string and parsed into
 //! `access::RoleKey` server-side; the client never sees `access` types
 //! (`access` is SSR-only).
+//!
+//! **Stage 3f (ADR-0002 rev.2):** `assign_member_role` and
+//! `remove_member_role` resolve the tenant that owns the domain before
+//! delegating to `saas::member::*`. For a tenant domain the id comes
+//! directly from the string; for a workspace domain the server does a
+//! `SELECT tenant_id FROM workspaces WHERE id = $1`. A suspended tenant
+//! yields `TenantSuspended` (HTTP 403); a non-member yields `Forbidden`.
+//! `list_members` and `my_permissions` are read-only and stay outside the
+//! resolution path (a suspended tenant must still allow reading its
+//! history — see the `pages::tenant` module doc).
+//!
+//! **Stage 3h (PermsCache):** `my_permissions` is read through the shared
+//! [`crate::perms_cache::PermsCache`] provided at the root `App`. The cache
+//! is invalidated after `assign_member_role` and `remove_member_role`, so
+//! the next render sees fresh permissions.
+//!
+//! **Stage 3i (Leptos 0.8 stable):** route param structs use `Option<Uuid>`
+//! for the id fields. The `IntoParam` impl for bare `Uuid` is gated behind
+//! Leptos's `nightly` feature; the `Option<Uuid>` impl works on stable.
+//! Closures unwrap with `.and_then(|p| p.field)`.
 
 use std::collections::HashSet;
 
@@ -24,6 +44,7 @@ use leptos_router::params::Params;
 use uuid::Uuid;
 
 use crate::pages::role::{list_roles, RoleView};
+use crate::perms_cache::PermsCache;
 
 #[cfg(feature = "ssr")]
 use access::RoleKey;
@@ -32,28 +53,40 @@ use access::RoleKey;
 
 /// Lists members of the domain identified by `domain`
 /// (`tenant:{uuid}` or `workspace:{uuid}`).
+///
+/// Read-only; no `resolve_active_tenant` (see module doc).
 #[server]
 pub async fn list_members(domain: String) -> Result<Vec<Member>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     let scope = parse_scope(&domain)?;
-    saas::member::list(&state.saas, &user, scope)
+    let page = saas::member::list_paged(&state.saas, &user, scope, i64::MAX, 0)
         .await
-        .map_err(crate::error::core_error_to_server_fn)
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(page.items)
 }
 
 /// Returns the actor's effective permissions in `domain`.
+///
+/// Read-only UX helper; no `resolve_active_tenant`.
 #[server]
 pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
     saas::access::my_permissions(&state.saas, &user, &domain)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
-/// Assigns `role_key` to `user_id` in `domain` (`(members, manage)` required
+/// Assigns `role_key` to `user_id` in `domain` (`(member, manage)` required
 /// via `saas::access::assign_role`).
+///
+/// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
+/// returns `TenantSuspended` (HTTP 403).
 #[server]
 pub async fn assign_member_role(
     domain: String,
@@ -61,15 +94,21 @@ pub async fn assign_member_role(
     role_key: String,
 ) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+    resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
     saas::access::assign_role(&state.saas, &user, user_id, &domain, &key)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
-/// Removes `role_key` from `user_id` in `domain` (`(members, manage)` required
+/// Removes `role_key` from `user_id` in `domain` (`(member, manage)` required
 /// via `saas::member::remove_role`).
+///
+/// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
+/// returns `TenantSuspended` (HTTP 403).
 #[server]
 pub async fn remove_member_role(
     domain: String,
@@ -77,7 +116,10 @@ pub async fn remove_member_role(
     role_key: String,
 ) -> Result<(), ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let user = crate::extract::CurrentUser::from_request().await?.require()?;
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+    resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
     let scope = parse_scope(&domain)?;
     saas::member::remove_role(&state.saas, &user, scope, user_id, &key)
@@ -100,10 +142,48 @@ fn parse_scope(domain: &str) -> Result<saas::member::MemberScope, ServerFnError>
     }
 }
 
+/// Resolves the tenant that owns `domain` (`tenant:{id}` or
+/// `workspace:{id}`) and verifies it is active for `user` (Stage 3f).
+///
+/// For `workspace:{id}` this performs an extra `SELECT tenant_id FROM
+/// workspaces WHERE id = $1` (`NotFound` if the workspace is gone) before
+/// calling `saas::platform::resolve_active_tenant`. Returns the tenant id;
+/// the caller may ignore it today — keeping it explicit makes the helper
+/// reusable from mutations that must pass `tenant_id` downstream.
+///
+/// `#[cfg(feature = "ssr")]` — calls into `crate::state::AppState` and
+/// `saas::platform::*`, both SSR-only.
+#[cfg(feature = "ssr")]
+pub(crate) async fn resolve_domain_tenant(
+    state: &crate::state::AppState,
+    user: &domain::AuthUser,
+    domain: &str,
+) -> Result<Uuid, ServerFnError> {
+    let tenant_id: Uuid = if let Some(id) = domain.strip_prefix("tenant:") {
+        Uuid::parse_str(id).map_err(|e| ServerFnError::new(e.to_string()))?
+    } else if let Some(id) = domain.strip_prefix("workspace:") {
+        let workspace_id = Uuid::parse_str(id).map_err(|e| ServerFnError::new(e.to_string()))?;
+        let tid: Option<Uuid> =
+            sqlx::query_scalar("select tenant_id from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(state.saas.pool())
+                .await
+                .map_err(|e| ServerFnError::new(e.to_string()))?;
+        tid.ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?
+    } else {
+        return Err(ServerFnError::new(format!("invalid domain: {domain}")));
+    };
+
+    let active = saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+        .await
+        .map_err(crate::error::core_error_to_server_fn)?;
+    Ok(active.id)
+}
+
 // ─── Shared panel ───────────────────────────────────────────────────────────
 
 /// Inline member panel for a domain. Renders the member list and, when the
-/// actor has `(members, manage)`, per-role remove buttons, a role- and
+/// actor has `(member, manage)`, per-role remove buttons, a role- and
 /// member-select "Assign role" form, and an "Invite instead" link to
 /// `scope_url`.
 ///
@@ -119,13 +199,21 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
     let perms = RwSignal::new(HashSet::<(String, String)>::new());
     let error = RwSignal::new(None::<String>);
     let refresh = RwSignal::new(0u32);
+    let cache = use_context::<PermsCache>().expect("PermsCache in context");
 
     let new_user = RwSignal::new(String::new());
     let new_role = RwSignal::new(String::new());
 
+    // `PermsCache` is `Clone` but not `Copy`. Each `move`-closure below needs
+    // its own owned handle so that one closure's `move` does not rob the
+    // others of the value. Clone **before** each closure boundary; clone
+    // again **inside** each closure body per invocation so that `FnMut`
+    // closures can be called more than once.
+    let cache_effect = cache.clone();
     Effect::new(move |_| {
         let _ = refresh.get();
         let d = domain.get_value();
+        let cache = cache_effect.clone();
         spawn_local(async move {
             match list_members(d.clone()).await {
                 Ok(list) => {
@@ -134,10 +222,14 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                 }
                 Err(e) => error.set(Some(e.to_string())),
             }
-            match my_permissions(d.clone()).await {
-                Ok(p) => perms.set(p.into_iter().collect()),
-                Err(e) => error.set(Some(e.to_string())),
-            }
+
+            let perms_vec = cache
+                .get_or_fetch(d.clone(), |domain| async move {
+                    my_permissions(domain).await.unwrap_or_default()
+                })
+                .await;
+            perms.set(perms_vec.into_iter().collect());
+
             match list_roles(d).await {
                 Ok(rs) => {
                     if new_role.get_untracked().is_empty() {
@@ -152,11 +244,14 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
         });
     });
 
-    let can_manage = move || {
-        perms.with(|p| p.contains(&("members".to_string(), "manage".to_string())))
-    };
+    let can_manage =
+        move || perms.with(|p| p.contains(&("member".to_string(), "manage".to_string())));
 
+    let cache_submit = cache.clone();
     let submit_assign = move |_| {
+        // Fresh clone per invocation: `submit_assign` is `FnMut` (clicked
+        // repeatedly) and the async block consumes its clone.
+        let cache = cache_submit.clone();
         let d = domain.get_value();
         let uid = new_user.get();
         let role = new_role.get();
@@ -172,10 +267,11 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
             }
         };
         spawn_local(async move {
-            match assign_member_role(d, uid, role).await {
+            match assign_member_role(d.clone(), uid, role).await {
                 Ok(()) => {
                     new_user.set(String::new());
                     error.set(None);
+                    cache.invalidate(&d);
                     refresh.update(|n| *n += 1);
                 }
                 Err(e) => error.set(Some(e.to_string())),
@@ -183,6 +279,7 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
         });
     };
 
+    let cache_view = cache.clone();
     view! {
         <div class="card mt-6">
             <h2 class="text-lg font-semibold">"Members"</h2>
@@ -191,6 +288,11 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
             <ul class="mt-4 divide-y divide-neutral-800">
                 {move || {
                     let list = members.get();
+                    // Per-render clone; the per-row / per-role / per-click
+                    // closures below each get their own derived clone so none
+                    // of them tries to move this binding out of a sibling
+                    // closure.
+                    let cache = cache_view.clone();
                     if list.is_empty() {
                         view! { <li class="py-2 text-neutral-500">"No members."</li> }.into_any()
                     } else {
@@ -201,6 +303,9 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                                 let email = m.email.clone();
                                 let roles = m.roles.clone();
                                 let d = d.clone();
+                                // Per-row clone: each row's `move ||` takes
+                                // ownership of its own handle.
+                                let cache = cache.clone();
                                 view! {
                                     <li class="py-3">
                                         <p class="font-medium">{email}</p>
@@ -214,22 +319,31 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                                                     let d = d.clone();
                                                     let role_label = r.clone();
                                                     let role_for_remove = r.clone();
+                                                    // Per-role clone.
+                                                    let cache = cache.clone();
                                                     view! {
                                                         <span class="inline-flex items-center gap-1 px-2 py-1 rounded bg-neutral-800 text-sm">
                                                             {role_label}
                                                             {move || if can_manage() {
                                                                 let d = d.clone();
                                                                 let role = role_for_remove.clone();
+                                                                // Per-render clone for the
+                                                                // button's click handler.
+                                                                let cache = cache.clone();
                                                                 Some(view! {
                                                                     <button
                                                                         class="ml-1 text-red-400"
                                                                         on:click=move |_| {
+                                                                            // Per-click clone: the
+                                                                            // handler stays `FnMut`.
+                                                                            let cache = cache.clone();
                                                                             let d = d.clone();
                                                                             let role = role.clone();
                                                                             spawn_local(async move {
-                                                                                match remove_member_role(d, uid, role).await {
+                                                                                match remove_member_role(d.clone(), uid, role).await {
                                                                                     Ok(()) => {
                                                                                         error.set(None);
+                                                                                        cache.invalidate(&d);
                                                                                         refresh.update(|n| *n += 1);
                                                                                     }
                                                                                     Err(e) => error.set(Some(e.to_string())),
@@ -261,6 +375,9 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
                 let member_opts = members.get();
                 let role_opts = roles.get();
                 let invite_href = scope_url.get_value();
+                // `submit_assign` is `FnMut + Clone`; clone per render so this
+                // outer closure does not move it out of its own capture.
+                let submit_assign = submit_assign.clone();
                 Some(view! {
                     <div class="mt-6 border-t border-neutral-800 pt-4">
                         <h3 class="text-sm font-semibold">"Assign role"</h3>
@@ -307,14 +424,14 @@ pub fn MemberListPage(domain: String, scope_url: String) -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct TenantIdParams {
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
 }
 
 /// `/tenants/:tenant_id/members` — tenant member list.
 #[component]
 pub fn TenantMemberListPage() -> impl IntoView {
     let params = use_params::<TenantIdParams>();
-    let tenant_id = move || params.with(|r| r.as_ref().ok().map(|p| p.tenant_id));
+    let tenant_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.tenant_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">
@@ -338,14 +455,14 @@ pub fn TenantMemberListPage() -> impl IntoView {
 
 #[derive(Params, PartialEq)]
 struct WorkspaceIdParams {
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
 }
 
 /// `/workspaces/:workspace_id/members` — workspace member list.
 #[component]
 pub fn WorkspaceMemberListPage() -> impl IntoView {
     let params = use_params::<WorkspaceIdParams>();
-    let workspace_id = move || params.with(|r| r.as_ref().ok().map(|p| p.workspace_id));
+    let workspace_id = move || params.with(|r| r.as_ref().ok().and_then(|p| p.workspace_id));
 
     view! {
         <main class="mx-auto max-w-2xl p-8">

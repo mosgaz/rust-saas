@@ -1,7 +1,9 @@
 [package]
 name = "seed"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "Bootstrap binary: platform owner, demo tenant/workspace/users/roles"
 
 [[bin]]
@@ -17,6 +19,8 @@ identity = { path = "../identity" }
 db = { path = "../db" }
 domain = { path = "../domain" }
 saas = { path = "../saas" }
+audit = { path = "../audit" }
+audit-pg = { path = "../audit-pg" }
 
 sqlx.workspace = true
 tokio.workspace = true

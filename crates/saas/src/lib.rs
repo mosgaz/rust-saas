@@ -4,12 +4,52 @@
 //! `casbin::Enforcer`, JWT or Argon2. Authorization is delegated to an
 //! `authz::AuthorizationEngine`; the actor is `domain::AuthUser` (resolved
 //! by `authn` in the consumer).
+//!
+//! Stage 3c adds [`CoreError::EmailNotVerified`] for addressed invitations:
+//! `invitation::accept_invitation` rejects an unverified actor when
+//! `invitation.email IS NOT NULL` before comparing the address
+//! (verified-first), and rejects a verified actor whose email does not match
+//! the invitation address (case-insensitive) with [`CoreError::Forbidden`].
+//!
+//! Stage 3e (ADR-0004): [`SaasState`] carries an `Arc<dyn AuditLogger>`
+//! (default [`NoopAuditLogger`]); [`SaasBuilder::with_audit`] plugs in a
+//! real logger (`PgAuditLogger`). Emissions live in submodules:
+//! - `platform::create_tenant` / `platform::provision_tenant` →
+//!   `tenant.created`.
+//! - `platform::suspend_tenant` / `platform::activate_tenant` →
+//!   `tenant.suspended` / `tenant.activated` (Stage 3f; emitted only on a
+//!   status transition).
+//! - `tenant::create_workspace` → `workspace.created`.
+//! - `invitation::{create, accept, revoke}_invitation` →
+//!   `invitation.{created, accepted, revoked}`.
+//! - `access::{assign_role, revoke_role, delete_role}` →
+//!   `member.role_assigned` / `member.role_revoked` / `role.deleted`.
+//! - `member::change_role` → `member.role_changed` (in addition to the
+//!   `member.role_assigned` / `member.role_revoked` emitted by its inner
+//!   `saas::access::{assign_role, revoke_role}` calls — three events total).
+//!
+//! Stage 3f: platform-level administration and tenant suspension.
+//! - [`platform`] is extracted into `crates/saas/src/platform.rs`; paths
+//!   are preserved via `pub mod platform;` + `pub use platform::{…}`.
+//!   [`ActiveTenant`] and [`resolve_active_tenant`] are re-exported at the
+//!   crate root for convenience.
+//! - [`CoreError::TenantSuspended`] is the typed rejection returned by
+//!   [`platform::resolve_active_tenant`] (and the invitation services) when
+//!   the tenant's `status != 'active'`. Mapped to HTTP 403 in the example.
+//! - All 21 audit events are now emitted; `tenant.suspended` /
+//!   `tenant.activated` fire on transitions only (`UPDATE … WHERE status =
+//!   <expected> RETURNING *` returns a row; zero-row updates are a no-op
+//!   without emission).
+//!
+//! Audit is best-effort: a failed write is `tracing::warn!` and does not
+//! fail the business operation (ADR-0004 §2.4).
 
 use std::sync::Arc;
 
 use ::access::{AccessError, AccessState, RoleKey};
+use audit::{AuditEvent, AuditLogger, NoopAuditLogger};
 use authz::{AuthorizationEngine, AuthzError};
-use domain::{AuthUser, Document, Tenant, Workspace, PLATFORM_DOMAIN};
+use domain::{AuthUser, Document, Tenant, Workspace};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -17,20 +57,47 @@ pub mod access;
 pub mod invitation;
 pub mod member;
 
+pub mod platform;
+pub use platform::{
+    resolve_active_tenant, resolve_active_workspace, ActiveTenant, ActiveWorkspace,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("unauthorized")]
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    /// Addressed invitation requires a verified email, but the actor's
+    /// email is not verified (Stage 3c). Mapped to HTTP 403 in the
+    /// example's `error.rs`, with a distinct message so the UI can offer
+    /// "resend verification email" instead of a generic "forbidden".
+    #[error("email not verified")]
+    EmailNotVerified,
+    /// The tenant exists and the actor is a member, but its `status` is not
+    /// `'active'` (Stage 3f; ADR-0002 rev.2). Returned by
+    /// [`platform::resolve_active_tenant`] and by the invitation services
+    /// (`create_invitation` / `accept_invitation`) when the target tenant
+    /// is suspended. Mapped to HTTP 403 in the example.
+    #[error("tenant is suspended")]
+    TenantSuspended,
     #[error("not found")]
     NotFound,
     #[error("validation error: {0}")]
     Validation(String),
     #[error("internal error: {0}")]
     Internal(String),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    #[error("db error: {0}")]
+    /// Opaque DB failure. `String` (not `sqlx::Error`) so that a consumer
+    /// does not need `sqlx` in its dependency tree just to pattern-match
+    /// this variant (Stage 4.2, `COMPATIBILITY.md`).
+    Db(String),
+}
+
+impl From<sqlx::Error> for CoreError {
+    fn from(e: sqlx::Error) -> Self {
+        CoreError::Db(e.to_string())
+    }
 }
 
 impl From<AuthzError> for CoreError {
@@ -38,6 +105,7 @@ impl From<AuthzError> for CoreError {
         match e {
             AuthzError::Forbidden => CoreError::Forbidden,
             AuthzError::Internal(s) => CoreError::Internal(s),
+            AuthzError::ReloadError(s) => CoreError::Internal(s),
         }
     }
 }
@@ -49,6 +117,16 @@ impl From<AccessError> for CoreError {
             AccessError::InvalidRoleKey(s) => CoreError::Validation(s),
             AccessError::RoleNotFound(_) => CoreError::NotFound,
             AccessError::PermissionNotFound(_, _) => CoreError::NotFound,
+            AccessError::UnknownResourceType { name } => {
+                CoreError::Validation(format!("unknown resource type: {name}"))
+            }
+            AccessError::ScopeMismatch {
+                name,
+                existing,
+                requested,
+            } => CoreError::Validation(format!(
+                "resource scope mismatch for `{name}`: existing={existing}, requested={requested}"
+            )),
             AccessError::Protected => CoreError::Forbidden,
             AccessError::Immutable => CoreError::Forbidden,
             AccessError::Validation(s) => CoreError::Validation(s),
@@ -62,7 +140,15 @@ impl From<AccessError> for CoreError {
 pub struct SaasState {
     pub(crate) pool: PgPool,
     pub(crate) authz: Arc<dyn AuthorizationEngine>,
-    pub(crate) access: Arc<AccessState>,
+    /// `None` iff the state was built via
+    /// [`SaasBuilder::without_access`] — a deliberate no-RBAC build. In
+    /// that case only the low-level methods (`create_tenant`,
+    /// `create_workspace`, `create_document`, `list_*`) work; the
+    /// RBAC-required ones (`provision_tenant`, `create_workspace_with_owner`,
+    /// `invitation::*`, `member::*`, `access::*`) return
+    /// [`CoreError::Internal`] via [`SaasState::access`].
+    pub(crate) access: Option<Arc<AccessState>>,
+    pub(crate) audit: Arc<dyn AuditLogger>,
 }
 
 impl SaasState {
@@ -74,8 +160,42 @@ impl SaasState {
         &self.authz
     }
 
-    pub fn access(&self) -> &AccessState {
-        &self.access
+    /// Shared access state.
+    ///
+    /// `Ok` on every `SaasState` built via `with_access(...)` (`access =
+    /// Some`). `Err(CoreError::Internal("RBAC not configured"))` on a
+    /// `SaasState` built via `without_access()` (`access = None`) — the
+    /// caller asked for a no-RBAC build and must not invoke `access::*`
+    /// methods.
+    ///
+    /// Read-only callers (`list_*`, `get_*`) map `Err` to 500;
+    /// RBAC-required mutations (`create_workspace_with_owner`,
+    /// `provision_tenant`, `invitation::*`, `member::*`) require `Ok`
+    /// by construction.
+    pub fn access(&self) -> Result<&AccessState, CoreError> {
+        self.access.as_deref().ok_or_else(|| {
+            CoreError::Internal("RBAC not configured: built with without_access()".into())
+        })
+    }
+
+    pub fn audit(&self) -> &Arc<dyn AuditLogger> {
+        &self.audit
+    }
+
+    /// Best-effort audit write: a failure is `tracing::warn!` and does
+    /// **not** propagate (ADR-0004 §2.4). Used by this crate's modules
+    /// (platform, tenant, invitation, access, member).
+    pub(crate) async fn audit_or_warn(&self, event: AuditEvent) {
+        let event_type = event.event_type.clone();
+        let actor_id = event.actor_id;
+        if let Err(e) = self.audit.log(&event).await {
+            tracing::warn!(
+                error = %e,
+                event_type = %event_type,
+                actor_id = ?actor_id,
+                "audit log failed"
+            );
+        }
     }
 }
 
@@ -83,6 +203,12 @@ pub struct SaasBuilder {
     pool: PgPool,
     authz: Option<Arc<dyn AuthorizationEngine>>,
     access: Option<Arc<AccessState>>,
+    /// Set by [`SaasBuilder::without_access`], cleared by
+    /// [`SaasBuilder::with_access`]. Distinguishes "consumer explicitly
+    /// opted out of RBAC" from "consumer forgot to call `with_access`" —
+    /// both leave `access = None`, but only the former should build.
+    access_skipped: bool,
+    audit: Option<Arc<dyn AuditLogger>>,
 }
 
 impl SaasBuilder {
@@ -91,6 +217,8 @@ impl SaasBuilder {
             pool,
             authz: None,
             access: None,
+            access_skipped: false,
+            audit: None,
         }
     }
 
@@ -101,110 +229,155 @@ impl SaasBuilder {
 
     pub fn with_access(mut self, access: Arc<AccessState>) -> Self {
         self.access = Some(access);
+        self.access_skipped = false;
         self
     }
 
+    /// Opt out of RBAC explicitly. The resulting [`SaasState`] works for
+    /// the low-level methods (`create_tenant`, `create_workspace`,
+    /// `create_document`, `list_*`), which only use `authz.require` +
+    /// SQL. The RBAC-required methods (`provision_tenant`,
+    /// `create_workspace_with_owner`, `invitation::*`, `member::*`,
+    /// `access::*`) return [`CoreError::Internal`] via
+    /// [`SaasState::access`].
+    ///
+    /// `authz` is still required — the low-level methods call
+    /// `authz.require(..)` for defense in depth. A no-RBAC consumer
+    /// passes their own `AuthorizationEngine` impl (e.g. an
+    /// `AlwaysAllow` in ~5 lines).
+    ///
+    /// Calling `without_access()` after `with_access()` wins; the
+    /// reverse is also true (last call wins).
+    pub fn without_access(mut self) -> Self {
+        self.access = None;
+        self.access_skipped = true;
+        self
+    }
+
+    /// Plugs in a real [`AuditLogger`] (`PgAuditLogger`). Without this
+    /// call, [`NoopAuditLogger`] is used and no events are recorded
+    /// (dev / tests / seed bootstrap — visible as an empty `audit_log`).
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Builds a [`SaasState`].
+    ///
+    /// `authz` is always required. `access` must be provided via
+    /// [`SaasBuilder::with_access`] **or** explicitly opted out of via
+    /// [`SaasBuilder::without_access`]; calling neither is a bug in the
+    /// caller and fails fast.
     pub fn build(self) -> Result<SaasState, CoreError> {
         let authz = self.authz.ok_or_else(|| {
             CoreError::Internal("SaasBuilder: authorization engine is required".into())
         })?;
-        let access = self
-            .access
-            .ok_or_else(|| CoreError::Internal("SaasBuilder: access state is required".into()))?;
+        let access = match (self.access, self.access_skipped) {
+            (Some(a), false) => Some(a),
+            (None, true) => None,
+            (_, false) => {
+                return Err(CoreError::Internal(
+                    "SaasBuilder: access state is required; call with_access(..) \
+                     or without_access() to opt out"
+                        .into(),
+                ));
+            }
+            // (Some(_), true) is unreachable: `with_access` clears
+            // `access_skipped`, `without_access` clears `access` — the
+            // last call wins. Keeping the arm explicit (not `_ =>`) so
+            // an accidental third combination is a compile-time surprise
+            // rather than silent behaviour.
+            (Some(_), true) => {
+                unreachable!("SaasBuilder: with_access/without_access must be mutually exclusive")
+            }
+        };
+        let audit = self.audit.unwrap_or_else(|| Arc::new(NoopAuditLogger));
         Ok(SaasState {
             pool: self.pool,
             authz,
             access,
+            audit,
         })
-    }
-}
-
-pub mod platform {
-    use super::*;
-
-    /// Creates a tenant container. No side effects.
-    pub async fn create_tenant(
-        state: &SaasState,
-        actor: &AuthUser,
-        name: String,
-    ) -> Result<Tenant, CoreError> {
-        state
-            .authz
-            .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
-            .await?;
-
-        let tenant = sqlx::query_as::<_, Tenant>(
-            "insert into tenants (name) values ($1) returning id, name, status, created_at",
-        )
-        .bind(name)
-        .fetch_one(&state.pool)
-        .await?;
-
-        Ok(tenant)
-    }
-
-    /// Creates a tenant and assigns an explicit owner with `owner_role_key`.
-    pub async fn provision_tenant(
-        state: &SaasState,
-        actor: &AuthUser,
-        name: String,
-        owner: &AuthUser,
-        owner_role_key: &RoleKey,
-    ) -> Result<Tenant, CoreError> {
-        state
-            .authz
-            .require(actor.id, PLATFORM_DOMAIN, "tenants", "create")
-            .await?;
-
-        let mut tx = state.pool.begin().await?;
-
-        let tenant = sqlx::query_as::<_, Tenant>(
-            "insert into tenants (name) values ($1) returning id, name, status, created_at",
-        )
-        .bind(name)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let domain_str = domain::tenant_domain(tenant.id);
-
-        ::access::create_owner_role(state.access(), &domain_str)
-            .await
-            .map_err(CoreError::from)?;
-
-        let permissions =
-            ::access::get_permissions_for_role(state.access(), &domain_str, owner_role_key)
-                .await
-                .map_err(CoreError::from)?;
-
-        state
-            .authz
-            .grant_role(owner.id, &domain_str, owner_role_key.as_str(), &permissions)
-            .await?;
-
-        sqlx::query(
-            r#"
-            insert into tenant_members (tenant_id, user_id, role)
-            values ($1, $2, $3)
-            on conflict do nothing
-            "#,
-        )
-        .bind(tenant.id)
-        .bind(owner.id)
-        .bind(owner_role_key.as_str())
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(tenant)
     }
 }
 
 pub mod tenant {
     use super::*;
+    use audit::events;
 
-    /// Creates a workspace inside a tenant and assigns the owner as `owner_role_key`.
+    /// Creates a bare workspace inside a tenant (no owner).
+    ///
+    /// Emits `workspace.created` (Stage 3e) after the insert commits;
+    /// `metadata` is `{ name, tenant_id }` — no `owner_id` /
+    /// `owner_role_key` (there is no owner to record).
+    ///
+    /// **No-RBAC path.** Requires only `authz.require(actor, tenant,
+    /// "workspace", "create")` + a SQL insert; does **not** touch
+    /// `state.access()`. Works on both `with_access(..)` and
+    /// `without_access()` builds.
+    ///
+    /// The caller is responsible for assigning roles/membership
+    /// afterwards (`saas::access::assign_role` if RBAC is on, or the
+    /// consumer's own mechanism). For the one-shot "create + assign
+    /// owner" flow, use [`create_workspace_with_owner`].
     pub async fn create_workspace(
+        state: &SaasState,
+        actor: &AuthUser,
+        tenant_id: Uuid,
+        name: String,
+    ) -> Result<Workspace, CoreError> {
+        let domain_str = domain::tenant_domain(tenant_id);
+
+        state
+            .authz
+            .require(actor.id, &domain_str, "workspace", "create")
+            .await?;
+
+        let workspace = sqlx::query_as::<_, Workspace>(
+            r#"
+            insert into workspaces (tenant_id, name)
+            values ($1, $2)
+            returning id, tenant_id, name, created_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&name)
+        .fetch_one(&state.pool)
+        .await?;
+
+        state
+            .audit_or_warn(AuditEvent {
+                event_type: events::WORKSPACE_CREATED.into(),
+                actor_id: Some(actor.id),
+                actor_email: Some(actor.email.clone()),
+                target_type: Some("workspace".into()),
+                target_id: Some(workspace.id),
+                metadata: serde_json::json!({
+                    "name": name,
+                    "tenant_id": tenant_id.to_string(),
+                }),
+            })
+            .await;
+
+        Ok(workspace)
+    }
+
+    /// Creates a workspace inside a tenant and assigns `owner` as
+    /// `owner_role_key` (RBAC path; requires `AccessState`).
+    ///
+    /// Emits `workspace.created` (Stage 3e) after the transaction
+    /// commits; `metadata` carries `owner_id` / `owner_role_key`.
+    ///
+    /// **Renamed from `create_workspace` in Stage 5.0-A2.2c** to free
+    /// the old name for the no-RBAC path
+    /// ([`create_workspace`]). Callers that want owner assignment on
+    /// workspace creation use this function; callers that want a bare
+    /// workspace (and assign the owner separately via
+    /// `saas::access::assign_role`) use [`create_workspace`].
+    ///
+    /// Requires `state.access()`; fails with `Internal("RBAC not
+    /// configured")` on a `without_access()` build.
+    pub async fn create_workspace_with_owner(
         state: &SaasState,
         actor: &AuthUser,
         tenant_id: Uuid,
@@ -216,7 +389,7 @@ pub mod tenant {
 
         state
             .authz
-            .require(actor.id, &domain_str, "workspaces", "create")
+            .require(actor.id, &domain_str, "workspace", "create")
             .await?;
 
         let mut tx = state.pool.begin().await?;
@@ -229,18 +402,18 @@ pub mod tenant {
             "#,
         )
         .bind(tenant_id)
-        .bind(name)
+        .bind(&name)
         .fetch_one(&mut *tx)
         .await?;
 
         let ws_domain = domain::workspace_domain(workspace.id);
 
-        ::access::create_owner_role(state.access(), &ws_domain)
+        ::access::create_owner_role(state.access()?, &ws_domain)
             .await
             .map_err(CoreError::from)?;
 
         let permissions =
-            ::access::get_permissions_for_role(state.access(), &ws_domain, owner_role_key)
+            ::access::get_permissions_for_role(state.access()?, &ws_domain, owner_role_key)
                 .await
                 .map_err(CoreError::from)?;
 
@@ -263,6 +436,22 @@ pub mod tenant {
         .await?;
 
         tx.commit().await?;
+
+        state
+            .audit_or_warn(AuditEvent {
+                event_type: events::WORKSPACE_CREATED.into(),
+                actor_id: Some(actor.id),
+                actor_email: Some(actor.email.clone()),
+                target_type: Some("workspace".into()),
+                target_id: Some(workspace.id),
+                metadata: serde_json::json!({
+                    "name": name,
+                    "tenant_id": tenant_id.to_string(),
+                    "owner_id": owner.id.to_string(),
+                    "owner_role_key": owner_role_key.as_str(),
+                }),
+            })
+            .await;
 
         Ok(workspace)
     }
@@ -304,7 +493,7 @@ pub mod workspace {
 
         state
             .authz
-            .require(actor.id, &domain_str, "documents", "write")
+            .require(actor.id, &domain_str, "document", "write")
             .await?;
 
         let document = sqlx::query_as::<_, Document>(
@@ -331,7 +520,7 @@ pub mod workspace {
 
         state
             .authz
-            .require(actor.id, &domain_str, "documents", "read")
+            .require(actor.id, &domain_str, "document", "read")
             .await?;
 
         let documents = sqlx::query_as::<_, Document>(
@@ -359,7 +548,7 @@ pub mod workspace {
 
         state
             .authz
-            .require(actor.id, &domain_str, "documents", "read")
+            .require(actor.id, &domain_str, "document", "read")
             .await?;
 
         let document = sqlx::query_as::<_, Document>(
@@ -408,7 +597,7 @@ mod tests {
     use std::sync::Mutex;
 
     use chrono::Utc;
-    use domain::InvitationTarget;
+    use domain::{InvitationTarget, PLATFORM_DOMAIN};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RequireCall {
@@ -533,6 +722,10 @@ mod tests {
         async fn purge_role(&self, _domain: &str, _role_key: &str) -> Result<u64, AuthzError> {
             Ok(0)
         }
+
+        async fn reload_in_memory(&self) -> Result<(), AuthzError> {
+            Ok(())
+        }
     }
 
     fn lazy_state(mock: Arc<MockAuthz>) -> SaasState {
@@ -553,8 +746,118 @@ mod tests {
         AuthUser {
             id: Uuid::new_v4(),
             email: "actor@example.test".to_string(),
+            email_verified: true,
             created_at: Utc::now(),
         }
+    }
+
+    // ─── A2.2b: without_access builder ─────────────────────────────────
+
+    fn lazy_pool() -> PgPool {
+        PgPool::connect_lazy("postgres://saas-test-host/saas_test")
+            .expect("lazy pool must be constructible")
+    }
+
+    #[tokio::test]
+    async fn without_access_works() {
+        let mock = Arc::new(MockAuthz::denying());
+        let state = SaasBuilder::new(lazy_pool())
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .without_access()
+            .build()
+            .expect("build with without_access must succeed");
+        let err = match state.access() {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err from access() on a without_access() build"),
+        };
+        match err {
+            CoreError::Internal(msg) => {
+                assert!(
+                    msg.contains("without_access"),
+                    "error message should mention without_access: {msg}"
+                );
+            }
+            other => panic!("expected CoreError::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn without_access_without_authz_fails() {
+        let err = match SaasBuilder::new(lazy_pool()).without_access().build() {
+            Err(e) => e,
+            Ok(_) => panic!("without_authz + without_access must fail"),
+        };
+        match err {
+            CoreError::Internal(msg) => {
+                assert!(
+                    msg.contains("authorization engine is required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected CoreError::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn access_required_unless_without_access() {
+        // Neither with_access nor without_access → build must fail
+        // (this protects against "forgot to call with_access").
+        let mock = Arc::new(MockAuthz::denying());
+        let err = match SaasBuilder::new(lazy_pool())
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .build()
+        {
+            Err(e) => e,
+            Ok(_) => panic!("build without access/without_access must fail"),
+        };
+        match err {
+            CoreError::Internal(msg) => {
+                assert!(
+                    msg.contains("access state is required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected CoreError::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_access_still_works() {
+        let mock = Arc::new(MockAuthz::denying());
+        let pool = lazy_pool();
+        let access = Arc::new(AccessState::new(
+            pool.clone(),
+            mock.clone() as Arc<dyn AuthorizationEngine>,
+        ));
+        let state = SaasBuilder::new(pool)
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .with_access(access)
+            .build()
+            .expect("with_access build must succeed");
+        assert!(
+            state.access().is_ok(),
+            "access() must be Ok on a with_access() build"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_access_wins_over_with_access_when_last() {
+        let mock = Arc::new(MockAuthz::denying());
+        let pool = lazy_pool();
+        let access = Arc::new(AccessState::new(
+            pool.clone(),
+            mock.clone() as Arc<dyn AuthorizationEngine>,
+        ));
+        let state = SaasBuilder::new(pool)
+            .with_authz(mock as Arc<dyn AuthorizationEngine>)
+            .with_access(access)
+            .without_access()
+            .build()
+            .expect("last call (without_access) wins");
+        assert!(
+            state.access().is_err(),
+            "last call (without_access) wins → access() is Err"
+        );
     }
 
     #[tokio::test]
@@ -573,7 +876,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, PLATFORM_DOMAIN);
-        assert_eq!(call.resource, "tenants");
+        assert_eq!(call.resource, "tenant");
         assert_eq!(call.action, "create");
 
         assert!(mock.grant_role_calls().is_empty());
@@ -597,21 +900,21 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, PLATFORM_DOMAIN);
-        assert_eq!(call.resource, "tenants");
+        assert_eq!(call.resource, "tenant");
         assert_eq!(call.action, "create");
 
         assert!(mock.grant_role_calls().is_empty());
     }
 
     #[tokio::test]
-    async fn create_workspace_requires_tenant_workspaces_create() {
+    async fn create_workspace_with_owner_requires_tenant_workspaces_create() {
         let mock = Arc::new(MockAuthz::denying());
         let state = lazy_state(mock.clone());
         let actor = actor();
         let tenant_id = Uuid::new_v4();
         let role_key = RoleKey::parse("owner").unwrap();
 
-        let err = tenant::create_workspace(
+        let err = tenant::create_workspace_with_owner(
             &state,
             &actor,
             tenant_id,
@@ -628,7 +931,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.resource, "workspaces");
+        assert_eq!(call.resource, "workspace");
         assert_eq!(call.action, "create");
 
         assert!(mock.grant_role_calls().is_empty());
@@ -651,7 +954,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "documents");
+        assert_eq!(call.resource, "document");
         assert_eq!(call.action, "write");
     }
 
@@ -672,7 +975,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "documents");
+        assert_eq!(call.resource, "document");
         assert_eq!(call.action, "read");
     }
 
@@ -701,7 +1004,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "create");
     }
 
@@ -730,7 +1033,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "create");
     }
 
@@ -757,7 +1060,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::tenant_domain(tenant_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "revoke");
     }
 
@@ -779,7 +1082,7 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.user_id, actor.id);
         assert_eq!(call.domain, domain::workspace_domain(workspace_id));
-        assert_eq!(call.resource, "invitations");
+        assert_eq!(call.resource, "invitation");
         assert_eq!(call.action, "list");
     }
 

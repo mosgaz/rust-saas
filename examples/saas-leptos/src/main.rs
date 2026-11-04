@@ -1,16 +1,29 @@
+//! `saas-leptos` entry point.
+//!
+//! Thin binary: env → `AppState` → `axum::serve(build_app(state))`.
+//! Everything else (handlers, middleware, router assembly) lives in
+//! `lib.rs::build_app`, which is what `tests/e2e.rs` drives in-process via
+//! `tower::ServiceExt::oneshot` (Stage 4.7).
+//!
+//! Kept `#[cfg(feature = "ssr")]` on `main` so `cargo check --features
+//! hydrate` on the host (without `ssr`) compiles an empty binary — the
+//! SSR wiring needs `axum`, `authn`, `saas`, `db`, all `ssr`-only.
+
 #[cfg(feature = "ssr")]
 use std::sync::Arc;
 
 #[cfg(feature = "ssr")]
-use authz::AuthorizationEngine;
+use audit::AuditLogger;
 #[cfg(feature = "ssr")]
-use axum::Router;
+use audit_pg::PgAuditLogger;
+#[cfg(feature = "ssr")]
+use authz::AuthorizationEngine;
 #[cfg(feature = "ssr")]
 use leptos::config::get_configuration;
 #[cfg(feature = "ssr")]
-use leptos_axum::{generate_route_list, LeptosRoutes};
+use metrics_exporter_prometheus::PrometheusBuilder;
 #[cfg(feature = "ssr")]
-use tower_http::trace::TraceLayer;
+use rate_limiter::RateLimiter;
 
 #[cfg(feature = "ssr")]
 #[tokio::main]
@@ -19,8 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -61,81 +73,89 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(authn::DEFAULT_REFRESH_TTL_DAYS);
 
+    let cookie_cfg = Arc::new(saas_leptos::cookie::CookieConfig::from_env(&bind_addr));
+
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
 
-    let access = Arc::new(access::AccessState::new(pool.clone(), authz.clone()));
+    let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
-    let authn = Arc::new(authn::Authn::with_ttl(
-        pool.clone(),
-        jwt_secret,
-        chrono::Duration::minutes(access_ttl_minutes),
-        chrono::Duration::days(refresh_ttl_days),
-    ));
+    let access =
+        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
+
+    let authn = Arc::new(
+        authn::Authn::with_ttl(
+            pool.clone(),
+            jwt_secret,
+            chrono::Duration::minutes(access_ttl_minutes),
+            chrono::Duration::days(refresh_ttl_days),
+        )
+        .with_audit(audit.clone()),
+    );
 
     let saas = Arc::new(
         saas::SaasBuilder::new(pool)
             .with_authz(authz)
             .with_access(access)
+            .with_audit(audit)
             .build()?,
     );
+
+    let base_url = std::env::var("BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("http://{bind_addr}"));
+    let smtp_from = std::env::var("SMTP_FROM")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "noreply@example.test".to_string());
+
+    let email: Arc<dyn saas_leptos::email::EmailSender> = match std::env::var("SMTP_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(smtp_url) => Arc::new(
+            saas_leptos::email::SmtpEmailSender::new(&smtp_url, &smtp_from, &base_url)
+                .map_err(|e| anyhow::anyhow!("failed to build SmtpEmailSender: {e}"))?,
+        ),
+        None => {
+            tracing::warn!(
+                    "SMTP_URL is not set; using NoopEmailSender (verification emails will not be delivered)"
+                );
+            Arc::new(saas_leptos::email::NoopEmailSender)
+        }
+    };
+
+    let rate_limit: Arc<dyn RateLimiter> = match std::env::var("REDIS_URL") {
+        Ok(url) if !url.trim().is_empty() => Arc::new(
+            rate_limiter::RedisRateLimiter::from_url(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to Redis: {e}"))?,
+        ),
+        _ => Arc::new(rate_limiter::InMemoryRateLimiter::new()),
+    };
+
+    // Stage 4.10: install the Prometheus recorder once per process.
+    // `install_recorder` is a global singleton — a second call panics.
+    let prometheus = PrometheusBuilder::new().install_recorder()?;
 
     let app_state = saas_leptos::state::AppState {
         authn: authn.clone(),
         saas,
         leptos_options: leptos_options.clone(),
+        email,
+        rate_limit,
+        cookie: cookie_cfg.clone(),
+        prometheus,
     };
 
-    let routes = generate_route_list(saas_leptos::App);
-
-    // TODO(Stage 3): auth-scoping ADR — formalize which routes require auth
-    // (see handoff §16). This split is the pragmatic boundary: SSR pages and
-    // Leptos `_server/*` handlers go through `auto_refresh`; static files and
-    // the 404 fallback do not. Open policy questions (does `_server/*` always
-    // require auth? how are public `#[server]` functions like `login` /
-    // `register` handled at this layer? should 404 fail-open or fail-closed?)
-    // are deferred to that ADR.
-    //
-    // `protected` covers SSR pages (`leptos_routes_with_context`) and, on the
-    // same router, Leptos server-function handlers (`/_server/*`). Both need
-    // `Extension<Option<AuthUser>>` injected by `auto_refresh`; `#[server]`
-    // functions that require an actor call `CurrentUser::require()` and get
-    // HTTP 401 when the extension is `None`.
-    let protected: Router<saas_leptos::state::AppState> = Router::new()
-        .leptos_routes_with_context(
-            &app_state,
-            routes,
-            {
-                let state = app_state.clone();
-                move || leptos::prelude::provide_context(state.clone())
-            },
-            {
-                let opts = leptos_options.clone();
-                move || saas_leptos::shell(opts.clone())
-            },
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            authn,
-            saas_leptos::middleware::auto_refresh,
-        ));
-
-    // `public` covers static files served by `file_and_error_handler`
-    // (`/pkg/*`, `/assets/*`, `/favicon.ico`, and any other files under
-    // `public/`) and the 404 fallback. These responses never depended on
-    // cookies; running `auto_refresh` here used to verify JWTs, rotate
-    // refresh tokens, and set `Cache-Control: no-store` on `.wasm` / `.css`
-    // fetches (Stage 2b–2c bug). Stage 2d fixes this at the router structure
-    // level.
-    let public: Router<saas_leptos::state::AppState> = Router::new()
-        .fallback(leptos_axum::file_and_error_handler::<saas_leptos::state::AppState, _>(saas_leptos::shell));
-
-    let router = protected
-        .merge(public)
-        .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+    let router = saas_leptos::build_app(app_state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await

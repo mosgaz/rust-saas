@@ -1,0 +1,21 @@
+[package]
+name = "rate-limiter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Rate limiter trait + InMemoryRateLimiter + RedisRateLimiter (Stage 4.8)"
+
+[dependencies]
+async-trait.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+redis = { workspace = true, optional = true }
+
+[features]
+default = ["in-memory"]
+in-memory = []
+redis = ["dep:redis"]
+
+[dev-dependencies]
+tokio.workspace = true

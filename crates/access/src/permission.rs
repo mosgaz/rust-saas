@@ -11,30 +11,58 @@ use uuid::Uuid;
 
 use crate::role::get_permissions_for_role_id;
 use crate::{AccessError, AccessState, Permission, RoleKey};
+use domain::Page;
 
-/// Returns the whole `permissions` reference table, ordered by
+/// Returns a page of the `permissions` reference table, ordered by
 /// `(resource, action)`.
 ///
 /// **No `actor`** (§5 p.5 exception): the reference is not sensitive.
-pub async fn list_permissions(state: &AccessState) -> Result<Vec<Permission>, AccessError> {
+pub async fn list_permissions_paged(
+    state: &AccessState,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<Permission>, AccessError> {
+    let total: i64 = sqlx::query_scalar("select count(*) from permissions")
+        .fetch_one(state.pool())
+        .await?;
+
     let rows = sqlx::query_as::<_, (String, String, String)>(
         r#"
         select resource, action, description
         from permissions
         order by resource, action
+        limit $1 offset $2
         "#,
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(state.pool())
     .await?;
 
-    Ok(rows
+    let items = rows
         .into_iter()
         .map(|(resource, action, description)| Permission {
             resource,
             action,
             description,
         })
-        .collect())
+        .collect();
+
+    Ok(Page {
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+/// Returns the whole `permissions` reference table, ordered by
+/// `(resource, action)`.
+///
+/// **No `actor`** (§5 p.5 exception): the reference is not sensitive.
+#[deprecated(note = "use list_permissions_paged(..., i64::MAX, 0) for 'all rows'")]
+pub async fn list_permissions(state: &AccessState) -> Result<Vec<Permission>, AccessError> {
+    Ok(list_permissions_paged(state, i64::MAX, 0).await?.items)
 }
 
 /// Returns `(resource, action)` pairs for `(domain, role_key)`, or an empty
