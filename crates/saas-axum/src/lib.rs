@@ -50,5 +50,5 @@ pub use endpoints::my_permissions::{
 pub use endpoints::resource_types::{resource_types, ResourceTypeView};
 pub use error::AppError;
 pub use extract::CurrentUser;
-pub use router::{build_app, build_app_full, build_app_with_protected};
+pub use router::{build_app, build_app_full, build_app_full_with, build_app_with_protected};
 pub use state::{AxumAppState, AxumAppStateBuilder};

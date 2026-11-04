@@ -139,6 +139,13 @@ pub fn build_app_with_protected(
 /// in reverse of registration, so `auth_layer` is registered first
 /// (innermost) and `csrf_guard` last (outermost).
 pub fn build_app_full(state: Arc<AxumAppState>) -> Router {
+    build_app_full_with(state, Router::new())
+}
+
+pub fn build_app_full_with(
+    state: Arc<AxumAppState>,
+    extra_protected: Router<Arc<AxumAppState>>,
+) -> Router {
     // `get` is module-level; only `post` needs a local import.
     use axum::routing::post;
 
@@ -153,6 +160,8 @@ pub fn build_app_full(state: Arc<AxumAppState>) -> Router {
             get(crate::endpoints::my_permissions_grouped),
         )
         .route("/resource_types", get(crate::endpoints::resource_types))
+        // Merge caller-supplied routes BEFORE the layers are applied.
+        .merge(extra_protected)
         // Innermost (registered first — `route_layer` reverses order).
         .route_layer(from_fn_with_state(state.clone(), auth_layer::auth_layer))
         // Middle: verify access / rotate refresh, populate Extension<AuthUser>.
