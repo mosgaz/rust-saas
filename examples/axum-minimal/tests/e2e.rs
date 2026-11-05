@@ -1,26 +1,4 @@
-//! Stage 4.7: E2E HTTP tests for `axum-minimal`.
-//!
-//! **In-process.** No TCP port, no `hyper::Server`. Tests drive the same
-//! `axum::Router` that `main.rs` serves via `tower::ServiceExt::oneshot`.
-//!
-//! **Isolated DB per test.** `#[sqlx::test]` creates a fresh database per
-//! test from `DATABASE_URL`, applies `crates/db/migrations`, drops it after.
-//!
-//! **Cookie jar, manually.** No `reqwest` — cookies are parsed from
-//! `Set-Cookie` and re-sent via `Cookie:`.
-//!
-//! **CSRF.** Mutating non-auth paths require `X-CSRF-Token` == `csrf` cookie.
-//! The `csrf` cookie is issued by `csrf_issue` on the first request.
-//!
-//! **Coverage (Stage 4.7, plan `Приблизительный план` §3):**
-//! 1. Smoke — `/healthz` public; protected route → 401 anon.
-//! 2. Auth flow — register / refresh / logout.
-//! 3. Tenant & workspace flow with CSRF.
-//! 4. Tenant suspension → 403 for tenant user.
-//! 5. Audit access — platform admin 200, regular user 403.
-//! 6. Rate limiting — 4th register → 429 + `Retry-After`.
-
-#![allow(dead_code)] // Some helpers are used by later steps.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -30,22 +8,14 @@ use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use axum_minimal::build_app;
-use axum_minimal::cookie::CookieConfig;
-use axum_minimal::email::NoopEmailSender;
-use axum_minimal::state::AppState;
 use http_body_util::BodyExt;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use rate_limiter::RateLimiter;
+use rust_saas::access::RoleKey;
+use rust_saas::AxumAppState;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-// ─── Setup ─────────────────────────────────────────────────────────────────
-
-/// Process-wide Prometheus recorder (Stage 4.10). `metrics` global
-/// recorder can only be set once per process; `#[sqlx::test]` runs
-/// multiple tests in one process, so we install it in a `OnceLock`
-/// and reuse the handle everywhere.
 static PROMETHEUS: OnceLock<PrometheusHandle> = OnceLock::new();
 
 fn prometheus_handle() -> PrometheusHandle {
@@ -53,76 +23,32 @@ fn prometheus_handle() -> PrometheusHandle {
         .get_or_init(|| {
             let recorder = PrometheusBuilder::new().build_recorder();
             let handle = recorder.handle();
-            // Ignore the error: a previous test may have already installed
-            // a recorder; the handle is the same.
             let _ = metrics::set_global_recorder(recorder);
             handle
         })
         .clone()
 }
 
-fn test_cookie_config() -> Arc<CookieConfig> {
-    let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("static SocketAddr");
-    Arc::new(CookieConfig::from_env(&bind))
-}
-
-/// Builds `(Router, AppState)` with the same wiring as `main.rs`.
-///
-/// Tests that need to seed authorization (`grant_platform_admin`) use
-/// `state.saas.authz()` to reach the live enforcer — direct SQL would not
-/// update the in-memory cache.
-async fn setup_app(pool: PgPool) -> (Router, Arc<AppState>) {
-    let authz: Arc<dyn authz::AuthorizationEngine> = Arc::new(
-        authz_casbin::CasbinAuthz::from_pool(pool.clone())
-            .await
-            .expect("casbin init"),
-    );
-    let audit: Arc<dyn audit::AuditLogger> =
-        Arc::new(audit_pg::PgAuditLogger::from_pool(pool.clone()));
-    let access =
-        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
-    let authn = Arc::new(
-        authn::Authn::with_ttl(
-            pool.clone(),
-            "test-jwt-secret-not-for-prod",
-            chrono::Duration::minutes(15),
-            chrono::Duration::days(30),
-        )
-        .with_audit(audit.clone()),
-    );
-    let saas = Arc::new(
-        saas::SaasBuilder::new(pool)
-            .with_authz(authz)
-            .with_access(access)
-            .with_audit(audit)
-            .build()
-            .expect("saas builder"),
-    );
-    let email: Arc<dyn axum_minimal::email::EmailSender> = Arc::new(NoopEmailSender);
-    let rate_limit: Arc<dyn RateLimiter> = Arc::new(rate_limiter::InMemoryRateLimiter::new());
-    let cookie = test_cookie_config();
-
-    let state = Arc::new(AppState {
-        authn,
-        saas,
-        email,
-        rate_limit,
-        cookie,
-        prometheus: prometheus_handle(),
-    });
+async fn setup(pool: PgPool) -> (Router, Arc<AxumAppState>) {
+    let state = AxumAppState::builder(pool, "test-jwt-secret-not-for-prod")
+        .with_prometheus(prometheus_handle())
+        .build()
+        .await
+        .expect("build must succeed");
+    let state = Arc::new(state);
     let router = build_app(state.clone());
     (router, state)
 }
 
-async fn grant_platform_admin(state: &AppState, user_id: Uuid) {
-    let owner_key = access::RoleKey::parse("owner").expect("role key");
-    let perms = access::get_permissions_for_role(
+async fn grant_platform_admin(state: &AxumAppState, user_id: Uuid) {
+    let owner_key = RoleKey::parse("owner").expect("owner key");
+    let perms = rust_saas::access::get_permissions_for_role(
         state.saas.access().expect("access"),
         "platform",
         &owner_key,
     )
     .await
-    .expect("platform owner perms");
+    .expect("platform perms");
     state
         .saas
         .authz()
@@ -130,8 +56,6 @@ async fn grant_platform_admin(state: &AppState, user_id: Uuid) {
         .await
         .expect("grant platform owner");
 }
-
-// ─── Cookie helpers ────────────────────────────────────────────────────────
 
 fn parse_set_cookies(resp: &Response) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -186,11 +110,7 @@ fn unique_email() -> String {
 }
 
 async fn register_and_get_jar(router: &Router, email: &str) -> (Vec<(String, String)>, Uuid) {
-    let body = serde_json::json!({
-        "email": email,
-        "password": "Password123!",
-    })
-    .to_string();
+    let body = serde_json::json!({"email": email, "password": "Password123!"}).to_string();
     let resp = router
         .clone()
         .oneshot(
@@ -204,15 +124,14 @@ async fn register_and_get_jar(router: &Router, email: &str) -> (Vec<(String, Str
         .await
         .expect("register oneshot");
     assert_eq!(resp.status(), StatusCode::OK, "register must succeed");
-
     let jar = parse_set_cookies(&resp);
     let json = body_json(resp).await;
-    let user_id = json["user"]["id"]
+    let uid = json["user"]["id"]
         .as_str()
-        .expect("register body must carry user.id")
+        .expect("user.id")
         .parse::<Uuid>()
-        .expect("user.id is a UUID");
-    (jar, user_id)
+        .expect("uuid");
+    (jar, uid)
 }
 
 async fn post_json_with_csrf(
@@ -222,9 +141,7 @@ async fn post_json_with_csrf(
     body: serde_json::Value,
 ) -> Response {
     let cookie = cookie_header(jar);
-    let csrf = find_cookie(jar, "csrf")
-        .expect("csrf cookie in jar")
-        .to_string();
+    let csrf = find_cookie(jar, "csrf").expect("csrf cookie").to_string();
     router
         .clone()
         .oneshot(
@@ -255,11 +172,9 @@ async fn get_with_jar(router: &Router, uri: &str, jar: &[(String, String)]) -> R
         .expect("get_with_jar oneshot")
 }
 
-// ─── Smoke ─────────────────────────────────────────────────────────────────
-
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn healthz_returns_200(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let resp = router
         .oneshot(
             Request::builder()
@@ -268,15 +183,14 @@ async fn healthz_returns_200(pool: PgPool) {
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await, serde_json::json!({ "status": "ok" }));
+    assert_eq!(body_json(resp).await, serde_json::json!({"status": "ok"}));
 }
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn protected_route_requires_auth(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let resp = router
         .oneshot(
             Request::builder()
@@ -285,27 +199,19 @@ async fn protected_route_requires_auth(pool: PgPool) {
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         body_json(resp).await,
-        serde_json::json!({ "error": "unauthorized" })
+        serde_json::json!({"error": "unauthorized"})
     );
 }
 
-// ─── Auth flow ─────────────────────────────────────────────────────────────
-
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn register_sets_auth_cookies(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let email = unique_email();
-    let body = serde_json::json!({
-        "email": email,
-        "password": "Password123!",
-    })
-    .to_string();
-
+    let body = serde_json::json!({"email": email, "password": "Password123!"}).to_string();
     let resp = router
         .oneshot(
             Request::builder()
@@ -316,8 +222,7 @@ async fn register_sets_auth_cookies(pool: PgPool) {
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let jar = parse_set_cookies(&resp);
     assert!(
@@ -328,11 +233,7 @@ async fn register_sets_auth_cookies(pool: PgPool) {
         find_cookie(&jar, "refresh_token").is_some(),
         "refresh_token missing: {jar:?}"
     );
-    assert!(
-        find_cookie(&jar, "csrf").is_some(),
-        "csrf cookie must be issued: {jar:?}"
-    );
-
+    assert!(find_cookie(&jar, "csrf").is_some(), "csrf missing: {jar:?}");
     let json = body_json(resp).await;
     assert_eq!(json["user"]["email"].as_str(), Some(email.as_str()));
     assert_eq!(json["user"]["email_verified"].as_bool(), Some(false));
@@ -341,25 +242,23 @@ async fn register_sets_auth_cookies(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn refresh_returns_current_user(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let email = unique_email();
     let (jar, _) = register_and_get_jar(&router, &email).await;
-    let cookie_hdr = cookie_header(&jar);
-    let csrf = find_cookie(&jar, "csrf").expect("csrf cookie").to_string();
-
+    let csrf = find_cookie(&jar, "csrf").expect("csrf").to_string();
     let resp = router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/auth/refresh")
-                .header(header::COOKIE, &cookie_hdr)
+                .header(header::COOKIE, cookie_header(&jar))
                 .header("x-csrf-token", &csrf)
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["email"].as_str(), Some(email.as_str()));
@@ -368,30 +267,26 @@ async fn refresh_returns_current_user(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn logout_clears_cookies(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let email = unique_email();
     let (jar, _) = register_and_get_jar(&router, &email).await;
-    let cookie_hdr = cookie_header(&jar);
-
     let resp = router
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/auth/logout")
-                .header(header::COOKIE, &cookie_hdr)
+                .header(header::COOKIE, cookie_header(&jar))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
     let set_cookies: Vec<String> = resp
         .headers()
         .get_all(header::SET_COOKIE)
         .iter()
-        .filter_map(|hv| hv.to_str().ok().map(String::from))
+        .filter_map(|h| h.to_str().ok().map(String::from))
         .collect();
     let is_removal = |name: &str| {
         set_cookies.iter().any(|s| {
@@ -409,20 +304,17 @@ async fn logout_clears_cookies(pool: PgPool) {
     );
 }
 
-// ─── Tenant & workspace flow ───────────────────────────────────────────────
-
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn tenant_and_workspace_flow(pool: PgPool) {
-    let (router, state) = setup_app(pool).await;
+    let (router, state) = setup(pool).await;
     let email = unique_email();
-    let (jar, user_id) = register_and_get_jar(&router, &email).await;
-    grant_platform_admin(&state, user_id).await;
-
+    let (jar, uid) = register_and_get_jar(&router, &email).await;
+    grant_platform_admin(&state, uid).await;
     let resp = post_json_with_csrf(
         &router,
         "/tenants",
         &jar,
-        serde_json::json!({ "name": "Acme" }),
+        serde_json::json!({"name": "Acme"}),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK, "POST /tenants must succeed");
@@ -430,12 +322,11 @@ async fn tenant_and_workspace_flow(pool: PgPool) {
     let tenant_id = tenant["id"].as_str().expect("tenant.id").to_string();
     assert_eq!(tenant["name"], "Acme");
     assert_eq!(tenant["status"], "active");
-
     let resp = post_json_with_csrf(
         &router,
         "/workspaces",
         &jar,
-        serde_json::json!({ "tenant_id": tenant_id, "name": "Engineering" }),
+        serde_json::json!({"tenant_id": tenant_id, "name": "Engineering"}),
     )
     .await;
     assert_eq!(
@@ -450,33 +341,30 @@ async fn tenant_and_workspace_flow(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn post_tenants_requires_platform_permission(pool: PgPool) {
-    let (router, _state) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let email = unique_email();
     let (jar, _) = register_and_get_jar(&router, &email).await;
-
     let resp = post_json_with_csrf(
         &router,
         "/tenants",
         &jar,
-        serde_json::json!({ "name": "Acme" }),
+        serde_json::json!({"name": "Acme"}),
     )
     .await;
-
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         body_json(resp).await,
-        serde_json::json!({ "error": "forbidden" })
+        serde_json::json!({"error": "forbidden"})
     );
 }
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn post_tenants_without_csrf_token_is_rejected(pool: PgPool) {
-    let (router, state) = setup_app(pool).await;
+    let (router, state) = setup(pool).await;
     let email = unique_email();
-    let (jar, user_id) = register_and_get_jar(&router, &email).await;
-    grant_platform_admin(&state, user_id).await;
-
-    let body = serde_json::json!({ "name": "Acme" }).to_string();
+    let (jar, uid) = register_and_get_jar(&router, &email).await;
+    grant_platform_admin(&state, uid).await;
+    let body = serde_json::json!({"name": "Acme"}).to_string();
     let resp = router
         .clone()
         .oneshot(
@@ -489,85 +377,61 @@ async fn post_tenants_without_csrf_token_is_rejected(pool: PgPool) {
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         body_json(resp).await,
-        serde_json::json!({ "error": "csrf token mismatch" })
+        serde_json::json!({"error": "csrf token mismatch"})
     );
 }
 
-// ─── Tenant suspension ─────────────────────────────────────────────────────
-
-/// `POST /workspaces` calls `resolve_active_tenant` in the handler. A
-/// suspended tenant must yield `403 {"error": "tenant is suspended"}` —
-/// this asserts the wiring between `main.rs` and `saas::platform`, not just
-/// the library function in isolation.
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn suspended_tenant_blocks_workspace_creation(pool: PgPool) {
-    let (router, state) = setup_app(pool.clone()).await;
+    let (router, state) = setup(pool.clone()).await;
     let email = unique_email();
-    let (jar, user_id) = register_and_get_jar(&router, &email).await;
-    grant_platform_admin(&state, user_id).await;
-
-    // Create a tenant (caller becomes its owner + member).
+    let (jar, uid) = register_and_get_jar(&router, &email).await;
+    grant_platform_admin(&state, uid).await;
     let resp = post_json_with_csrf(
         &router,
         "/tenants",
         &jar,
-        serde_json::json!({ "name": "Acme" }),
+        serde_json::json!({"name": "Acme"}),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let tenant = body_json(resp).await;
     let tenant_id = tenant["id"].as_str().unwrap().to_string();
-
-    // Suspend via direct SQL — axum-minimal has no /suspend endpoint.
     sqlx::query("update tenants set status = 'suspended' where id = $1")
         .bind(Uuid::parse_str(&tenant_id).unwrap())
         .execute(&pool)
         .await
         .expect("suspend tenant");
-
-    // POST /workspaces → 403 "tenant is suspended".
     let resp = post_json_with_csrf(
         &router,
         "/workspaces",
         &jar,
-        serde_json::json!({ "tenant_id": tenant_id, "name": "Engineering" }),
+        serde_json::json!({"tenant_id": tenant_id, "name": "Engineering"}),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         body_json(resp).await,
-        serde_json::json!({ "error": "tenant is suspended" })
+        serde_json::json!({"error": "tenant is suspended"})
     );
 }
 
-// ─── Audit access ──────────────────────────────────────────────────────────
-
-/// `GET /audit` requires `(audit, read)` in `PLATFORM_DOMAIN`. A regular
-/// user (valid session, no platform role) is rejected by `auth_layer`
-/// **before** the handler — 403. After `grant_platform_admin`, the same
-/// request returns 200 + a JSON array (possibly empty; we assert only the
-/// shape, not rows — `list_audit` returns most recent N).
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn audit_requires_platform_audit_read(pool: PgPool) {
-    let (router, state) = setup_app(pool).await;
+    let (router, state) = setup(pool).await;
     let email = unique_email();
-    let (jar, user_id) = register_and_get_jar(&router, &email).await;
-
-    // 1. Regular user: 403.
+    let (jar, uid) = register_and_get_jar(&router, &email).await;
     let resp = get_with_jar(&router, "/audit?limit=10", &jar).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         body_json(resp).await,
-        serde_json::json!({ "error": "forbidden" })
+        serde_json::json!({"error": "forbidden"})
     );
-
-    // 2. Grant platform admin → 200 + array.
-    grant_platform_admin(&state, user_id).await;
+    grant_platform_admin(&state, uid).await;
     let resp = get_with_jar(&router, "/audit?limit=10", &jar).await;
     assert_eq!(
         resp.status(),
@@ -581,18 +445,11 @@ async fn audit_requires_platform_audit_read(pool: PgPool) {
     );
 }
 
-// ─── Rate limiting ─────────────────────────────────────────────────────────
-
-/// `SimpleRateLimiter` in `register` is per-email, 3 per hour. The counter
-/// is incremented on **every** call to `try_acquire`, regardless of whether
-/// `authn.register` succeeds — so 3 attempts (200 or 409) consume the quota,
-/// the 4th → 429 with `Retry-After`.
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn register_rate_limited_at_4_per_hour(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let email = unique_email();
-    let body = serde_json::json!({ "email": email, "password": "Password123!" }).to_string();
-
+    let body = serde_json::json!({"email": email, "password": "Password123!"}).to_string();
     for i in 0..3 {
         let resp = router
             .clone()
@@ -605,14 +462,13 @@ async fn register_rate_limited_at_4_per_hour(pool: PgPool) {
                     .unwrap(),
             )
             .await
-            .expect("oneshot");
+            .unwrap();
         let status = resp.status();
         assert!(
             status == StatusCode::OK || status == StatusCode::CONFLICT,
             "attempt {i}: expected 200 or 409, got {status}"
         );
     }
-
     let resp = router
         .oneshot(
             Request::builder()
@@ -623,61 +479,45 @@ async fn register_rate_limited_at_4_per_hour(pool: PgPool) {
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-
     let retry_after = resp
         .headers()
         .get(header::RETRY_AFTER)
-        .expect("Retry-After header on 429")
+        .expect("Retry-After")
         .to_str()
-        .expect("Retry-After is ASCII");
-    let n: u64 = retry_after
-        .parse()
-        .expect("Retry-After is an integer number of seconds");
+        .expect("ascii");
+    let n: u64 = retry_after.parse().expect("integer");
     assert!(n > 0 && n <= 3600, "Retry-After out of range: {n}");
 }
 
-// ─── Pagination (Stage 4.8) ────────────────────────────────────────────────
-
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn pagination_limits_and_offsets_tenants(pool: PgPool) {
-    let (router, state) = setup_app(pool).await;
+    let (router, state) = setup(pool).await;
     let email = unique_email();
-    let (jar, user_id) = register_and_get_jar(&router, &email).await;
-    grant_platform_admin(&state, user_id).await;
-
-    // Create 2 tenants
+    let (jar, uid) = register_and_get_jar(&router, &email).await;
+    grant_platform_admin(&state, uid).await;
     for i in 0..2 {
         let resp = post_json_with_csrf(
             &router,
             "/tenants",
             &jar,
-            serde_json::json!({ "name": format!("Acme {}", i) }),
+            serde_json::json!({"name": format!("Acme {}", i)}),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
-
-    // Page 1: limit=1, offset=0
     let resp = get_with_jar(&router, "/tenants?limit=1&offset=0", &jar).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let page1 = body_json(resp).await;
     assert_eq!(page1["total"], 2);
     assert_eq!(page1["items"].as_array().unwrap().len(), 1);
     let id1 = page1["items"][0]["id"].as_str().unwrap().to_string();
-
-    // Page 2: limit=1, offset=1
     let resp = get_with_jar(&router, "/tenants?limit=1&offset=1", &jar).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let page2 = body_json(resp).await;
-    assert_eq!(page2["total"], 2);
-    assert_eq!(page2["items"].as_array().unwrap().len(), 1);
     let id2 = page2["items"][0]["id"].as_str().unwrap().to_string();
-
     assert_ne!(id1, id2, "items on different pages must be distinct");
-
-    // Clamp: limit=1000 should clamp to 200 (and return both tenants)
     let resp = get_with_jar(&router, "/tenants?limit=1000", &jar).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let page3 = body_json(resp).await;
@@ -686,11 +526,9 @@ async fn pagination_limits_and_offsets_tenants(pool: PgPool) {
     assert_eq!(page3["items"].as_array().unwrap().len(), 2);
 }
 
-// ─── Stage 4.10: /readyz + /metrics ────────────────────────────────────
-
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn readyz_returns_200(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
+    let (router, _) = setup(pool).await;
     let resp = router
         .oneshot(
             Request::builder()
@@ -699,28 +537,22 @@ async fn readyz_returns_200(pool: PgPool) {
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["status"], "ok");
     assert_eq!(json["checks"]["db"], "ok");
-    // REDIS_URL может быть задан (Stage 4.8: docker-compose + .env) —
-    // тогда "ok"; если нет — "not_configured". Failure только "down".
     let redis = json["checks"]["redis"].as_str().unwrap_or("");
     assert!(
         redis == "ok" || redis == "not_configured",
-        "redis check must be ok/not_configured, got: {redis:?}"
+        "redis must be ok/not_configured, got: {redis:?}"
     );
 }
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
 async fn metrics_returns_prometheus_format(pool: PgPool) {
-    let (router, _) = setup_app(pool).await;
-    // Unique marker — proves the recorder is wired and the handler
-    // renders it. Name is unique across tests.
-    metrics::counter!("e2e_readyz_marker").increment(1);
-
+    let (router, _) = setup(pool).await;
+    metrics::counter!("e2e_axum_minimal_marker").increment(1);
     let resp = router
         .oneshot(
             Request::builder()
@@ -729,13 +561,12 @@ async fn metrics_returns_prometheus_format(pool: PgPool) {
                 .unwrap(),
         )
         .await
-        .expect("oneshot");
-
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
     assert!(
-        body.contains("e2e_readyz_marker"),
-        "expected marker metric, got: {}",
+        body.contains("e2e_axum_minimal_marker"),
+        "expected marker, got: {}",
         &body[..body.len().min(300)]
     );
     assert!(
