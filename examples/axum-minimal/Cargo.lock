@@ -261,34 +261,18 @@ dependencies = [
 name = "axum-minimal"
 version = "0.1.0"
 dependencies = [
- "access",
  "anyhow",
- "async-trait",
- "audit",
- "audit-pg",
- "authn",
- "authz",
- "authz-casbin",
  "axum",
- "axum-extra",
- "chrono",
- "cookie",
- "db",
- "domain",
  "dotenvy",
  "http-body-util",
- "identity",
  "metrics",
  "metrics-exporter-prometheus",
- "rate-limiter",
- "redis",
- "saas",
+ "rust-saas",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
  "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1833,7 +1817,6 @@ name = "rate-limiter"
 version = "0.3.0"
 dependencies = [
  "async-trait",
- "redis",
  "tracing",
  "uuid",
 ]
@@ -1986,6 +1969,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-saas"
+version = "0.3.0"
+dependencies = [
+ "access",
+ "anyhow",
+ "audit",
+ "audit-pg",
+ "authn",
+ "authz",
+ "authz-casbin",
+ "db",
+ "domain",
+ "identity",
+ "rate-limiter",
+ "saas",
+ "saas-axum",
+ "sqlx",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2057,6 +2060,39 @@ dependencies = [
  "sha2",
  "sqlx",
  "thiserror 2.0.21",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "saas-axum"
+version = "0.3.0"
+dependencies = [
+ "access",
+ "async-trait",
+ "audit",
+ "audit-pg",
+ "authn",
+ "authz",
+ "authz-casbin",
+ "axum",
+ "axum-extra",
+ "chrono",
+ "cookie",
+ "db",
+ "domain",
+ "identity",
+ "matchit",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "rate-limiter",
+ "redis",
+ "saas",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower-http",
  "tracing",
  "uuid",
 ]

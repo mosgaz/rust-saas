@@ -8,9 +8,9 @@ Every crate in `crates/` shares one version (enforced by
 `[workspace.package]`); consumers must pin all crates to the same
 revision.
 
-## [0.3.0] - 2026-11-03
+## [0.3.0] - 2026-11-05
 
-### Stage 5.0 — Phase A, part 1 (A1 + A2 + A3)
+### Stage 5.0 — Phase A (A1 + A2 + A3 + A4 + A4.6 + A5 + A6)
 
 **Breaking changes (5 items; see `COMPATIBILITY.md` §0.3.0 for migration guide):**
 - `authz::AuthorizationEngine::reload_in_memory()` — new required method (A1.4).
@@ -33,7 +33,66 @@ revision.
 - Added `db::migrate_composed` and public `db::MIGRATOR`. Deprecated `db::migrate_with`.
 - Meta-crate `rust-saas`: added `migrate_all` / `migrate_extended`.
 
-**Tests:** 174 → 197 workspace tests.
+**A4 — `saas-axum` HTTP adapter (B5, B6, B7 closed):**
+
+*New crate `crates/saas-axum` — internal HTTP adapter; consumer-facing via `rust-saas::features = ["axum"]`.*
+
+- **A4.0–A4.2** (PR-1): `AxumAppState` (11 fields) + `AxumAppStateBuilder` (16 methods, `build().await` — 10 steps). `build_app(state)` — public-only (`/healthz`, `/readyz`, `/metrics`, 404 fallback) + middleware chain + `TraceLayer`. `without_rbac()` for RBAC-free builds.
+- **A4.3a–A4.3b** (PR-2): `RouteBinding` / `BindingScope` / `RouteBindings` (matchit 0.8, `{name}` syntax) with built-in precedence wins (structural — user binding colliding with built-in is silently skipped). `PathPermissions` trait; `auth_layer` precedence: built-in → `PathPermissions::is_public` → `RouteBindings::resolve` → `PathPermissions::path_permission` → pass-through. `build_app_with_protected(state, protected)` — public + custom protected (chain: `csrf_guard` → `auto_refresh` → `auth_layer` → handler). `/readyz` wired (DB `SELECT 1` + Redis `PING` when `REDIS_URL` is set). Fail-fast `bindings::validate()` in `build()` — unknown `(resource_type, action)` → `CoreError::Validation` → 400.
+- **A4.4** (PR-3): endpoints `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/refresh`, `/my_permissions`, `/my_permissions/grouped`, `/resource_types`. `build_app_full(state)` — public + standard endpoints + middleware chain (additive to `build_app` / `build_app_with_protected`).
+- **A4.5** (PR-3): `deny.toml` wrappers for `axum` (`wrappers = ["axum-extra", "saas-axum", "rust-saas"]`), `axum-extra`, `tower-http`, `matchit`, `hyper`. `lettre` — bare ban (`saas-leptos` in `workspace.exclude`).
+
+*Re-exports:*
+- `crates/saas-axum/src/lib.rs` — `pub use bindings::…`, `pub use cookie::CookieConfig`, `pub use email::{EmailResult, EmailSender, NoopEmailSender}`, `pub use endpoints::auth::{login, logout, refresh, register, RegisterRequest, RegisterResponse}`, `pub use endpoints::my_permissions::{my_permissions_flat, my_permissions_grouped, MyPermissionsQuery}`, `pub use endpoints::resource_types::{resource_types, ResourceTypeView}`, `pub use error::AppError`, `pub use extract::CurrentUser`, `pub use router::{build_app, build_app_full, build_app_full_with, build_app_with_protected}`, `pub use state::{AxumAppState, AxumAppStateBuilder}`.
+- `crates/rust-saas/src/lib.rs` — same surface under `#[cfg(feature = "axum")]`.
+- `crates/rust-saas/tests/feature_axum.rs` — fn-pointer asserts.
+
+**A4.6 — `build_app_full_with(state, extra_protected)` (additive):**
+
+- **Motivation:** `build_app_full(state)` returns `Router<()>` (after `.with_state(state)`), so `.route(...)` afterwards cannot accept handlers parameterised on `State<Arc<AxumAppState>>`. Consumers that want both the standard endpoints **and** their own business routes need an entry-point that merges before the state is attached.
+- **Solution:** `build_app_full_with(state: Arc<AxumAppState>, extra_protected: Router<Arc<AxumAppState>>) -> Router`. `extra_protected` is `.merge(…)'d **before** the `route_layer` chain, so every extra route gets the same middleware (`csrf_guard` → `auto_refresh` → `auth_layer`) as the standard endpoints. `build_app_full(state)` delegates to `build_app_full_with(state, Router::new())` — signature and semantics unchanged.
+- **Four entry-points total:** `build_app` / `build_app_with_protected` / `build_app_full` / `build_app_full_with`.
+- **No behavioural test added** (deliberate): fn-pointer assert in `feature_axum.rs` proves the export; `.merge(…) → .route_layer(…)` is a standard axum builder-chain pattern (structurally impossible to "forget merge" within a single builder-chain).
+
+**A5 — `examples/minimal-lms` (DoD-артефакт Phase A, Axum path):**
+
+*New consumer example `examples/minimal-lms/` — fork-free Axum consumer on `saas-axum`. 8 files, ~486 raw LOC / ~290 without comments, 3 E2E green, `fmt --check` + `clippy -D warnings` clean.*
+
+- **`Cargo.toml`:** `rust-saas = { path = "../../crates/rust-saas", features = ["axum"] }` + `tokio`, `sqlx` (`runtime-tokio`, `tls-rustls`, `postgres`, `migrate`), `anyhow`, `dotenvy`, `axum`, `serde` (`derive`), `uuid` (`serde`) — 8 deps. `[dev-dependencies]`: `sqlx` (`macros`), `tower` (`util`), `http-body-util`, `serde_json` — 4 dev-deps. `Cargo.lock` committed.
+- **`build.rs`:** `rerun-if-changed=migrations` (4 lines).
+- **`migrations/90000000000001_lms_tables.sql`:** 4 tables — `courses` (FK `workspaces(id)` on delete cascade), `assignments` (FK `courses(id)` on delete cascade), `batches` (FK `tenants(id)` on delete cascade), `files` (FK `tenants(id)` on delete cascade). `enrollments` deliberately out of scope. Version `90000000000001` > `db::CONSUMER_VERSION_FLOOR` (`90000000000000`) — no collision with rust-saas set.
+- **`src/handlers.rs`:** 4 handlers — `list_courses` (workspace-scope, `resolve_workspace` read path, suspended tenant OK), `create_course` (workspace-scope, `resolve_active_workspace` mutation path, then `authz.require(workspace_domain, "course", "write")`), `list_files` (tenant-scope, `resolve_tenant`), `create_batch` (tenant-scope, `resolve_active_tenant`, then `authz.require(tenant_domain, "batch", "manage")`).
+- **`src/lib.rs`:** `pub fn build_app(state: Arc<AxumAppState>) -> Router` = `build_app_full_with(state, extra_routes())`. `extra_routes` — 3 routes: `GET|POST /workspaces/{workspace_id}/courses`, `GET /tenants/{tenant_id}/files`, `POST /tenants/{tenant_id}/batches`.
+- **`src/main.rs`:** `db::connect` → `db::migrate_composed(&pool, &[&MY_MIGRATOR])` → `AxumAppState::builder(pool, jwt_secret).with_resource_types(&[…]).with_bindings([…]).build().await?` → `axum::serve`. `with_resource_types` before `with_bindings` (build() fail-fast validation order). `with_bindings([…])` — array by value, not `&[…]`.
+- **`tests/e2e.rs`:** 3 E2E via `tower::oneshot` + `#[sqlx::test(migrations = false)]` + `db::migrate_composed`:
+  - `course_editor_creates_course` — owner (via `provision_tenant` + `create_workspace_with_owner`) POST → 200 + `title` in response.
+  - `viewer_reads_course` — viewer (custom role with `[]` permissions + `assign_role`) POST → **403** (no `course:write`).
+  - `batch_requires_tenant_manage` — member (custom role with `[]` + assign) POST → **403** (no `batch:manage`).
+- **DoD deviations from `saas-23.md §3`** (documented in A8 §5.7(i)):
+  - 8 `[dependencies]` (not 5) — `axum`, `serde`, `uuid` needed at compile-time for handler DTOs / `Json` / `IntoResponse`.
+  - 4 handlers (not 5) — `bootstrap.rs` rolled into `main.rs`; helpers rolled into `handlers.rs`.
+  - `build_app_full_with(state, Router)` (not `build_app_full(state).route(…)`) — A4.6.
+  - LOC 486 raw / ~290 without comments (DoD "≤300 without comments" satisfied).
+
+**A6 — `examples/axum-minimal` → `saas-axum` (fork-free refactor):**
+
+*`examples/axum-minimal/` refactored onto `saas-axum`: 17 `src/*.rs` files → 3, ~2000 LOC → **278 LOC src**, ~15 workspace deps → **1** (`rust-saas = { features = ["axum"] }`), 14/14 E2E green, `fmt --check` + `clippy -D warnings` clean. Structural refactor only — behavioural contract preserved (status codes, JSON shape, cookie flow, error bodies identical to pre-A6).*
+
+- **`Cargo.toml`:** one workspace dependency `rust-saas = { path = "../../crates/rust-saas", features = ["axum"] }` (was ~15 explicit: `domain`, `authz`, `authz-casbin`, `access`, `identity`, `authn`, `saas`, `db`, `audit`, `audit-pg`, `rate-limiter`). System deps: `tokio`, `sqlx`, `anyhow`, `dotenvy`, `axum`, `serde`, `uuid`, `tracing`, `tracing-subscriber`. Dev: `sqlx` (`macros`), `tower` (`util`), `http-body-util`, `serde_json`, `metrics`, `metrics-exporter-prometheus`. `Cargo.lock` regenerated (rust-saas + saas-axum as path deps).
+- **`src/lib.rs`** (~32 LOC): `pub mod handlers;` + `pub fn build_app(state: Arc<AxumAppState>) -> Router = build_app_full_with(state, extra)`, where `extra` carries 7 consumer routes: `/tenants` (GET+POST), `/workspaces` (GET+POST), `/documents` (GET+POST), `/audit` (GET).
+- **`src/handlers.rs`** (~206 LOC, new): 7 handlers — `list_my_tenants`, `create_tenant`, `list_my_workspaces`, `create_workspace`, `list_documents`, `create_document`, `list_audit`. Plus a local `PaginationQuery` (15 lines; `saas-axum::pagination` is not re-exported from `rust_saas`, and adding it to the public API for a single `limit/offset` field was judged not worth it). Same `state.saas.pool()` / `state.saas.access()` / `my_permissions` contracts as the old modules.
+- **`src/main.rs`** (~41 LOC): `db::connect` → `db::migrate` → `AxumAppState::builder(pool, jwt_secret).build().await?` → `axum::serve`. No `with_resource_types`, no `with_bindings`, no `with_prometheus` — `axum-minimal` is the "minimal path" reference; `minimal-lms` is the "custom resource types + custom bindings" reference.
+- **Removed 14 files** (`src/{audit,auth,auth_layer,cookie,csrf,email,error,extract,health,middleware,pagination,state,tenant,workspace}.rs`). All functionality is now either in `build_app_full_with` (auth endpoints, middleware chain, `/healthz`, `/readyz`, `/metrics`) or re-exported from `rust_saas` (`AppError`, `CurrentUser`, `CookieConfig`, `EmailSender`, `NoopEmailSender`, `EmailResult`).
+- **`tests/e2e.rs`** (~377 LOC, 14 tests, `#[sqlx::test(migrations = "../../crates/db/migrations")]`): `healthz_returns_200`, `protected_route_requires_auth`, `register_sets_auth_cookies`, `refresh_returns_current_user`, `logout_clears_cookies`, `tenant_and_workspace_flow`, `post_tenants_requires_platform_permission`, `post_tenants_without_csrf_token_is_rejected`, `suspended_tenant_blocks_workspace_creation`, `audit_requires_platform_audit_read`, `register_rate_limited_at_4_per_hour`, `pagination_limits_and_offsets_tenants`, `readyz_returns_200`, `metrics_returns_prometheus_format`. All assertions (status codes, JSON shape, cookie flow, error bodies) unchanged from pre-A6.
+- **DoD deviations from `saas-24.md §3`** (documented in A8 §5.7(i) and `saas-25.md §1.9`):
+  - 8 system deps (not 5) — `serde`, `uuid` needed at compile-time for handler DTOs / `Json`; `tracing`, `tracing-subscriber` for `.init()` in `main.rs`.
+  - `with_bindings` / `with_prometheus` not called in `main.rs` — minimal path (these are exercised by `minimal-lms`).
+  - `list_audit` performs `my_permissions` + gate directly instead of using a `RouteBinding` on `/audit` — matches the pre-A6 pattern in `src/audit.rs`; `minimal-lms` demonstrates the declarative `RouteBinding` path.
+  - LOC 278 src (DoD "≤500" satisfied; the target was ~500).
+
+**PR #35 (`feat/rbac`)** — merged into `main` (`b815743`) between A5-precursor and A5. Unrelated to A5 or A6; consumers should still verify via `git show b815743 --stat` before starting A7' that no `saas` / `saas-axum` / `access` API changed. For A6, no API changes were observed on the surfaces used (`saas::platform::*`, `saas::access::my_permissions`, `AxumAppStateBuilder`, `build_app_full_with`).
+
+**Tests:** 174 → **197** (A1 + A2 + A3) → **245** → **254** (A4.0–A4.5: `saas-axum` 57 integration + `rust-saas/tests/feature_axum.rs` fn-pointer asserts). Workspace test count unchanged by A6 (consumer-only refactor). **E2E:** 14 (`axum-minimal`) + 15 (`saas-leptos`) + **3 (`minimal-lms`)** = **32** — same count as A5; `axum-minimal` E2E adapted in place.
 
 ## [0.2.2] - 2026-11-03
 
