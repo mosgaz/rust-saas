@@ -90,6 +90,15 @@ revision.
   - `list_audit` performs `my_permissions` + gate directly instead of using a `RouteBinding` on `/audit` — matches the pre-A6 pattern in `src/audit.rs`; `minimal-lms` demonstrates the declarative `RouteBinding` path.
   - LOC 278 src (DoD "≤500" satisfied; the target was ~500).
 
+### A7'.1 — `saas-leptos` single-dep
+
+**`examples/saas-leptos` → starter template (one workspace dep).** `Cargo.toml` now has one workspace dependency `rust-saas = { path = "../../crates/rust-saas", features = ["ssr", "rate-limiter-redis"], optional = true }` (was ~11 optional workspace deps) + a direct `domain = { path = "../../crates/domain", default-features = false }` (hydrate-only: `rust-saas` is `optional`, enabled only under `ssr`; hydrate-compiled code uses `domain::*` directly). All `use`-lines in `src/*.rs` and `src/pages/*.rs` that referenced `authz` / `authz-casbin` / `access` / `identity` / `authn` / `saas` / `db` / `audit` / `audit-pg` / `rate-limiter` switched to `rust_saas::*` (SSR-only locations: `main.rs`, `state.rs`, `middleware.rs`, `error.rs`, `pages/*` under `#[server]` / `#[cfg(feature = "ssr")]`). `README.md` rewritten as **starter template, not a library** (copy-flow, rename-flow, what-is-included / what-is-NOT-included). **Code does not change** (only `Cargo.toml` + `use`-lines + `README.md`). **15/15 E2E green, `cargo check --features ssr` + `cargo check --features hydrate` green.**
+
+**Deviations from `saas-25.md §3`:**
+- `features = ["ssr", "rate-limiter-redis"]` — not just `["ssr"]`. `src/main.rs` uses `rate_limiter::RedisRateLimiter::from_url(...)`; the `rate-limiter-redis` feature (in `crates/rust-saas/Cargo.toml`) is required for `RedisRateLimiter` to compile — it is **not** part of `ssr`. Both `README.md` and this entry use the full feature set.
+- `domain` stays a direct, non-optional dependency (not `rust_saas::domain`). `rust-saas` is `optional = true` (only `ssr`), so hydrate-compiled code (`guard.rs`, `pages/*`) cannot reference `rust_saas::domain::*` — it would fail `cargo check --features hydrate` with `E0433: use of undeclared crate or module rust_saas`. `domain` is `default-features = false` and compiles in both `ssr` and `hydrate`.
+- **No library API change** (consumer-only refactor; `rust-saas` `features = ["ssr", "rate-limiter-redis"]` already existed; `domain` direct dep was already the case in the reference).
+
 **PR #35 (`feat/rbac`)** — merged into `main` (`b815743`) between A5-precursor and A5. Unrelated to A5 or A6; consumers should still verify via `git show b815743 --stat` before starting A7' that no `saas` / `saas-axum` / `access` API changed. For A6, no API changes were observed on the surfaces used (`saas::platform::*`, `saas::access::my_permissions`, `AxumAppStateBuilder`, `build_app_full_with`).
 
 **Tests:** 174 → **197** (A1 + A2 + A3) → **245** → **254** (A4.0–A4.5: `saas-axum` 57 integration + `rust-saas/tests/feature_axum.rs` fn-pointer asserts). Workspace test count unchanged by A6 (consumer-only refactor). **E2E:** 14 (`axum-minimal`) + 15 (`saas-leptos`) + **3 (`minimal-lms`)** = **32** — same count as A5; `axum-minimal` E2E adapted in place.

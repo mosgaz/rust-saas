@@ -4,7 +4,7 @@
 
 The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, and authorization from each other, so they can be reused in other applications through git dependencies. Three reference consumers live under `examples/`:
 
-- `examples/saas-leptos` — Leptos SSR + Axum + `#[server]` (starter template; A7' migrates it to a single-dep build).
+- `examples/saas-leptos` — Leptos SSR + Axum + `#[server]` (starter template; A7'.1 — single-dep (`rust-saas` + `domain` hydrate-only)).
 - `examples/axum-minimal` — pure Axum, no Leptos (Stage 3g portability proof; **Stage 5.0-A6 — fork-free consumer on `saas-axum`**, one library dependency, 278 LOC src, 14 E2E).
 - `examples/minimal-lms` — **fork-free Axum consumer on `saas-axum`** (Stage 5.0-A5; DoD-артефакт Phase A, Axum path).
 
@@ -136,8 +136,8 @@ Plus a cross-cutting concern:
 ### Crate dependency graph
 
 ```text
-saas-leptos  -> domain, authz, authz-casbin, access, identity, authn, saas, db,
-                audit, audit-pg, rate-limiter                                  (example)
+saas-leptos  -> rust-saas (features = ["ssr", "rate-limiter-redis"]),
+                domain (hydrate-only)                                          (example)
 axum-minimal -> rust-saas (features = ["axum"])                               (example)
 minimal-lms  -> rust-saas (features = ["axum"])                               (example)
 seed         -> authz, authz-casbin, access, authn, identity, db, domain, saas,
@@ -714,7 +714,7 @@ Standalone binary. Bootstrap data + demo accounts (all email-verified). Wires re
 
 ### examples/saas-leptos
 
-Reference consumer. `main.rs` builds real `PgAuditLogger` + passes to `AccessState::with_audit`, `Authn::with_audit`, `SaasBuilder::with_audit`. `GuardRoute` on `Resource`/`Suspense` (Stage 4.9). `auth_layer.rs` (Stage 4.9). `error.rs` maps errors to 400/401/403/404/409/429/500 (including `TenantSuspended` → 403 distinct message).
+Reference consumer (single-dep since A7'.1: `rust-saas = { features = ["ssr", "rate-limiter-redis"] }` + `domain` hydrate-only). `main.rs` builds real `PgAuditLogger` + passes to `AccessState::with_audit`, `Authn::with_audit`, `SaasBuilder::with_audit`. `GuardRoute` on `Resource`/`Suspense` (Stage 4.9). `auth_layer.rs` (Stage 4.9). `error.rs` maps errors to 400/401/403/404/409/429/500 (including `TenantSuspended` → 403 distinct message).
 
 ### examples/axum-minimal (Stage 3g, refactored Stage 5.0-A6)
 
@@ -806,7 +806,8 @@ Deviations from `saas-23.md §3` documented in A8 §5.7(i): 8 deps (not 5), 4 ha
 - **A4.6 (done):** `build_app_full_with(state, extra_protected)` — additive fork-free entry-point.
 - **A5 (done, PR #36):** `examples/minimal-lms` — DoD-артефакт Phase A (Axum path). **All 10 pluggability blockers (B1–B10) closed.**
 - **A6 (done):** `examples/axum-minimal` → `saas-axum` — 278 LOC src (was ~2000), 3 files in `src/`, 1 library dependency `rust-saas = { features = ["axum"] }`, 14/14 E2E green, `fmt --check` + `clippy -D warnings` clean.
-- **A7'.1 / A7'.2 (next):** `saas-leptos` starter template (`Cargo.toml` single-dep + README; `bootstrap_*` in `main.rs`; `#[server] register_resource` + admin UI in `pages/platform.rs`).
+- **A7'.1 (done):** `saas-leptos` single-dep — `Cargo.toml` (one workspace dep `rust-saas = { features = ["ssr", "rate-limiter-redis"] }`) + `domain` hydrate-only; `README.md` "starter template"; 15/15 E2E; `fmt --check` + `clippy -D warnings` clean.
+- **A7'.2 (next):** `bootstrap_*` in `main.rs` (5+ lines) + `#[server] register_resource` in `pages/platform.rs` + form.
 - **A8:** docs (`saas-external-02.md`, `ADR-0008`, `ADR-0009`, `CHANGELOG`, `README`, Appendix B) + CI jobs for both examples (`minimal-lms` + `axum-minimal`).
 - **A9:** DoD Phase A, tag `v0.3.0`.
 - **Stage 5.1+ (open):** ABAC/ReBAC (Phase B); OIDC + TOTP + WebAuthn (Phase C); RLS + cleanup TTL + escape hatch + polish (Phase D).
@@ -861,7 +862,7 @@ Explicitly **out of scope** for this reference:
 
 ## Compatibility
 
-All `crates/*` share **one version** (`[workspace.package] version = "0.3.0"` (unreleased)). Consumers must pin every path / git dependency to the same revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change log (`0.3.0` — 5 breaking items from A2.2 + `reload_in_memory` from A1.4 + `migrate_with` deprecated; `axum` feature and `build_app_full_with` are additive; A6 is a consumer-only refactor with no library API change).
+All `crates/*` share **one version** (`[workspace.package] version = "0.3.0"` (unreleased)). Consumers must pin every path / git dependency to the same revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change log (`0.3.0` — 5 breaking items from A2.2 + `reload_in_memory` from A1.4 + `migrate_with` deprecated; `axum` feature and `build_app_full_with` are additive; A6 and A7'.1 are consumer-only refactors with no library API change).
 
 ## License
 

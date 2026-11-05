@@ -25,7 +25,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use authn::{Authn, AuthnError};
+use rust_saas::authn::{Authn, AuthnError};
 use axum::extract::{Request, State};
 use axum::http::header::{CACHE_CONTROL, SET_COOKIE};
 use axum::http::HeaderValue;

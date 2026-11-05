@@ -1,6 +1,6 @@
 //! Tenant and workspace roles: list, create, edit, delete.
 //!
-//! `RoleView` is a client-side mirror of `access::Role` (which is SSR-only
+//! `RoleView` is a client-side mirror of `rust_saas::access::Role` (which is SSR-only
 //! because `access` pulls `sqlx`). Conversion happens server-side only.
 //!
 //! Stage 3a: `RoleFormPage` edits `name`, `description`, and `permissions`.
@@ -16,9 +16,9 @@
 //!
 //! **Stage 3f (ADR-0002 rev.2):** `create_role`, `update_role`, and
 //! `delete_role` resolve the tenant that owns the role's domain before
-//! delegating to `saas::access::*`. `create_role` knows the domain directly
+//! delegating to `rust_saas::saas::access::*`. `create_role` knows the domain directly
 //! (the `#[server]` argument); `update_role` and `delete_role` receive only
-//! `role_id` and must first call `access::get_role_by_id` to learn the
+//! `role_id` and must first call `rust_saas::access::get_role_by_id` to learn the
 //! domain. `list_roles`, `get_role`, and `my_permissions` are read-only and
 //! stay outside the resolution path — see the `pages::tenant` module doc
 //! for the reasoning.
@@ -64,8 +64,8 @@ pub struct RoleView {
 }
 
 #[cfg(feature = "ssr")]
-impl From<access::Role> for RoleView {
-    fn from(r: access::Role) -> Self {
+impl From<rust_saas::access::Role> for RoleView {
+    fn from(r: rust_saas::access::Role) -> Self {
         RoleView {
             id: r.id,
             domain: r.domain,
@@ -94,7 +94,7 @@ pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> 
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    let page = saas::access::list_roles_paged(&state.saas, &user, &domain, i64::MAX, 0)
+    let page = rust_saas::saas::access::list_roles_paged(&state.saas, &user, &domain, i64::MAX, 0)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     Ok(page.items.into_iter().map(RoleView::from).collect())
@@ -102,7 +102,7 @@ pub async fn list_roles(domain: String) -> Result<Vec<RoleView>, ServerFnError> 
 
 /// Returns a role by `role_id`, or `None` if not found.
 ///
-/// Uses `access::get_role_by_id` (no `actor`, §5 p.5 helper): any
+/// Uses `rust_saas::access::get_role_by_id` (no `actor`, §5 p.5 helper): any
 /// authenticated user who knows the `role_id` can read its metadata. The
 /// mutation (`update_role`) performs `authz.require(actor, domain,
 /// "role", "manage")` server-side. Read-only; no `resolve_active_tenant`.
@@ -112,7 +112,7 @@ pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> 
     let _user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    let role = access::get_role_by_id(
+    let role = rust_saas::access::get_role_by_id(
         state
             .saas
             .access()
@@ -129,7 +129,7 @@ pub async fn get_role(role_id: Uuid) -> Result<Option<RoleView>, ServerFnError> 
 #[server]
 pub async fn list_permissions() -> Result<Vec<(String, String, String)>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let page = saas::access::list_permissions_paged(&state.saas, i64::MAX, 0)
+    let page = rust_saas::saas::access::list_permissions_paged(&state.saas, i64::MAX, 0)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     Ok(page
@@ -158,11 +158,11 @@ pub async fn create_role(
 
     resolve_domain_tenant(&state, &user, &domain).await?;
 
-    let key = access::RoleKey::parse(key).map_err(crate::error::access_error_to_server_fn)?;
+    let key = rust_saas::access::RoleKey::parse(key).map_err(crate::error::access_error_to_server_fn)?;
     let pairs = parse_permission_pairs(&permissions)?;
 
     let role =
-        saas::access::create_role(&state.saas, &user, &domain, &key, name, description, &pairs)
+        rust_saas::saas::access::create_role(&state.saas, &user, &domain, &key, name, description, &pairs)
             .await
             .map_err(crate::error::core_error_to_server_fn)?;
     Ok(RoleView::from(role))
@@ -186,7 +186,7 @@ pub async fn update_role(
         .await?
         .require()?;
 
-    let existing = access::get_role_by_id(
+    let existing = rust_saas::access::get_role_by_id(
         state
             .saas
             .access()
@@ -195,12 +195,12 @@ pub async fn update_role(
     )
     .await
     .map_err(crate::error::access_error_to_server_fn)?
-    .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
+    .ok_or_else(|| crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound))?;
     resolve_domain_tenant(&state, &user, &existing.domain).await?;
 
     let pairs = parse_permission_pairs(&permissions)?;
 
-    let role = saas::access::update_role(&state.saas, &user, role_id, name, description, &pairs)
+    let role = rust_saas::saas::access::update_role(&state.saas, &user, role_id, name, description, &pairs)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     Ok(RoleView::from(role))
@@ -217,7 +217,7 @@ pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
         .await?
         .require()?;
 
-    let existing = access::get_role_by_id(
+    let existing = rust_saas::access::get_role_by_id(
         state
             .saas
             .access()
@@ -226,10 +226,10 @@ pub async fn delete_role(role_id: Uuid) -> Result<(), ServerFnError> {
     )
     .await
     .map_err(crate::error::access_error_to_server_fn)?
-    .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
+    .ok_or_else(|| crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound))?;
     resolve_domain_tenant(&state, &user, &existing.domain).await?;
 
-    saas::access::delete_role(&state.saas, &user, role_id)
+    rust_saas::saas::access::delete_role(&state.saas, &user, role_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -243,7 +243,7 @@ pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, Ser
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::access::my_permissions(&state.saas, &user, &domain)
+    rust_saas::saas::access::my_permissions(&state.saas, &user, &domain)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }

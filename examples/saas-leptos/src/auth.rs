@@ -2,7 +2,7 @@
 //! verification (Stage 3b), password reset (Stage 3d), and post-auth
 //! return-URL preservation (Stage 3a).
 //!
-//! All delegate to `authn::*`. Cookies are managed by the example, not by
+//! All delegate to `rust_saas::authn::*`. Cookies are managed by the example, not by
 //! `authn`:
 //!
 //! - `access_token` — short-lived JWT (default TTL 15 min).
@@ -39,14 +39,14 @@
 //!   **silent** — unknown emails return `Ok(())` and no token is created;
 //!   the response cannot be used as an enumeration oracle. Rate limited to
 //!   `5 / 1h` per email via `AppState.rate_limit`. If the address is
-//!   registered, `authn::request_password_reset` issues a single-active
+//!   registered, `rust_saas::authn::request_password_reset` issues a single-active
 //!   1-hour token and `EmailSender::send_password_reset` delivers the link;
 //!   SMTP outcome is intentionally discarded (a failure here would also be
 //!   an enumeration oracle and `EmailResult` is not surfaced to the UI on
 //!   this path — the page shows a generic confirmation regardless).
 //! - `reset_password(token, password)` is **public** (no `require`): the
 //!   link is opened from the email, possibly in an anonymous browser. It
-//!   delegates to `authn::reset_password`, which is **one-shot** (a
+//!   delegates to `rust_saas::authn::reset_password`, which is **one-shot** (a
 //!   replayed token returns `TokenInvalid`) and, in one transaction,
 //!   rewrites `password_hash` + `password_changed_at`, expires every
 //!   outstanding reset token for the user, and revokes every refresh-token
@@ -184,7 +184,7 @@ pub async fn register(
     // practice — `email_verified_at` is NULL on insert). Log and skip.
     let email_result = match state.authn.create_email_verification(user.id).await {
         Ok(token) => state.email.send_verification(&user.email, &token).await,
-        Err(authn::AuthnError::AlreadyVerified) => {
+        Err(rust_saas::authn::AuthnError::AlreadyVerified) => {
             tracing::error!(
                 user_id = %user.id,
                 "register: user already verified immediately after creation; skipping verification email"
@@ -303,7 +303,7 @@ pub async fn logout() -> Result<(), ServerFnError> {
 ///
 /// Returns `EmailResult` (`Sent` / `Failed` / `Disabled`) — transport
 /// failures are not `ServerFnError`s; they surface in the UI so the user
-/// can retry. `authn::AuthnError::AlreadyVerified` (user already verified)
+/// can retry. `rust_saas::authn::AuthnError::AlreadyVerified` (user already verified)
 /// maps to HTTP 409 via `authn_error_to_server_fn`.
 #[server]
 pub async fn request_email_verification() -> Result<EmailResult, ServerFnError> {
@@ -358,7 +358,7 @@ pub async fn verify_email(token: String) -> Result<AuthUser, ServerFnError> {
 /// **Silent** — always returns `Ok(())` when the request is accepted:
 /// - Unknown email → no token created, no email sent, `Ok(())`. The
 ///   response cannot be used as an enumeration oracle.
-/// - Known email → `authn::request_password_reset` issues a single-active
+/// - Known email → `rust_saas::authn::request_password_reset` issues a single-active
 ///   1-hour token; `EmailSender::send_password_reset` delivers the link.
 ///   SMTP outcome is intentionally discarded: surfacing "failed" vs "sent"
 ///   would distinguish registered from unregistered addresses (assuming a
@@ -423,7 +423,7 @@ pub async fn request_password_reset(email: String) -> Result<(), ServerFnError> 
 /// **Public** (no `CurrentUser::require`): the link is clicked from the
 /// email, possibly in an anonymous browser.
 ///
-/// Delegates to `authn::reset_password`, which is **one-shot** (a replayed
+/// Delegates to `rust_saas::authn::reset_password`, which is **one-shot** (a replayed
 /// token returns `TokenInvalid`). In a single transaction it:
 /// - rewrites `users.password_hash` and `users.password_changed_at`,
 /// - expires every outstanding reset token for the user (including the

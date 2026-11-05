@@ -47,7 +47,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use rate_limiter::RateLimiter;
+use rust_saas::rate_limiter::RateLimiter;
 use saas_leptos::build_app;
 use saas_leptos::cookie::CookieConfig;
 use saas_leptos::email::NoopEmailSender;
@@ -84,17 +84,18 @@ fn test_leptos_options() -> leptos::prelude::LeptosOptions {
 }
 
 async fn setup_app(pool: PgPool) -> (Router, AppState) {
-    let authz: Arc<dyn authz::AuthorizationEngine> = Arc::new(
-        authz_casbin::CasbinAuthz::from_pool(pool.clone())
+    let authz: Arc<dyn rust_saas::authz::AuthorizationEngine> = Arc::new(
+        rust_saas::authz_casbin::CasbinAuthz::from_pool(pool.clone())
             .await
             .expect("casbin init"),
     );
-    let audit: Arc<dyn audit::AuditLogger> =
-        Arc::new(audit_pg::PgAuditLogger::from_pool(pool.clone()));
-    let access =
-        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
+    let audit: Arc<dyn rust_saas::audit::AuditLogger> =
+        Arc::new(rust_saas::audit_pg::PgAuditLogger::from_pool(pool.clone()));
+    let access = Arc::new(
+        rust_saas::access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()),
+    );
     let authn = Arc::new(
-        authn::Authn::with_ttl(
+        rust_saas::authn::Authn::with_ttl(
             pool.clone(),
             "test-jwt-secret-not-for-prod",
             chrono::Duration::minutes(15),
@@ -103,7 +104,7 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
         .with_audit(audit.clone()),
     );
     let saas = Arc::new(
-        saas::SaasBuilder::new(pool)
+        rust_saas::saas::SaasBuilder::new(pool)
             .with_authz(authz)
             .with_access(access)
             .with_audit(audit)
@@ -111,7 +112,8 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
             .expect("saas builder"),
     );
     let email: Arc<dyn saas_leptos::email::EmailSender> = Arc::new(NoopEmailSender);
-    let rate_limit: Arc<dyn RateLimiter> = Arc::new(rate_limiter::InMemoryRateLimiter::new());
+    let rate_limit: Arc<dyn RateLimiter> =
+        Arc::new(rust_saas::rate_limiter::InMemoryRateLimiter::new());
     let cookie = test_cookie_config();
 
     let state = AppState {
@@ -128,8 +130,8 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
 }
 
 async fn grant_platform_admin(state: &AppState, user_id: Uuid) {
-    let owner_key = access::RoleKey::parse("owner").expect("role key");
-    let perms = access::get_permissions_for_role(
+    let owner_key = rust_saas::access::RoleKey::parse("owner").expect("role key");
+    let perms = rust_saas::access::get_permissions_for_role(
         state.saas.access().expect("access"),
         "platform",
         &owner_key,
@@ -411,9 +413,9 @@ async fn provision_tenant_and_create_workspace(pool: PgPool) {
         .register(&owner_email, "Password123!")
         .await
         .expect("register owner");
-    let owner_key = access::RoleKey::parse("owner").unwrap();
+    let owner_key = rust_saas::access::RoleKey::parse("owner").unwrap();
 
-    let tenant = saas::platform::provision_tenant(
+    let tenant = rust_saas::saas::platform::provision_tenant(
         &state.saas,
         &admin,
         format!("Acme-{}", Uuid::new_v4()),
@@ -423,7 +425,7 @@ async fn provision_tenant_and_create_workspace(pool: PgPool) {
     .await
     .expect("provision_tenant");
 
-    let workspace = saas::tenant::create_workspace_with_owner(
+    let workspace = rust_saas::saas::tenant::create_workspace_with_owner(
         &state.saas,
         &owner,
         tenant.id,
@@ -459,9 +461,9 @@ async fn suspended_tenant_blocks_resolve_active_tenant(pool: PgPool) {
         .register(&owner_email, "Password123!")
         .await
         .expect("register owner");
-    let owner_key = access::RoleKey::parse("owner").unwrap();
+    let owner_key = rust_saas::access::RoleKey::parse("owner").unwrap();
 
-    let tenant = saas::platform::provision_tenant(
+    let tenant = rust_saas::saas::platform::provision_tenant(
         &state.saas,
         &admin,
         format!("Acme-{}", Uuid::new_v4()),
@@ -472,19 +474,19 @@ async fn suspended_tenant_blocks_resolve_active_tenant(pool: PgPool) {
     .expect("provision_tenant");
 
     // Precondition: owner resolves fine when active.
-    saas::platform::resolve_active_tenant(&state.saas, &owner, tenant.id)
+    rust_saas::saas::platform::resolve_active_tenant(&state.saas, &owner, tenant.id)
         .await
         .expect("active tenant must resolve");
 
-    saas::platform::suspend_tenant(&state.saas, &admin, tenant.id)
+    rust_saas::saas::platform::suspend_tenant(&state.saas, &admin, tenant.id)
         .await
         .expect("suspend_tenant");
 
-    let err = saas::platform::resolve_active_tenant(&state.saas, &owner, tenant.id)
+    let err = rust_saas::saas::platform::resolve_active_tenant(&state.saas, &owner, tenant.id)
         .await
         .expect_err("suspended tenant must be rejected");
     assert!(
-        matches!(err, saas::CoreError::TenantSuspended),
+        matches!(err, rust_saas::saas::CoreError::TenantSuspended),
         "got {err:?}"
     );
 }
@@ -515,16 +517,17 @@ async fn audit_permission_gated_by_platform_owner(pool: PgPool) {
     let has_audit_read =
         |perms: &[(String, String)]| perms.iter().any(|(r, a)| r == "audit" && a == "read");
 
-    let admin_perms = saas::access::my_permissions(&state.saas, &admin, domain::PLATFORM_DOMAIN)
-        .await
-        .expect("admin perms");
+    let admin_perms =
+        rust_saas::saas::access::my_permissions(&state.saas, &admin, domain::PLATFORM_DOMAIN)
+            .await
+            .expect("admin perms");
     assert!(
         has_audit_read(&admin_perms),
         "platform admin must hold `(audit, read)`"
     );
 
     let regular_perms =
-        saas::access::my_permissions(&state.saas, &regular, domain::PLATFORM_DOMAIN)
+        rust_saas::saas::access::my_permissions(&state.saas, &regular, domain::PLATFORM_DOMAIN)
             .await
             .expect("regular perms");
     assert!(
@@ -578,11 +581,11 @@ async fn pagination_via_state(pool: PgPool) {
         .register(&owner_email, "Password123!")
         .await
         .unwrap();
-    let owner_key = access::RoleKey::parse("owner").unwrap();
+    let owner_key = rust_saas::access::RoleKey::parse("owner").unwrap();
 
     // Create 3 tenants
     for i in 0..3 {
-        saas::platform::provision_tenant(
+        rust_saas::saas::platform::provision_tenant(
             &state.saas,
             &admin,
             format!("Acme-{}-{}", Uuid::new_v4(), i),
@@ -594,21 +597,21 @@ async fn pagination_via_state(pool: PgPool) {
     }
 
     // Page 1: limit 2, offset 0
-    let page1 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 0)
+    let page1 = rust_saas::saas::platform::list_tenants_paged(&state.saas, &admin, 2, 0)
         .await
         .unwrap();
     assert_eq!(page1.total, 3);
     assert_eq!(page1.items.len(), 2);
 
     // Page 2: limit 2, offset 2
-    let page2 = saas::platform::list_tenants_paged(&state.saas, &admin, 2, 2)
+    let page2 = rust_saas::saas::platform::list_tenants_paged(&state.saas, &admin, 2, 2)
         .await
         .unwrap();
     assert_eq!(page2.total, 3);
     assert_eq!(page2.items.len(), 1);
 
     // Audit pagination: limit 1, offset 0
-    let logger = audit_pg::PgAuditLogger::from_pool(state.saas.pool().clone());
+    let logger = rust_saas::audit_pg::PgAuditLogger::from_pool(state.saas.pool().clone());
     let audit_page = logger.list_paged(1, 0).await.unwrap();
     assert!(audit_page.total >= 3);
     assert_eq!(audit_page.items.len(), 1);
