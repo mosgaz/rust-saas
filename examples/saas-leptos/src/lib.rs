@@ -21,7 +21,7 @@
 //! wrapped in [`guard::GuardRoute`] with a [`guard::RouteGuard`] policy
 //! declared right here, next to the `<Route>`. `pages/*.rs` are not
 //! touched: the policy lives in the router. Guards are **UX-only** —
-//! `saas::*` and `saas::platform::*` still call `authz.require` /
+//! `rust_saas::saas::*` and `rust_saas::saas::platform::*` still call `authz.require` /
 //! `resolve_active_tenant` server-side. Public routes (`/`, `/login`,
 //! `/register`, `/verify/:token`, `/forgot-password`,
 //! `/reset-password/:token`, `/invitations/:token`) have no guard.

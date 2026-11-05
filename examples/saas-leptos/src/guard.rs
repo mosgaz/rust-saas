@@ -2,7 +2,7 @@
 //!
 //! **UX-only, not a security boundary.** A guard hides pages the actor
 //! cannot use, but the backend `authz.require` / `resolve_active_tenant`
-//! calls in `saas::*` remain authoritative. A client that bypasses the
+//! calls in `rust_saas::saas::*` remain authoritative. A client that bypasses the
 //! guard still gets HTTP 401/403 from the server functions.
 //!
 //! **Architecture.** A single [`GuardRoute`] sits in front of every

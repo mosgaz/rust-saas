@@ -1,8 +1,8 @@
 //! Tenant and workspace member management: list members, assign or remove
 //! roles.
 //!
-//! Server functions delegate to `saas::member::*` and
-//! `saas::access::{assign_role, my_permissions}`; errors go through
+//! Server functions delegate to `rust_saas::saas::member::*` and
+//! `rust_saas::saas::access::{assign_role, my_permissions}`; errors go through
 //! `crate::error::core_error_to_server_fn`.
 //!
 //! Stage 3a: `MemberListPage` uses `<select>` for user (all current members,
@@ -11,12 +11,12 @@
 //! invitations page for the same tenant or workspace.
 //!
 //! Role key is passed to the server as a raw string and parsed into
-//! `access::RoleKey` server-side; the client never sees `access` types
+//! `rust_saas::access::RoleKey` server-side; the client never sees `access` types
 //! (`access` is SSR-only).
 //!
 //! **Stage 3f (ADR-0002 rev.2):** `assign_member_role` and
 //! `remove_member_role` resolve the tenant that owns the domain before
-//! delegating to `saas::member::*`. For a tenant domain the id comes
+//! delegating to `rust_saas::saas::member::*`. For a tenant domain the id comes
 //! directly from the string; for a workspace domain the server does a
 //! `SELECT tenant_id FROM workspaces WHERE id = $1`. A suspended tenant
 //! yields `TenantSuspended` (HTTP 403); a non-member yields `Forbidden`.
@@ -47,7 +47,7 @@ use crate::pages::role::{list_roles, RoleView};
 use crate::perms_cache::PermsCache;
 
 #[cfg(feature = "ssr")]
-use access::RoleKey;
+use rust_saas::access::RoleKey;
 
 // ─── Server functions ───────────────────────────────────────────────────────
 
@@ -62,7 +62,7 @@ pub async fn list_members(domain: String) -> Result<Vec<Member>, ServerFnError> 
         .await?
         .require()?;
     let scope = parse_scope(&domain)?;
-    let page = saas::member::list_paged(&state.saas, &user, scope, i64::MAX, 0)
+    let page = rust_saas::saas::member::list_paged(&state.saas, &user, scope, i64::MAX, 0)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     Ok(page.items)
@@ -77,13 +77,13 @@ pub async fn my_permissions(domain: String) -> Result<Vec<(String, String)>, Ser
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::access::my_permissions(&state.saas, &user, &domain)
+    rust_saas::saas::access::my_permissions(&state.saas, &user, &domain)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Assigns `role_key` to `user_id` in `domain` (`(member, manage)` required
-/// via `saas::access::assign_role`).
+/// via `rust_saas::saas::access::assign_role`).
 ///
 /// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
 /// returns `TenantSuspended` (HTTP 403).
@@ -99,13 +99,13 @@ pub async fn assign_member_role(
         .require()?;
     resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
-    saas::access::assign_role(&state.saas, &user, user_id, &domain, &key)
+    rust_saas::saas::access::assign_role(&state.saas, &user, user_id, &domain, &key)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 /// Removes `role_key` from `user_id` in `domain` (`(member, manage)` required
-/// via `saas::member::remove_role`).
+/// via `rust_saas::saas::member::remove_role`).
 ///
 /// Stage 3f: resolves the tenant that owns `domain`; a suspended tenant
 /// returns `TenantSuspended` (HTTP 403).
@@ -122,20 +122,20 @@ pub async fn remove_member_role(
     resolve_domain_tenant(&state, &user, &domain).await?;
     let key = RoleKey::parse(role_key).map_err(crate::error::access_error_to_server_fn)?;
     let scope = parse_scope(&domain)?;
-    saas::member::remove_role(&state.saas, &user, scope, user_id, &key)
+    rust_saas::saas::member::remove_role(&state.saas, &user, scope, user_id, &key)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
 
 #[cfg(feature = "ssr")]
-fn parse_scope(domain: &str) -> Result<saas::member::MemberScope, ServerFnError> {
+fn parse_scope(domain: &str) -> Result<rust_saas::saas::member::MemberScope, ServerFnError> {
     if let Some(id) = domain.strip_prefix("tenant:") {
         Uuid::parse_str(id)
-            .map(saas::member::MemberScope::Tenant)
+            .map(rust_saas::saas::member::MemberScope::Tenant)
             .map_err(|e| ServerFnError::new(e.to_string()))
     } else if let Some(id) = domain.strip_prefix("workspace:") {
         Uuid::parse_str(id)
-            .map(saas::member::MemberScope::Workspace)
+            .map(rust_saas::saas::member::MemberScope::Workspace)
             .map_err(|e| ServerFnError::new(e.to_string()))
     } else {
         Err(ServerFnError::new(format!("invalid domain: {domain}")))
@@ -147,12 +147,12 @@ fn parse_scope(domain: &str) -> Result<saas::member::MemberScope, ServerFnError>
 ///
 /// For `workspace:{id}` this performs an extra `SELECT tenant_id FROM
 /// workspaces WHERE id = $1` (`NotFound` if the workspace is gone) before
-/// calling `saas::platform::resolve_active_tenant`. Returns the tenant id;
+/// calling `rust_saas::saas::platform::resolve_active_tenant`. Returns the tenant id;
 /// the caller may ignore it today — keeping it explicit makes the helper
 /// reusable from mutations that must pass `tenant_id` downstream.
 ///
 /// `#[cfg(feature = "ssr")]` — calls into `crate::state::AppState` and
-/// `saas::platform::*`, both SSR-only.
+/// `rust_saas::saas::platform::*`, both SSR-only.
 #[cfg(feature = "ssr")]
 pub(crate) async fn resolve_domain_tenant(
     state: &crate::state::AppState,
@@ -169,12 +169,12 @@ pub(crate) async fn resolve_domain_tenant(
                 .fetch_optional(state.saas.pool())
                 .await
                 .map_err(|e| ServerFnError::new(e.to_string()))?;
-        tid.ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?
+        tid.ok_or_else(|| crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound))?
     } else {
         return Err(ServerFnError::new(format!("invalid domain: {domain}")));
     };
 
-    let active = saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+    let active = rust_saas::saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     Ok(active.id)

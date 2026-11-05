@@ -87,7 +87,7 @@ mod ssr {
         /// invitations), containing `{base_url}/invitations/{token}`.
         ///
         /// `token` is the raw invitation token returned by
-        /// `saas::invitation::create_invitation`; only its hash is persisted
+        /// `rust_saas::saas::invitation::create_invitation`; only its hash is persisted
         /// in the database. Transports must not log the raw token or the
         /// URL (`NoopEmailSender` logs only `to` and the skip reason).
         ///
@@ -100,7 +100,7 @@ mod ssr {
         /// `{base_url}/reset-password/{token}`.
         ///
         /// `token` is the raw password-reset token returned by
-        /// `authn::request_password_reset`; only its hash is persisted in
+        /// `rust_saas::authn::request_password_reset`; only its hash is persisted in
         /// the database. Transports must not log the raw token or the URL
         /// (`NoopEmailSender` logs only `to` and the skip reason).
         ///

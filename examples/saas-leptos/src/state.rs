@@ -2,20 +2,20 @@
 use std::sync::Arc;
 
 #[cfg(feature = "ssr")]
-use authn::Authn;
+use rust_saas::authn::Authn;
 #[cfg(feature = "ssr")]
 use leptos::prelude::LeptosOptions;
 #[cfg(feature = "ssr")]
 use metrics_exporter_prometheus::PrometheusHandle;
 #[cfg(feature = "ssr")]
-use saas::SaasState;
+use rust_saas::saas::SaasState;
 
 #[cfg(feature = "ssr")]
 use crate::cookie::CookieConfig;
 #[cfg(feature = "ssr")]
 use crate::email::EmailSender;
 #[cfg(feature = "ssr")]
-use rate_limiter::RateLimiter;
+use rust_saas::rate_limiter::RateLimiter;
 
 #[cfg(feature = "ssr")]
 #[derive(Clone)]

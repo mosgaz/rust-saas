@@ -2,8 +2,8 @@
 //! single-tenant page (create workspace, open invitations/members/roles).
 //!
 //! **Stage 3f (ADR-0002 rev.2):** the `create_workspace` server function
-//! calls `saas::platform::resolve_active_tenant` before delegating to
-//! `saas::tenant::create_workspace`. Resolution checks that the actor is a
+//! calls `rust_saas::saas::platform::resolve_active_tenant` before delegating to
+//! `rust_saas::saas::tenant::create_workspace`. Resolution checks that the actor is a
 //! member of the tenant (`EXISTS tenant_members`) and that its status is
 //! `'active'`; a non-member gets `Forbidden`, a suspended tenant gets
 //! `TenantSuspended` (both map to HTTP 403 in `error.rs`). The mutation
@@ -44,7 +44,7 @@ pub async fn list_my_tenants() -> Result<Vec<domain::Tenant>, ServerFnError> {
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::tenant::list_memberships(&state.saas, &user)
+    rust_saas::saas::tenant::list_memberships(&state.saas, &user)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -61,14 +61,14 @@ pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace
         .await?
         .require()?;
     let owner_key =
-        access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
+        rust_saas::access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let active = saas::platform::resolve_active_tenant(&state.saas, &user, tenant_id)
+    let active = rust_saas::saas::platform::resolve_active_tenant(&state.saas, &user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     let tenant_id = active.id;
 
-    saas::tenant::create_workspace_with_owner(
+    rust_saas::saas::tenant::create_workspace_with_owner(
         &state.saas,
         &user,
         tenant_id,

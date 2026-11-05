@@ -1,7 +1,7 @@
 //! Invitation UI: create/list/revoke (tenant- and workspace-scoped) and
 //! accept via an invitation link.
 //!
-//! Every server function delegates to `saas::invitation::*`; errors go
+//! Every server function delegates to `rust_saas::saas::invitation::*`; errors go
 //! through `crate::error::core_error_to_server_fn` (HTTP 400/401/403/404/500).
 //!
 //! Stage 3a: on `InvitationAcceptPage`, when the visitor is anonymous, the
@@ -23,12 +23,12 @@
 //!   always showing the raw token as a link.
 //! - [`InvitationAcceptPage`] gates Accept for addressed invitations:
 //!   - unverified actor → the server returns
-//!     [`saas::CoreError::EmailNotVerified`]; the UI shows
+//!     [`rust_saas::saas::CoreError::EmailNotVerified`]; the UI shows
 //!     "verify your email first" and a **Resend verification email**
 //!     button that reuses [`crate::auth::request_email_verification`].
 //!   - verified actor whose email does not match the invitation
 //!     (case-insensitive) → the server returns
-//!     [`saas::CoreError::Forbidden`]; the UI shows "invitation is for X,
+//!     [`rust_saas::saas::CoreError::Forbidden`]; the UI shows "invitation is for X,
 //!     you are logged in as Y" and a link to `/login`.
 //!   - Link invitations (`email IS NULL`) skip both checks (Stage 2a
 //!     behaviour preserved).
@@ -36,14 +36,14 @@
 //! **Stage 3f (ADR-0002 rev.2):**
 //! - `create_invitation` resolves the tenant via
 //!   [`resolve_invitation_target`] **in addition to** the status check
-//!   inside `saas::invitation::create_invitation` — defense in depth. A
+//!   inside `rust_saas::saas::invitation::create_invitation` — defense in depth. A
 //!   suspended tenant yields `TenantSuspended` (HTTP 403) from the
 //!   `#[server]` before the service is called; a non-member gets
 //!   `Forbidden`.
 //! - `accept_invitation` does **not** resolve in the `#[server]`: the
 //!   invitation token is the only authorization proof the actor has, and
 //!   the tenant id is not known to the client before the lookup.
-//!   `saas::invitation::accept_invitation` performs the status check
+//!   `rust_saas::saas::invitation::accept_invitation` performs the status check
 //!   itself, before incrementing `used_count` (defense in depth preserved
 //!   inside the library).
 //! - `list_invitations` and `revoke_invitation` do **not** resolve: an
@@ -102,7 +102,7 @@ pub async fn who_am_i() -> Result<Option<SessionUser>, ServerFnError> {
 #[server]
 pub async fn get_invitation_info(token: String) -> Result<Option<Invitation>, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    saas::invitation::check_invitation(&state.saas, &token)
+    rust_saas::saas::invitation::check_invitation(&state.saas, &token)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -115,7 +115,7 @@ pub async fn get_invitation_info(token: String) -> Result<Option<Invitation>, Se
 /// the raw token is displayed once in the UI and shared out of band.
 ///
 /// Stage 3f: resolves the tenant before delegating to
-/// `saas::invitation::create_invitation` (defense in depth — the service
+/// `rust_saas::saas::invitation::create_invitation` (defense in depth — the service
 /// itself also checks `status = 'active'`).
 #[server]
 pub async fn create_invitation(
@@ -131,7 +131,7 @@ pub async fn create_invitation(
 
     resolve_invitation_target(&state, &user, target).await?;
 
-    let (invitation, token) = saas::invitation::create_invitation(
+    let (invitation, token) = rust_saas::saas::invitation::create_invitation(
         &state.saas,
         &user,
         target,
@@ -163,7 +163,7 @@ pub async fn list_invitations(target: InvitationTarget) -> Result<Vec<Invitation
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::invitation::list_invitations(&state.saas, &user, target)
+    rust_saas::saas::invitation::list_invitations(&state.saas, &user, target)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -180,7 +180,7 @@ pub async fn revoke_invitation(
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::invitation::revoke_invitation(&state.saas, &user, target, invitation_id)
+    rust_saas::saas::invitation::revoke_invitation(&state.saas, &user, target, invitation_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -195,7 +195,7 @@ pub async fn revoke_invitation(
 ///
 /// Stage 3f: no `resolve_active_tenant` in this layer — the invitation
 /// token is the only authorization proof, and the tenant id is not known
-/// before the lookup. `saas::invitation::accept_invitation` performs the
+/// before the lookup. `rust_saas::saas::invitation::accept_invitation` performs the
 /// status check itself, before `used_count++`.
 #[server]
 pub async fn accept_invitation(token: String) -> Result<Invitation, ServerFnError> {
@@ -203,7 +203,7 @@ pub async fn accept_invitation(token: String) -> Result<Invitation, ServerFnErro
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::invitation::accept_invitation(&state.saas, &user, &token)
+    rust_saas::saas::invitation::accept_invitation(&state.saas, &user, &token)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -211,13 +211,13 @@ pub async fn accept_invitation(token: String) -> Result<Invitation, ServerFnErro
 /// Resolves the tenant that owns `target` and verifies it is active for
 /// `user` (Stage 3f, `create_invitation` only).
 ///
-/// For `InvitationTarget::Tenant(id)` calls `saas::platform::resolve_active_tenant`
+/// For `InvitationTarget::Tenant(id)` calls `rust_saas::saas::platform::resolve_active_tenant`
 /// directly; for `InvitationTarget::Workspace(id)` first does a
 /// `SELECT tenant_id FROM workspaces WHERE id = $1` (`NotFound` if the
 /// workspace is gone) and then resolves.
 ///
 /// `#[cfg(feature = "ssr")]` — calls into `crate::state::AppState` and
-/// `saas::platform::*`, both SSR-only. Invoked from a `#[server]`-function
+/// `rust_saas::saas::platform::*`, both SSR-only. Invoked from a `#[server]`-function
 /// (SSR-only at runtime).
 #[cfg(feature = "ssr")]
 async fn resolve_invitation_target(
@@ -234,11 +234,13 @@ async fn resolve_invitation_target(
                     .fetch_optional(state.saas.pool())
                     .await
                     .map_err(|e| ServerFnError::new(e.to_string()))?;
-            tid.ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?
+            tid.ok_or_else(|| {
+                crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound)
+            })?
         }
     };
 
-    saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+    rust_saas::saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     Ok(())

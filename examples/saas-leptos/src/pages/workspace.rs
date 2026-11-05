@@ -4,8 +4,8 @@
 //!
 //! **Stage 3f (ADR-0002 rev.2):** `create_document` resolves the tenant
 //! that owns the workspace (via `SELECT tenant_id FROM workspaces WHERE
-//! id = $1`) and calls `saas::platform::resolve_active_tenant` before
-//! delegating to `saas::workspace::create_document`. A non-member or a
+//! id = $1`) and calls `rust_saas::saas::platform::resolve_active_tenant` before
+//! delegating to `rust_saas::saas::workspace::create_document`. A non-member or a
 //! member of a suspended tenant gets HTTP 403 (`Forbidden` /
 //! `TenantSuspended`). Reads (`list_documents`, `get_document`,
 //! `list_my_workspaces`) do **not** resolve — see the module doc on
@@ -40,7 +40,7 @@ pub async fn list_my_workspaces() -> Result<Vec<domain::Workspace>, ServerFnErro
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::workspace::list_memberships(&state.saas, &user)
+    rust_saas::saas::workspace::list_memberships(&state.saas, &user)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -59,7 +59,7 @@ pub async fn create_document(workspace_id: Uuid, title: String) -> Result<Docume
 
     let _tenant_id = resolve_ws_tenant(&state, &user, workspace_id).await?;
 
-    saas::workspace::create_document(&state.saas, &user, workspace_id, title)
+    rust_saas::saas::workspace::create_document(&state.saas, &user, workspace_id, title)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -73,7 +73,7 @@ pub async fn list_documents(workspace_id: Uuid) -> Result<Vec<Document>, ServerF
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::workspace::list_documents(&state.saas, &user, workspace_id)
+    rust_saas::saas::workspace::list_documents(&state.saas, &user, workspace_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -90,7 +90,7 @@ pub async fn get_document(
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::workspace::get_document(&state.saas, &user, workspace_id, document_id)
+    rust_saas::saas::workspace::get_document(&state.saas, &user, workspace_id, document_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -99,13 +99,13 @@ pub async fn get_document(
 /// for `user` (Stage 3f).
 ///
 /// Two steps: (1) `SELECT tenant_id FROM workspaces WHERE id = $1`
-/// (`NotFound` if the workspace is gone); (2) `saas::platform::resolve_active_tenant`
+/// (`NotFound` if the workspace is gone); (2) `rust_saas::saas::platform::resolve_active_tenant`
 /// (membership + `status = 'active'`). Returns the tenant id — the caller
 /// does not need it today, but keeping the return value makes the helper
 /// usable from other mutations that must pass `tenant_id` downstream.
 ///
 /// `#[cfg(feature = "ssr")]` — the helper reads `AppState.saas` and calls
-/// into `saas::platform::*`; both are SSR-only. It is called from
+/// into `rust_saas::saas::platform::*`; both are SSR-only. It is called from
 /// `#[server]`-functions, which are also SSR-only at runtime.
 #[cfg(feature = "ssr")]
 async fn resolve_ws_tenant(
@@ -120,9 +120,9 @@ async fn resolve_ws_tenant(
             .await
             .map_err(|e| ServerFnError::new(e.to_string()))?;
     let tenant_id = tenant_id
-        .ok_or_else(|| crate::error::core_error_to_server_fn(saas::CoreError::NotFound))?;
+        .ok_or_else(|| crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound))?;
 
-    let active = saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
+    let active = rust_saas::saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     Ok(active.id)

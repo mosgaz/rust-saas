@@ -27,7 +27,7 @@
 //!   only surfaced through `rate_limited_error(...)` → 429.
 //!
 //! Stage 3f: `CoreError::TenantSuspended` (ADR-0002 rev.2; returned by
-//! `saas::platform::resolve_active_tenant` and the invitation services when
+//! `rust_saas::saas::platform::resolve_active_tenant` and the invitation services when
 //! the tenant's `status != 'active'`) maps to 403. The message
 //! (`"tenant is suspended"`) is distinct from `Forbidden` so the UI can
 //! show a dedicated banner instead of a generic permission-denied message.
@@ -40,9 +40,9 @@
 
 use leptos::prelude::*;
 
-use access::AccessError;
-use authn::AuthnError;
-use saas::CoreError;
+use rust_saas::access::AccessError;
+use rust_saas::authn::AuthnError;
+use rust_saas::saas::CoreError;
 
 fn status_for_core(e: &CoreError) -> u16 {
     match e {
@@ -54,8 +54,8 @@ fn status_for_core(e: &CoreError) -> u16 {
     }
 }
 
-fn status_for_identity_kind(e: &authn::IdentityErrorKind) -> u16 {
-    use authn::IdentityErrorKind;
+fn status_for_identity_kind(e: &rust_saas::authn::IdentityErrorKind) -> u16 {
+    use rust_saas::authn::IdentityErrorKind;
     match e {
         IdentityErrorKind::Validation(_) => 400,
         IdentityErrorKind::NotFound => 404,
@@ -97,19 +97,19 @@ fn set_status(status: u16) {
     response.set_status(code);
 }
 
-/// Maps `saas::CoreError` into `ServerFnError` with the corresponding HTTP code.
+/// Maps `rust_saas::saas::CoreError` into `ServerFnError` with the corresponding HTTP code.
 pub fn core_error_to_server_fn(e: CoreError) -> ServerFnError {
     set_status(status_for_core(&e));
     ServerFnError::new(e.to_string())
 }
 
-/// Maps `authn::AuthnError` into `ServerFnError` with the corresponding HTTP code.
+/// Maps `rust_saas::authn::AuthnError` into `ServerFnError` with the corresponding HTTP code.
 pub fn authn_error_to_server_fn(e: AuthnError) -> ServerFnError {
     set_status(status_for_authn(&e));
     ServerFnError::new(e.to_string())
 }
 
-/// Maps `access::AccessError` into `ServerFnError` with the corresponding HTTP code.
+/// Maps `rust_saas::access::AccessError` into `ServerFnError` with the corresponding HTTP code.
 pub fn access_error_to_server_fn(e: AccessError) -> ServerFnError {
     set_status(status_for_access(&e));
     ServerFnError::new(e.to_string())

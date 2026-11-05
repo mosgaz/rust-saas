@@ -1,7 +1,7 @@
 //! Platform administration pages.
 //!
 //! `PlatformTenantListPage` (route `/platform`) — create a tenant (as its
-//! owner via `saas::platform::provision_tenant`), list every tenant on the
+//! owner via `rust_saas::saas::platform::provision_tenant`), list every tenant on the
 //! platform, and suspend or activate each. `PlatformAuditListPage`
 //! (route `/platform/audit`) — read-only view of the most recent audit
 //! rows.
@@ -15,35 +15,35 @@
 //!
 //! **`create_tenant` vs `provision_tenant`.** The `#[server]` keeps the
 //! name `create_tenant` (URL/contract unchanged from Stage 1.1) but
-//! delegates to `saas::platform::provision_tenant` with `actor == owner`:
+//! delegates to `rust_saas::saas::platform::provision_tenant` with `actor == owner`:
 //! the UI scenario "created → became owner" is preserved through an
-//! explicit call. `saas::platform::create_tenant` (container-only) remains
+//! explicit call. `rust_saas::saas::platform::create_tenant` (container-only) remains
 //! available to library consumers who do not want an implicit owner.
 //!
 //! **`list_tenants` / `suspend_tenant` / `activate_tenant`** delegate to
-//! `saas::platform::*` (Stage 3f). They require `(tenant, list)` /
+//! `rust_saas::saas::platform::*` (Stage 3f). They require `(tenant, list)` /
 //! `(tenant, manage)` in `PLATFORM_DOMAIN`; a non-platform-admin gets
 //! HTTP 403 (`CoreError::Forbidden`).
 //!
 //! **`list_audit`** is the only `#[server]` that does not have a
-//! `saas::*` wrapper: the `AuditLogger` trait is a single-method write
+//! `rust_saas::saas::*` wrapper: the `AuditLogger` trait is a single-method write
 //! interface (by design — see `crates/audit/src/lib.rs`), and `list` is a
 //! `PgAuditLogger`-specific read helper (Stage 3f). The permission check
 //! `(audit, read)` in `PLATFORM_DOMAIN` is performed in the `#[server]`
-//! via `saas::access::my_permissions` (the same read-only UX helper the
-//! UI uses for button gating); `saas::access::my_permissions` is itself a
+//! via `rust_saas::saas::access::my_permissions` (the same read-only UX helper the
+//! UI uses for button gating); `rust_saas::saas::access::my_permissions` is itself a
 //! §5 p.5 exception, so no direct `authz.require` is called from the
 //! example. `AuditRowView` is a client-side mirror of
-//! `audit_pg::AuditRow` (which is SSR-only, like `access::Role` /
+//! `rust_saas::audit_pg::AuditRow` (which is SSR-only, like `rust_saas::access::Role` /
 //! `RoleView`).
 //!
 //! **Hydrate-safety.** Client-side code (`#[component]` bodies) must not
 //! reference `crate::state::AppState`, `crate::extract::CurrentUser`, or
-//! `saas::*` directly — those modules are gated behind `#[cfg(feature =
+//! `rust_saas::saas::*` directly — those modules are gated behind `#[cfg(feature =
 //! "ssr")]`. The `PlatformTenantListPage` effect therefore obtains
 //! effective permissions by calling the existing
 //! [`crate::pages::member::my_permissions`] `#[server]` function (which
-//! resolves the actor and calls `saas::access::my_permissions` server-side).
+//! resolves the actor and calls `rust_saas::saas::access::my_permissions` server-side).
 
 use domain::{Tenant, TenantStatus};
 use leptos::prelude::*;
@@ -55,12 +55,12 @@ use crate::perms_cache::PermsCache;
 
 // ─── Client-side DTO for audit rows ────────────────────────────────────────
 
-/// Client-side mirror of `audit_pg::AuditRow`.
+/// Client-side mirror of `rust_saas::audit_pg::AuditRow`.
 ///
 /// `audit_pg` is SSR-only (`sqlx` dependency), so the return type of
 /// `list_audit` cannot reference it directly in a component compiled for
 /// `hydrate`. Same pattern as `RoleView` (`pages/role.rs`):
-/// `From<audit_pg::AuditRow>` is implemented under `ssr` only, and the
+/// `From<rust_saas::audit_pg::AuditRow>` is implemented under `ssr` only, and the
 /// server function converts on its way out.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuditRowView {
@@ -75,8 +75,8 @@ pub struct AuditRowView {
 }
 
 #[cfg(feature = "ssr")]
-impl From<audit_pg::AuditRow> for AuditRowView {
-    fn from(r: audit_pg::AuditRow) -> Self {
+impl From<rust_saas::audit_pg::AuditRow> for AuditRowView {
+    fn from(r: rust_saas::audit_pg::AuditRow) -> Self {
         AuditRowView {
             id: r.id,
             occurred_at: r.occurred_at,
@@ -94,7 +94,7 @@ impl From<audit_pg::AuditRow> for AuditRowView {
 
 /// Creates a tenant and assigns the current user as its owner.
 ///
-/// Delegates to `saas::platform::provision_tenant` with
+/// Delegates to `rust_saas::saas::platform::provision_tenant` with
 /// `RoleKey::parse("owner")`. Name kept as `create_tenant` for the Leptos
 /// endpoint (URL/contract unchanged from Stage 1.1).
 #[server]
@@ -105,9 +105,9 @@ pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
         .await?
         .require()?;
     let owner_key =
-        access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
+        rust_saas::access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let tenant = saas::platform::provision_tenant(&state.saas, &user, name, &user, &owner_key)
+    let tenant = rust_saas::saas::platform::provision_tenant(&state.saas, &user, name, &user, &owner_key)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
 
@@ -122,7 +122,7 @@ pub async fn list_tenants(limit: i64, offset: i64) -> Result<domain::Page<Tenant
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::platform::list_tenants_paged(&state.saas, &user, limit, offset)
+    rust_saas::saas::platform::list_tenants_paged(&state.saas, &user, limit, offset)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -136,7 +136,7 @@ pub async fn suspend_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::platform::suspend_tenant(&state.saas, &user, tenant_id)
+    rust_saas::saas::platform::suspend_tenant(&state.saas, &user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -150,7 +150,7 @@ pub async fn activate_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    saas::platform::activate_tenant(&state.saas, &user, tenant_id)
+    rust_saas::saas::platform::activate_tenant(&state.saas, &user, tenant_id)
         .await
         .map_err(crate::error::core_error_to_server_fn)
 }
@@ -158,7 +158,7 @@ pub async fn activate_tenant(tenant_id: Uuid) -> Result<Tenant, ServerFnError> {
 /// Lists the most recent audit rows, newest first.
 ///
 /// Permission `(audit, read)` in `PLATFORM_DOMAIN` is enforced via
-/// `saas::access::my_permissions` — a read-only UX helper (also used by
+/// `rust_saas::saas::access::my_permissions` — a read-only UX helper (also used by
 /// the UI to gate navigation links). No direct `authz.require`: the
 /// example never calls `authz.require` (handoff §4). `limit` is clamped to
 /// `[1, 200]`; the audit table is append-only and unbounded in Stage 3f,
@@ -174,16 +174,16 @@ pub async fn list_audit(
         .await?
         .require()?;
 
-    let perms = saas::access::my_permissions(&state.saas, &user, domain::PLATFORM_DOMAIN)
+    let perms = rust_saas::saas::access::my_permissions(&state.saas, &user, domain::PLATFORM_DOMAIN)
         .await
         .map_err(crate::error::core_error_to_server_fn)?;
     if !perms.iter().any(|(r, a)| r == "audit" && a == "read") {
         return Err(crate::error::core_error_to_server_fn(
-            saas::CoreError::Forbidden,
+            rust_saas::saas::CoreError::Forbidden,
         ));
     }
 
-    let logger = audit_pg::PgAuditLogger::from_pool(state.saas.pool().clone());
+    let logger = rust_saas::audit_pg::PgAuditLogger::from_pool(state.saas.pool().clone());
     let page = logger
         .list_paged(limit, offset)
         .await
@@ -232,7 +232,7 @@ pub fn PlatformTenantListPage() -> impl IntoView {
 
             // Effective permissions for UI gating. `my_permissions` is the
             // existing `#[server]` from `pages/member.rs`; it resolves the
-            // actor and calls `saas::access::my_permissions` server-side
+            // actor and calls `rust_saas::saas::access::my_permissions` server-side
             // (SSR-only modules never leak into this hydrate-compiled
             // component). Read through `PermsCache` for consistency with
             // the member/role pages (Stage 3h).

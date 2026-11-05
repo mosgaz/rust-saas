@@ -13,17 +13,17 @@
 use std::sync::Arc;
 
 #[cfg(feature = "ssr")]
-use audit::AuditLogger;
+use rust_saas::audit::AuditLogger;
 #[cfg(feature = "ssr")]
-use audit_pg::PgAuditLogger;
+use rust_saas::audit_pg::PgAuditLogger;
 #[cfg(feature = "ssr")]
-use authz::AuthorizationEngine;
+use rust_saas::authz::AuthorizationEngine;
 #[cfg(feature = "ssr")]
 use leptos::config::get_configuration;
 #[cfg(feature = "ssr")]
 use metrics_exporter_prometheus::PrometheusBuilder;
 #[cfg(feature = "ssr")]
-use rate_limiter::RateLimiter;
+use rust_saas::rate_limiter::RateLimiter;
 
 #[cfg(feature = "ssr")]
 #[tokio::main]
@@ -67,27 +67,27 @@ async fn main() -> anyhow::Result<()> {
     let access_ttl_minutes = std::env::var("ACCESS_TOKEN_TTL_MINUTES")
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(authn::DEFAULT_ACCESS_TTL_MINUTES);
+        .unwrap_or(rust_saas::authn::DEFAULT_ACCESS_TTL_MINUTES);
     let refresh_ttl_days = std::env::var("REFRESH_TOKEN_TTL_DAYS")
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(authn::DEFAULT_REFRESH_TTL_DAYS);
+        .unwrap_or(rust_saas::authn::DEFAULT_REFRESH_TTL_DAYS);
 
     let cookie_cfg = Arc::new(saas_leptos::cookie::CookieConfig::from_env(&bind_addr));
 
-    let pool = db::connect(&database_url).await?;
-    db::migrate(&pool).await?;
+    let pool = rust_saas::db::connect(&database_url).await?;
+    rust_saas::db::migrate(&pool).await?;
 
     let authz: Arc<dyn AuthorizationEngine> =
-        Arc::new(authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
+        Arc::new(rust_saas::authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
 
     let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
     let access =
-        Arc::new(access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
+        Arc::new(rust_saas::access::AccessState::new(pool.clone(), authz.clone()).with_audit(audit.clone()));
 
     let authn = Arc::new(
-        authn::Authn::with_ttl(
+        rust_saas::authn::Authn::with_ttl(
             pool.clone(),
             jwt_secret,
             chrono::Duration::minutes(access_ttl_minutes),
@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let saas = Arc::new(
-        saas::SaasBuilder::new(pool)
+        rust_saas::saas::SaasBuilder::new(pool)
             .with_authz(authz)
             .with_access(access)
             .with_audit(audit)
@@ -134,11 +134,11 @@ async fn main() -> anyhow::Result<()> {
 
     let rate_limit: Arc<dyn RateLimiter> = match std::env::var("REDIS_URL") {
         Ok(url) if !url.trim().is_empty() => Arc::new(
-            rate_limiter::RedisRateLimiter::from_url(&url)
+            rust_saas::rate_limiter::RedisRateLimiter::from_url(&url)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to connect to Redis: {e}"))?,
         ),
-        _ => Arc::new(rate_limiter::InMemoryRateLimiter::new()),
+        _ => Arc::new(rust_saas::rate_limiter::InMemoryRateLimiter::new()),
     };
 
     // Stage 4.10: install the Prometheus recorder once per process.
