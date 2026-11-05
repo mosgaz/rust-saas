@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Указываем путь к миграциям для sqlx-cli
   SQLX_MIGRATIONS_DIR: crates/db/migrations
 
 jobs:
@@ -243,4 +242,6 @@ jobs:
           NET: rust-saas_rust_saas_net
           PG_DB: rust_saas
           PG_USER: postgres
-        run: ./examples/saas-leptos/smoke.sh
+        run: |
+          chmod +x ./examples/saas-leptos/smoke.sh
+          ./examples/saas-leptos/smoke.sh
