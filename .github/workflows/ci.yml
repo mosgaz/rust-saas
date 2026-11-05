@@ -8,11 +8,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Указываем путь к миграциям для sqlx-cli
+  SQLX_MIGRATIONS_DIR: crates/db/migrations
 
 jobs:
   test:
     name: Test & Lint
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+      JWT_SECRET: test-secret
     services:
       postgres:
         image: postgres:16-alpine
@@ -34,6 +39,27 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: Cache sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-sqlx-cli-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sqlx-cli-
+
+      - name: Install sqlx-cli
+        run: |
+          if ! command -v sqlx &> /dev/null; then
+            cargo install sqlx-cli --no-default-features --features postgres
+          fi
+
+      - name: Run migrations
+        run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -41,9 +67,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
-          JWT_SECRET: test-secret
         run: cargo test --workspace
 
 
@@ -89,6 +112,8 @@ jobs:
   e2e-examples:
     name: E2E Examples
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
     services:
       postgres:
         image: postgres:16-alpine
@@ -123,21 +148,34 @@ jobs:
             examples/axum-minimal -> target
             examples/saas-leptos -> target
 
-      # Stage 4.7: in-process HTTP tests (`tower::oneshot`), one isolated
-      # DB per test via `#[sqlx::test]`. Same 6 scenarios as the plan
-      # (`Приблизительный план` §3).
+      - name: Cache sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-sqlx-cli-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sqlx-cli-
+
+      - name: Install sqlx-cli
+        run: |
+          if ! command -v sqlx &> /dev/null; then
+            cargo install sqlx-cli --no-default-features --features postgres
+          fi
+
+      - name: Run migrations
+        run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
+
       - name: E2E axum-minimal
         env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
           REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
 
-      # `saas-leptos` server modules are `#[cfg(feature = "ssr")]`; the
-      # `[[test]] name = "e2e" required-features = ["ssr"]` in Cargo.toml
-      # gates the target accordingly.
       - name: E2E saas-leptos
         env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
           REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr --test e2e
 
@@ -170,6 +208,29 @@ jobs:
           until docker exec rust-saas-postgres-core pg_isready -U postgres -d rust_saas; do
             sleep 1
           done
+
+      - name: Cache sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-sqlx-cli-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sqlx-cli-
+
+      - name: Install sqlx-cli
+        run: |
+          if ! command -v sqlx &> /dev/null; then
+            cargo install sqlx-cli --no-default-features --features postgres
+          fi
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+        run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
 
       - name: Seed database
         env:
