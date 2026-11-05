@@ -39,8 +39,6 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      # sqlx-adapter использует макросы query! для проверки SQL на этапе компиляции.
-      # Поэтому миграции должны быть применены ДО запуска Clippy и тестов.
       - name: Cache sqlx-cli
         uses: actions/cache@v4
         with:
@@ -171,17 +169,11 @@ jobs:
       - name: Run migrations
         run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
 
-      # Stage 4.7: in-process HTTP tests (`tower::oneshot`), one isolated
-      # DB per test via `#[sqlx::test]`. Same 6 scenarios as the plan
-      # (`Приблизительный план` §3).
       - name: E2E axum-minimal
         env:
           REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
 
-      # `saas-leptos` server modules are `#[cfg(feature = "ssr")]`; the
-      # `[[test]] name = "e2e" required-features = ["ssr"]` in Cargo.toml
-      # gates the target accordingly.
       - name: E2E saas-leptos
         env:
           REDIS_URL: redis://localhost:6379
@@ -216,6 +208,29 @@ jobs:
           until docker exec rust-saas-postgres-core pg_isready -U postgres -d rust_saas; do
             sleep 1
           done
+
+      - name: Cache sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-sqlx-cli-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sqlx-cli-
+
+      - name: Install sqlx-cli
+        run: |
+          if ! command -v sqlx &> /dev/null; then
+            cargo install sqlx-cli --no-default-features --features postgres
+          fi
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+        run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
 
       - name: Seed database
         env:
