@@ -50,6 +50,9 @@ RUN ARCH=$(uname -m) \
       *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
     esac \
  && curl -fsSL \
+      --retry 5 \
+      --retry-delay 5 \
+      --retry-connrefused \
       "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${BIN_ARCH}-linux.tar.gz" \
       -o /tmp/binaryen.tar.gz \
  && tar -xzf /tmp/binaryen.tar.gz -C /opt \
