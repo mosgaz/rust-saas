@@ -81,6 +81,15 @@ async fn main() -> anyhow::Result<()> {
     let authz: Arc<dyn AuthorizationEngine> =
         Arc::new(rust_saas::authz_casbin::CasbinAuthz::from_pool(pool.clone()).await?);
 
+    // A7'.2: Bootstrap resource types (core + custom LMS types).
+    // Idempotent — safe on every startup.
+    rust_saas::access::registry::bootstrap_all_core(&pool, &authz).await?;
+    rust_saas::access::registry::bootstrap_resource_types(&pool, &authz, &[
+        rust_saas::access::ResourceType::workspace("course", &["read", "write", "publish"]),
+        rust_saas::access::ResourceType::workspace("assignment", &["read", "grade"]),
+        rust_saas::access::ResourceType::tenant("batch", &["read", "manage"]),
+    ]).await?;
+
     let audit: Arc<dyn AuditLogger> = Arc::new(PgAuditLogger::from_pool(pool.clone()));
 
     let access =

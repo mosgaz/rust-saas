@@ -9,6 +9,11 @@
 //! Stage 3h: `PlatformTenantListPage` reads `my_permissions("platform")`
 //! through `PermsCache` (TTL 30s) for consistency with other pages.
 //!
+//! **Stage 5.0-A7'.2:** Added "Resource Types" section to
+//! `PlatformTenantListPage`. Uses `rust_saas::access::registry::*` for
+//! runtime registration (via `#[server] register_resource`) and lists
+//! existing types.
+//!
 //! **Naming.** The component is `PlatformTenantListPage`, not
 //! `PlatformPage` (Stage 3f). The route stays `/platform`; the second page
 //! lives at `/platform/audit`.
@@ -53,7 +58,7 @@ use uuid::Uuid;
 
 use crate::perms_cache::PermsCache;
 
-// ─── Client-side DTO for audit rows ────────────────────────────────────────
+// ─── Client-side DTOs ──────────────────────────────────────────────────────
 
 /// Client-side mirror of `rust_saas::audit_pg::AuditRow`.
 ///
@@ -88,6 +93,15 @@ impl From<rust_saas::audit_pg::AuditRow> for AuditRowView {
             metadata: r.metadata,
         }
     }
+}
+
+/// Client-side mirror of `rust_saas::access::ResourceType` (SSR-only).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResourceTypeView {
+    pub name: String,
+    pub scope: String,
+    pub default_actions: Vec<String>,
+    pub description: String,
 }
 
 // ─── Server functions ──────────────────────────────────────────────────────
@@ -197,10 +211,64 @@ pub async fn list_audit(
     })
 }
 
-// ─── `/platform` — tenant list ──────────────────────────────────────────────
+/// Lists all declared resource types.
+#[server]
+pub async fn list_resource_types() -> Result<Vec<ResourceTypeView>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let rows = rust_saas::access::registry::list_resource_types(state.saas.pool())
+        .await
+        .map_err(crate::error::access_error_to_server_fn)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ResourceTypeView {
+            name: r.name,
+            scope: r.scope.as_str().to_string(),
+            default_actions: r.default_actions,
+            description: r.description,
+        })
+        .collect())
+}
+
+/// Registers a new resource type.
+#[server]
+pub async fn register_resource(
+    name: String,
+    scope: String,
+    actions_str: String,
+) -> Result<(), ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+    let access = state
+        .saas
+        .access()
+        .map_err(crate::error::core_error_to_server_fn)?;
+
+    let actions: Vec<String> = actions_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let actions_ref: Vec<&str> = actions.iter().map(|s| s.as_str()).collect();
+
+    let rt = match scope.as_str() {
+        "platform" => rust_saas::access::ResourceType::platform(&name, &actions_ref),
+        "tenant" => rust_saas::access::ResourceType::tenant(&name, &actions_ref),
+        "workspace" => rust_saas::access::ResourceType::workspace(&name, &actions_ref),
+        _ => return Err(ServerFnError::new("invalid scope")),
+    };
+
+    rust_saas::access::registry::register_resource_type(access, &user, &rt)
+        .await
+        .map_err(crate::error::access_error_to_server_fn)?;
+    Ok(())
+}
+
+// ─── `/platform` — tenant list + resource types ────────────────────────────
 
 /// `/platform` — create a tenant (as its owner) and manage the platform
-/// tenant list (suspend / activate).
+/// tenant list (suspend / activate). Also exposes resource type registration.
 #[component]
 pub fn PlatformTenantListPage() -> impl IntoView {
     let page = RwSignal::new(None::<domain::Page<Tenant>>);
@@ -213,13 +281,17 @@ pub fn PlatformTenantListPage() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let cache = use_context::<PermsCache>().expect("PermsCache in context");
 
+    // Resource types state
+    let rt_name = RwSignal::new(String::new());
+    let rt_scope = RwSignal::new("workspace".to_string());
+    let rt_actions = RwSignal::new(String::new());
+    let rt_list = RwSignal::new(Vec::<ResourceTypeView>::new());
+    let rt_error = RwSignal::new(None::<String>);
+
     Effect::new(move |_| {
         let _ = refresh.get();
         let lim = limit.get();
         let off = offset.get();
-        // `PermsCache` is `Clone` but not `Copy`. Clone per invocation so
-        // `Effect::new`'s `move |_|` remains `FnMut`: the async block below
-        // consumes the clone, not the captured `cache`.
         let cache = cache.clone();
         spawn_local(async move {
             match list_tenants(lim, off).await {
@@ -230,12 +302,6 @@ pub fn PlatformTenantListPage() -> impl IntoView {
                 Err(e) => error.set(Some(e.to_string())),
             }
 
-            // Effective permissions for UI gating. `my_permissions` is the
-            // existing `#[server]` from `pages/member.rs`; it resolves the
-            // actor and calls `rust_saas::saas::access::my_permissions` server-side
-            // (SSR-only modules never leak into this hydrate-compiled
-            // component). Read through `PermsCache` for consistency with
-            // the member/role pages (Stage 3h).
             let perms_vec = cache
                 .get_or_fetch(domain::PLATFORM_DOMAIN.to_string(), |d| async move {
                     crate::pages::member::my_permissions(d)
@@ -244,11 +310,18 @@ pub fn PlatformTenantListPage() -> impl IntoView {
                 })
                 .await;
             perms.set(perms_vec.into_iter().collect());
+
+            match list_resource_types().await {
+                Ok(list) => rt_list.set(list),
+                Err(e) => rt_error.set(Some(e.to_string())),
+            }
         });
     });
 
     let can_manage =
         move || perms.with(|p| p.contains(&("tenant".to_string(), "manage".to_string())));
+    let can_manage_resources =
+        move || perms.with(|p| p.contains(&("resource".to_string(), "manage".to_string())));
 
     let submit = move |_| {
         spawn_local(async move {
@@ -260,6 +333,20 @@ pub fn PlatformTenantListPage() -> impl IntoView {
                     refresh.update(|n| *n += 1);
                 }
                 Err(e) => error.set(Some(e.to_string())),
+            }
+        });
+    };
+
+    let submit_rt = move |_| {
+        spawn_local(async move {
+            match register_resource(rt_name.get(), rt_scope.get(), rt_actions.get()).await {
+                Ok(()) => {
+                    rt_name.set(String::new());
+                    rt_actions.set(String::new());
+                    rt_error.set(None);
+                    refresh.update(|n| *n += 1);
+                }
+                Err(e) => rt_error.set(Some(e.to_string())),
             }
         });
     };
@@ -405,6 +492,47 @@ pub fn PlatformTenantListPage() -> impl IntoView {
                     }
                 }}
             </div>
+
+            // ─── Resource Types section ──────────────────────────────────────
+            {move || can_manage_resources().then(|| view! {
+                <div class="card mt-8 border border-blue-900">
+                    <h2 class="text-xl font-semibold">"Resource Types"</h2>
+                    <p class="mt-1 text-sm text-neutral-400">
+                        "Register custom resource types at runtime."
+                    </p>
+
+                    <div class="mt-4 space-y-2">
+                        <input class="input" placeholder="Name (e.g., course)" bind:value=rt_name />
+                        <select class="input" bind:value=rt_scope>
+                            <option value="platform">"platform"</option>
+                            <option value="tenant">"tenant"</option>
+                            <option value="workspace">"workspace"</option>
+                        </select>
+                        <input class="input" placeholder="Actions (comma separated, e.g., read, write)" bind:value=rt_actions />
+                        <button class="btn" on:click=submit_rt>"Register Resource Type"</button>
+                    </div>
+                    {move || rt_error.get().map(|e| view! { <p class="mt-2 text-red-400">{e}</p> })}
+
+                    <div class="mt-6">
+                        <h3 class="text-lg font-semibold">"Registered Types"</h3>
+                        <ul class="mt-2 divide-y divide-neutral-800">
+                            {move || {
+                                let list = rt_list.get();
+                                if list.is_empty() {
+                                    view! { <li class="py-2 text-neutral-500">"None."</li> }.into_any()
+                                } else {
+                                    list.into_iter().map(|rt| view! {
+                                        <li class="py-2">
+                                            <p class="font-medium">{rt.name} <span class="text-xs text-neutral-500">"({rt.scope})"</span></p>
+                                            <p class="text-sm text-neutral-400">"Actions: " {rt.default_actions.join(", ")}</p>
+                                        </li>
+                                    }).collect_view().into_any()
+                                }
+                            }}
+                        </ul>
+                    </div>
+                </div>
+            })}
         </main>
     }
 }
