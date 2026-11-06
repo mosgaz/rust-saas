@@ -1,10 +1,10 @@
-# Rust SAAS
+# Rust SaaS
 
 **rust-saas** is a Rust library and reference application for building multi-tenant SaaS.
 
 The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, and authorization from each other, so they can be reused in other applications through git dependencies. Three reference consumers live under `examples/`:
 
-- `examples/saas-leptos` — Leptos SSR + Axum + `#[server]` (starter template; A7'.1 — single-dep (`rust-saas` + `domain` hydrate-only)).
+- `examples/saas-leptos` — Leptos SSR + Axum + `#[server]` (starter template; A7'.2 — single-dep + startup `bootstrap_*` + admin UI for `resource_types`).
 - `examples/axum-minimal` — pure Axum, no Leptos (Stage 3g portability proof; **Stage 5.0-A6 — fork-free consumer on `saas-axum`**, one library dependency, 278 LOC src, 14 E2E).
 - `examples/minimal-lms` — **fork-free Axum consumer on `saas-axum`** (Stage 5.0-A5; DoD-артефакт Phase A, Axum path).
 
@@ -51,6 +51,7 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **`saas-axum` HTTP adapter** (Stage 5.0-A4, B5/B6/B7 closed): internal crate, consumer-facing via `rust-saas = { features = ["axum"] }`. **Four entry-points**: `build_app` (public-only), `build_app_with_protected(state, protected)`, `build_app_full(state)` (public + standard endpoints `/auth/*`, `/my_permissions*`, `/resource_types`), **`build_app_full_with(state, extra_protected)`** (Stage 5.0-A4.6 — public + standard + custom, all under `csrf_guard → auto_refresh → auth_layer`). `RouteBinding`/`BindingScope`/`RouteBindings`/`PathPermissions` for declarative path-level gating; fail-fast validation in `build()`.
 - **`examples/minimal-lms`** (Stage 5.0-A5): fork-free Axum consumer — 8 files, ~290 LOC without comments, 3 E2E. Uses only `rust-saas = { features = ["axum"] }` from workspace. **All 10 pluggability blockers (B1–B10) closed.**
 - **`examples/axum-minimal`** (Stage 5.0-A6): refactored onto `saas-axum` — **3 files, 278 LOC src** (was ~2000), **1 library dependency** `rust-saas = { features = ["axum"] }`, **14/14 E2E green**, `fmt --check` + `clippy -D warnings` clean. Structural refactor; behavioral contract (status codes, JSON shape, cookie flow, error bodies) preserved.
+- **`examples/saas-leptos` starter template** (Stage 5.0-A7'.1 + A7'.2): **1 workspace dep** (`rust-saas` + `domain` hydrate-only). A7'.2 adds **startup `bootstrap_*`** in `main.rs` (`bootstrap_all_core` + `bootstrap_resource_types` with 3 LMS types: `course`/`assignment`/`batch`) and **admin UI** on `/platform` (`#[server] list_resource_types` + `#[server] register_resource` + form + list). **18/18 E2E green** (was 15 — A7'.2 added 3). Full `resource_types` lifecycle: startup registration + runtime registration.
 
 ## Architecture
 
@@ -65,7 +66,7 @@ crates/                  (library — the Cargo workspace)
 ├── authz/              AuthorizationEngine trait
 │                       (can / require / grant_role / revoke_role / has_role /
 │                        count_users_with_role / purge_role / reload_in_memory) + AuthzError;
-│                       test_support (AllowAllAuthz / DenyAllAuthz) под feature `test-support`
+│                       test_support (AllowAllAuthz / DenyAllAuthz) — под feature `test-support`
 ├── authz-casbin/       CasbinAuthz: canonical trait implementation
 ├── audit/              AuditLogger trait, AuditEvent DTO, NoopAuditLogger, 21 event constants
 ├── audit-pg/           PgAuditLogger: PostgreSQL implementation (audit_log table) + MIGRATOR
@@ -106,6 +107,8 @@ examples/                (reference consumers — outside the workspace)
 │                       + PgAuditLogger wired through Authn / AccessState / SaasBuilder
 │                       + client route guards (Stage 3f + follow-up; SSR-correct Stage 4.9)
 │                       + AuthLayer (Stage 4.9)
+│                       + resource_types lifecycle (A7'.2: bootstrap_* in main.rs
+│                         + #[server] register_resource / list_resource_types + UI)
 ├── axum-minimal/       Stage 3g + Stage 5.0-A6: pure Axum, no Leptos — fork-free
 │                       consumer on saas-axum (3 files, 278 LOC src, 14 E2E,
 │                       1 library dep)
@@ -365,12 +368,14 @@ cargo leptos watch
 
 Open `http://127.0.0.1:3395`. Reload port: `3396`.
 
+On startup, `main.rs` calls `bootstrap_all_core` + `bootstrap_resource_types` (A7'.2) — so 3 custom LMS types (`course`, `assignment`, `batch`) are registered automatically.
+
 Then in the browser:
 
 1. `/register` — create account.
 2. Verification link from Mailpit → `/verify/:token`. Idempotent.
 3. `/login` with demo account.
-4. `/platform` — create/suspend tenants.
+4. `/platform` — create/suspend tenants. **A7'.2: also lists + registers `resource_types` (form + list).**
 5. `/platform/audit` — audit rows (as platform admin).
 6. `/tenants/<id>` — create workspace.
 7. `/tenants/<id>/members` — assign/remove roles.
@@ -520,13 +525,21 @@ clear && cargo test && cargo check && cargo check -p seed \
   && cargo check --manifest-path examples/minimal-lms/Cargo.toml
 ```
 
+E2E for the three consumers:
+
+```bash
+cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
+cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr --test e2e
+cargo test --manifest-path examples/minimal-lms/Cargo.toml --test e2e
+```
+
 ### Running tests
 
 ```bash
 cargo test
 ```
 
-**254 workspace tests + 32 E2E, all green.** (14 `axum-minimal` + 15 `saas-leptos` + 3 `minimal-lms`.)
+**254 workspace tests + 35 E2E, all green.** (14 `axum-minimal` + 18 `saas-leptos` (A7'.2 added 3) + 3 `minimal-lms`.)
 
 Unit tests live inline (`#[cfg(test)] mod tests`) in `authn`, `access`, `saas`, `audit`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
@@ -714,7 +727,7 @@ Standalone binary. Bootstrap data + demo accounts (all email-verified). Wires re
 
 ### examples/saas-leptos
 
-Reference consumer (single-dep since A7'.1: `rust-saas = { features = ["ssr", "rate-limiter-redis"] }` + `domain` hydrate-only). `main.rs` builds real `PgAuditLogger` + passes to `AccessState::with_audit`, `Authn::with_audit`, `SaasBuilder::with_audit`. `GuardRoute` on `Resource`/`Suspense` (Stage 4.9). `auth_layer.rs` (Stage 4.9). `error.rs` maps errors to 400/401/403/404/409/429/500 (including `TenantSuspended` → 403 distinct message).
+Reference consumer (single-dep since A7'.1: `rust-saas = { features = ["ssr", "rate-limiter-redis"] }` + `domain` hydrate-only). `main.rs` builds real `PgAuditLogger` + passes to `AccessState::with_audit`, `Authn::with_audit`, `SaasBuilder::with_audit`. **A7'.2: `main.rs` also calls `bootstrap_all_core` + `bootstrap_resource_types` (3 LMS types) at startup; `pages/platform.rs` has a "Resource Types" UI section (form + list) backed by `#[server] list_resource_types` / `register_resource`.** `GuardRoute` on `Resource`/`Suspense` (Stage 4.9). `auth_layer.rs` (Stage 4.9). `error.rs` maps errors to 400/401/403/404/409/429/500 (including `TenantSuspended` → 403 distinct message).
 
 ### examples/axum-minimal (Stage 3g, refactored Stage 5.0-A6)
 
@@ -773,6 +786,7 @@ Deviations from `saas-23.md §3` documented in A8 §5.7(i): 8 deps (not 5), 4 ha
 - **Audit events constants in `audit::events`.** Adding a new event is a source change (no migration); per-event `metadata` free-form JSONB. `event_type` is `text` (not enum) — extensible without migration.
 - **`resource_types` declared, not enforced.** `scope` is a hint. Enforcement in `casbin_rule.p.v1`. Runtime registration via `access::registry`; `reload_in_memory()` refreshes current process.
 - **`build_app_full_with` is the fork-free entry-point.** Consumer-supplied protected routes get the same `csrf_guard → auto_refresh → auth_layer` chain as the standard endpoints. `.route(...)` on `build_app_full(state)`'s return value does **not** accept handlers with `State<Arc<AxumAppState>>` (structure: `Router<()>` after `.with_state(state)`).
+- **`bootstrap_*` in `main.rs` is the recommended startup pattern.** `examples/saas-leptos` (A7'.2) and `examples/minimal-lms` (A5) both call it after `CasbinAuthz::from_pool`, before `SaasBuilder`. Idempotent; safe on every start. `register_resource_type` (runtime, permission-checked) is the admin-UI variant.
 
 ## Roadmap
 
@@ -807,8 +821,8 @@ Deviations from `saas-23.md §3` documented in A8 §5.7(i): 8 deps (not 5), 4 ha
 - **A5 (done, PR #36):** `examples/minimal-lms` — DoD-артефакт Phase A (Axum path). **All 10 pluggability blockers (B1–B10) closed.**
 - **A6 (done):** `examples/axum-minimal` → `saas-axum` — 278 LOC src (was ~2000), 3 files in `src/`, 1 library dependency `rust-saas = { features = ["axum"] }`, 14/14 E2E green, `fmt --check` + `clippy -D warnings` clean.
 - **A7'.1 (done):** `saas-leptos` single-dep — `Cargo.toml` (one workspace dep `rust-saas = { features = ["ssr", "rate-limiter-redis"] }`) + `domain` hydrate-only; `README.md` "starter template"; 15/15 E2E; `fmt --check` + `clippy -D warnings` clean.
-- **A7'.2 (next):** `bootstrap_*` in `main.rs` (5+ lines) + `#[server] register_resource` in `pages/platform.rs` + form.
-- **A8:** docs (`saas-external-02.md`, `ADR-0008`, `ADR-0009`, `CHANGELOG`, `README`, Appendix B) + CI jobs for both examples (`minimal-lms` + `axum-minimal`).
+- **A7'.2 (done, this stage):** `saas-leptos` starter template — `bootstrap_all_core` + `bootstrap_resource_types` in `main.rs`; `#[server] list_resource_types` / `register_resource` + UI form on `/platform`; **18/18 E2E** (was 15 — +3 bootstrap/register tests); `fmt --check` + `clippy -D warnings` clean. Consumer-only; 0 lines changed in `crates/*`.
+- **A8 (next):** docs (`saas-external-02.md`, `ADR-0008`, `ADR-0009`, `CHANGELOG`, `README`, Appendix B) + CI jobs for both examples (`minimal-lms` + `axum-minimal`).
 - **A9:** DoD Phase A, tag `v0.3.0`.
 - **Stage 5.1+ (open):** ABAC/ReBAC (Phase B); OIDC + TOTP + WebAuthn (Phase C); RLS + cleanup TTL + escape hatch + polish (Phase D).
 
@@ -862,7 +876,7 @@ Explicitly **out of scope** for this reference:
 
 ## Compatibility
 
-All `crates/*` share **one version** (`[workspace.package] version = "0.3.0"` (unreleased)). Consumers must pin every path / git dependency to the same revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change log (`0.3.0` — 5 breaking items from A2.2 + `reload_in_memory` from A1.4 + `migrate_with` deprecated; `axum` feature and `build_app_full_with` are additive; A6 and A7'.1 are consumer-only refactors with no library API change).
+All `crates/*` share **one version** (`[workspace.package] version = "0.3.0"` (unreleased)). Consumers must pin every path / git dependency to the same revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change log (`0.3.0` — 5 breaking items from A2.2 + `reload_in_memory` from A1.4 + `migrate_with` deprecated; `axum` feature and `build_app_full_with` are additive; A6, A7'.1, A7'.2 are consumer-only refactors with no library API change).
 
 ## License
 

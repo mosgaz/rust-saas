@@ -31,6 +31,9 @@
 //! 5. Audit access — `(audit, read)` via `my_permissions`.
 //! 6. Rate limiting — 4th `try_acquire` → `Err`.
 //! 7. CSRF — `same_origin_guard` 403 on Origin mismatch.
+//!
+//! **Stage 5.0-A7'.2:** Added `bootstrap_*` to `setup_app` (mirrors
+//! `main.rs`), and 3 E2E tests for `register_resource_type`.
 
 #![allow(dead_code)]
 
@@ -47,6 +50,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use rust_saas::access::registry::{bootstrap_all_core, bootstrap_resource_types};
+use rust_saas::access::{AccessError, ResourceType};
 use rust_saas::rate_limiter::RateLimiter;
 use saas_leptos::build_app;
 use saas_leptos::cookie::CookieConfig;
@@ -89,6 +94,25 @@ async fn setup_app(pool: PgPool) -> (Router, AppState) {
             .await
             .expect("casbin init"),
     );
+
+    // A7'.2: mirror `main.rs` — bootstrap core + custom resource types.
+    // Idempotent; on a fresh migrated DB: 8 core from migration,
+    // `bootstrap_all_core` is a no-op, `bootstrap_resource_types` adds 3.
+    bootstrap_all_core(&pool, &authz)
+        .await
+        .expect("bootstrap_all_core");
+    bootstrap_resource_types(
+        &pool,
+        &authz,
+        &[
+            ResourceType::workspace("course", &["read", "write", "publish"]),
+            ResourceType::workspace("assignment", &["read", "grade"]),
+            ResourceType::tenant("batch", &["read", "manage"]),
+        ],
+    )
+    .await
+    .expect("bootstrap_resource_types");
+
     let audit: Arc<dyn rust_saas::audit::AuditLogger> =
         Arc::new(rust_saas::audit_pg::PgAuditLogger::from_pool(pool.clone()));
     let access = Arc::new(
@@ -617,8 +641,6 @@ async fn pagination_via_state(pool: PgPool) {
     assert_eq!(audit_page.items.len(), 1);
 }
 
-// ─── Stage 4.9: AuthLayer ──────────────────────────────────────────────────
-
 // ─── Stage 4.10: /readyz + /metrics ────────────────────────────────────
 
 #[sqlx::test(migrations = "../../crates/db/migrations")]
@@ -671,4 +693,113 @@ async fn metrics_returns_prometheus_format(pool: PgPool) {
         body.contains("# TYPE"),
         "expected Prometheus exposition format"
     );
+}
+
+// ─── Stage 5.0-A7'.2: Resource Registry bootstrap + register_resource ────
+
+/// After `setup_app` (which mirrors `main.rs` bootstrap), the DB must
+/// contain the 8 core types (from migration A1.1) plus the 3 custom
+/// LMS types registered by `bootstrap_resource_types`.
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn bootstrap_registers_core_and_custom_types(pool: PgPool) {
+    let _ = setup_app(pool.clone()).await;
+
+    let count: i64 = sqlx::query_scalar("select count(*) from resource_types")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 11,
+        "expected 8 core (migration) + 3 custom (bootstrap) resource types"
+    );
+
+    for name in ["course", "assignment", "batch"] {
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from resource_types where name = $1)")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(exists, "custom type `{name}` must exist after bootstrap");
+
+        // And their actions landed in `permissions` (A1.2 trigger
+        // propagates them to owners).
+        let perms: i64 =
+            sqlx::query_scalar("select count(*) from permissions where resource = $1")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(perms > 0, "`{name}` must have at least one permission row");
+    }
+}
+
+/// Non-platform-owner must be rejected with `Forbidden`.
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn register_resource_requires_platform_resource_manage(pool: PgPool) {
+    let (_, state) = setup_app(pool.clone()).await;
+
+    let email = format!("user-{}@test.local", Uuid::new_v4());
+    let user = state
+        .authn
+        .register(&email, "Password123!")
+        .await
+        .expect("register");
+
+    let access = state.saas.access().expect("access");
+    let rt = ResourceType::workspace("test_new", &["read"]);
+
+    let err = rust_saas::access::registry::register_resource_type(access, &user, &rt)
+        .await
+        .expect_err("non-platform-owner must be forbidden");
+    assert!(matches!(err, AccessError::Forbidden), "got {err:?}");
+
+    // Nothing inserted.
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from resource_types where name = 'test_new'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "forbidden call must not insert anything");
+}
+
+/// Platform owner can register a new resource type; it appears in
+/// `resource_types` and its actions land in `permissions`.
+#[sqlx::test(migrations = "../../crates/db/migrations")]
+async fn register_resource_creates_type(pool: PgPool) {
+    let (_, state) = setup_app(pool.clone()).await;
+
+    let email = format!("admin-{}@test.local", Uuid::new_v4());
+    let admin = state
+        .authn
+        .register(&email, "Password123!")
+        .await
+        .expect("register");
+    grant_platform_admin(&state, admin.id).await;
+
+    let access = state.saas.access().expect("access");
+    let rt = ResourceType::workspace("test_new", &["read", "write"]);
+
+    rust_saas::access::registry::register_resource_type(access, &admin, &rt)
+        .await
+        .expect("platform owner must be allowed");
+
+    let scope: String =
+        sqlx::query_scalar("select scope from resource_types where name = 'test_new'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scope, "workspace");
+
+    for action in ["read", "write"] {
+        let exists: bool = sqlx::query_scalar(
+            "select exists(select 1 from permissions \
+             where resource = 'test_new' and action = $1)",
+        )
+        .bind(action)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists, "permission ('test_new', {action}) must exist");
+    }
 }

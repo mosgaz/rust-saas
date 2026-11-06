@@ -10,7 +10,7 @@ revision.
 
 ## [0.3.0] - 2026-11-05
 
-### Stage 5.0 — Phase A (A1 + A2 + A3 + A4 + A4.6 + A5 + A6)
+### Stage 5.0 — Phase A (A1 + A2 + A3 + A4 + A4.6 + A5 + A6 + A7'.1 + A7'.2)
 
 **Breaking changes (5 items; see `COMPATIBILITY.md` §0.3.0 for migration guide):**
 - `authz::AuthorizationEngine::reload_in_memory()` — new required method (A1.4).
@@ -99,9 +99,27 @@ revision.
 - `domain` stays a direct, non-optional dependency (not `rust_saas::domain`). `rust-saas` is `optional = true` (only `ssr`), so hydrate-compiled code (`guard.rs`, `pages/*`) cannot reference `rust_saas::domain::*` — it would fail `cargo check --features hydrate` with `E0433: use of undeclared crate or module rust_saas`. `domain` is `default-features = false` and compiles in both `ssr` and `hydrate`.
 - **No library API change** (consumer-only refactor; `rust-saas` `features = ["ssr", "rate-limiter-redis"]` already existed; `domain` direct dep was already the case in the reference).
 
+**A7'.2 — `saas-leptos` starter template (bootstrap + register_resource)**
+
+**Stage 5.0-A7'.2 closes the "A7' starter template incomplete" gap.** `examples/saas-leptos` now demonstrates the full `resource_types` lifecycle:
+
+- **Startup bootstrap** (`src/main.rs`): after `CasbinAuthz::from_pool`, before `AccessState` — `bootstrap_all_core(&pool, &authz)` + `bootstrap_resource_types(&pool, &authz, &[ResourceType::workspace("course", &["read","write","publish"]), ResourceType::workspace("assignment", &["read","grade"]), ResourceType::tenant("batch", &["read","manage"])])`. Both idempotent (safe on every process start). Replaces the pre-A7'.2 "8 core types from migration, custom types nowhere".
+- **Admin UI** (`src/pages/platform.rs`, `/platform` route): new "Resource Types" section (visible only to holders of `(resource, manage)` in `PLATFORM_DOMAIN`, i.e. platform owners). Form (name + scope + comma-separated actions) + list. Backed by two new `#[server]` functions:
+  - `list_resource_types() -> Vec<ResourceTypeView>` — wraps `rust_saas::access::registry::list_resource_types`. `ResourceTypeView` is a client-side mirror (same `RoleView` / `AuditRowView` pattern — `access` is SSR-only).
+  - `register_resource(name, scope, actions_str) -> ()` — wraps `rust_saas::access::registry::register_resource_type` (permission-checked: `(resource, manage)` in `PLATFORM_DOMAIN`). Parses `"read, write, publish"` → `&["read","write","publish"]`; scope-string → `ResourceType::{platform,tenant,workspace}`.
+- **Tests** (`tests/e2e.rs`): +3 new E2E, `setup_app` now mirrors `main.rs` bootstrap (`bootstrap_all_core` + `bootstrap_resource_types`) so every test starts on the same 11-type DB (8 core + 3 custom):
+  - `bootstrap_registers_core_and_custom_types` — after `setup_app`: 11 rows in `resource_types`; `course`/`assignment`/`batch` each have >0 `permissions` rows.
+  - `register_resource_requires_platform_resource_manage` — non-platform-owner → `AccessError::Forbidden`; **nothing inserted** (permission check precedes write).
+  - `register_resource_creates_type` — platform owner → `ResourceType::workspace("test_new", &["read","write"])` inserted; `scope='workspace'`; both `(test_new, read)` and `(test_new, write)` in `permissions`.
+- **`README.md`** — new "What A7'.2 added" section (bootstrap snippet, admin-UI description, "3 ways to register resources" pointer to `saas-external-02.md §6` — A8); `Status` section updated (A7'.1 done, A7'.2 done, A8 next).
+
+**Deviations from `saas-26.md §5`:** none — all DoD items met as specified. Bootstrap snippet exactly as handoff sketch (`bootstrap_all_core` + `bootstrap_resource_types` with 3 types); `#[server] register_resource` + `list_resource_types` + form; 3 E2E (handoff §5 step "5–8" said "3–5", we shipped 3); `fmt --check` + `clippy -D warnings` clean.
+
+**A7'.2 is consumer-only.** `crates/*` — 0 lines changed. `rust-saas` / `saas-axum` / `access` / `saas` API — unchanged. Schema (15 migrations) — unchanged. B1–B10 (all pluggability blockers) remain closed.
+
 **PR #35 (`feat/rbac`)** — merged into `main` (`b815743`) between A5-precursor and A5. Unrelated to A5 or A6; consumers should still verify via `git show b815743 --stat` before starting A7' that no `saas` / `saas-axum` / `access` API changed. For A6, no API changes were observed on the surfaces used (`saas::platform::*`, `saas::access::my_permissions`, `AxumAppStateBuilder`, `build_app_full_with`).
 
-**Tests:** 174 → **197** (A1 + A2 + A3) → **245** → **254** (A4.0–A4.5: `saas-axum` 57 integration + `rust-saas/tests/feature_axum.rs` fn-pointer asserts). Workspace test count unchanged by A6 (consumer-only refactor). **E2E:** 14 (`axum-minimal`) + 15 (`saas-leptos`) + **3 (`minimal-lms`)** = **32** — same count as A5; `axum-minimal` E2E adapted in place.
+**Tests:** 174 → **197** (A1 + A2 + A3) → **245** → **254** (A4.0–A4.5: `saas-axum` 57 integration + `rust-saas/tests/feature_axum.rs` fn-pointer asserts). Workspace test count unchanged by A6 (consumer-only refactor) and by A7'.1 / A7'.2 (consumer-only). **E2E:** 14 (`axum-minimal`) + **18 (`saas-leptos`, was 15 — A7'.2 +3)** + 3 (`minimal-lms`) = **35** (was 32 after A5). `axum-minimal` E2E adapted in place (14 → 14). `saas-leptos` E2E: 15 → 18.
 
 ## [0.2.2] - 2026-11-03
 

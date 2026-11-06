@@ -26,7 +26,7 @@ Whole `saas-leptos/` directory:
 - `Cargo.toml` — 1 workspace dep (`rust-saas = { features = ["ssr", "rate-limiter-redis"] }`) + Leptos/Axum/DB/Email/Metrics
 - `Cargo.lock` — regenerate with `cargo leptos build`
 - `src/` — auth, tenant, workspace, member, role, invitation, document, platform, health, metrics
-- `tests/e2e.rs` — 15 E2E tests (adapt to your domain)
+- `tests/e2e.rs` — 18 E2E tests (adapt to your domain)
 - `migrations/` — your migrations with versions `90000000000000+` (see `db::CONSUMER_VERSION_FLOOR`)
 - `Dockerfile`, `smoke.sh` — reference
 - `rust-toolchain.toml`, `assets/`, `public/`
@@ -54,6 +54,25 @@ Whole `saas-leptos/` directory:
 - `CookieConfig`, `EmailSender` / `NoopEmailSender` / `SmtpEmailSender`
 - `PerRequest` instrumentation (`#[instrument]` in `authn`/`saas`/`access`)
 
+## What A7'.2 added (Resource Registry in the starter template)
+
+**Startup bootstrap** (`src/main.rs`, right after `CasbinAuthz::from_pool`):
+
+```rust
+rust_saas::access::registry::bootstrap_all_core(&pool, &authz).await?;
+rust_saas::access::registry::bootstrap_resource_types(&pool, &authz, &[
+    rust_saas::access::ResourceType::workspace("course", &["read", "write", "publish"]),
+    rust_saas::access::ResourceType::workspace("assignment", &["read", "grade"]),
+    rust_saas::access::ResourceType::tenant("batch", &["read", "manage"]),
+]).await?;
+```
+
+Idempotent — safe on every start. **Replace these 3 custom types with your domain's**: `course`/`assignment`/`batch` are the LMS example; a CRM uses `deal`/`pipeline`, a CMS uses `page`/`asset`, etc.
+
+**Admin UI** (`src/pages/platform.rs`): `Resource Types` section with a form (name + scope + actions) and a list. Backed by `#[server] list_resource_types` and `#[server] register_resource` — both require `(resource, manage)` in `PLATFORM_DOMAIN` (i.e. platform owner).
+
+The whole registry story (SQL / `bootstrap_*` / `register_resource_type`) is documented in `saas-external-02.md §6` (A8) — decision matrix "3 ways to register resources".
+
 ## What-is-NOT-included (you write these)
 
 - Your domain model (`courses`, `lessons`, `assignments` — 1:1 to `workspaces`/`documents` via consumer migrations `90000000000000+`)
@@ -62,29 +81,13 @@ Whole `saas-leptos/` directory:
 - `guard.rs` (`RouteGuard`/`GuardRoute` — rewrite for your permissions)
 - `seed` — your data seeding
 - Custom SMTP (`lettre`) — if you need a real sender
+- **Real domain resource types** — A7'.2 ships LMS examples (`course`/`assignment`/`batch`) as a bootstrap demonstration. Replace with your own.
 
-## Next steps (post-A7')
+## Status
 
-- **A7'.2** — `bootstrap_*` in `main.rs` (5+ lines: `bootstrap_all_core` + `bootstrap_resource_types`) + `#[server] register_resource` in `pages/platform.rs` + form. See `saas-external-02.md §6` (A8) — decision matrix "3 ways to register resources": SQL / `bootstrap_*` / `register_resource_type`.
-
-## What is copied from which `crates/*`
-
-| What | From where (in `rust_saas::*`) |
-|---|---|
-| `Authn`, `AuthnError`, `Claims` | `rust_saas::authn` |
-| `AccessState`, `RoleKey`, `Permission`, `Role` | `rust_saas::access` |
-| `SaasState`, `SaasBuilder`, `CoreError`, `platform::*`, `tenant::*`, `workspace::*` | `rust_saas::saas` |
-| `AuditLogger`, `PgAuditLogger`, `NoopAuditLogger` | `rust_saas::audit` / `rust_saas::audit_pg` |
-| `AuthorizationEngine`, `CasbinAuthz` | `rust_saas::authz` / `rust_saas::authz_casbin` |
-| `AuthUser`, `Tenant`, `Workspace`, `Document`, `Member`, `PLATFORM_DOMAIN` | `rust_saas::domain` |
-| `MIGRATOR`, `migrate`, `migrate_composed`, `CONSUMER_VERSION_FLOOR` | `rust_saas::db` |
-| `RateLimiter`, `InMemoryRateLimiter`, `RedisRateLimiter` | `rust_saas::rate_limiter` |
-
-## Pre-A7' status
-
-- **A7'.1 (this sub-stage)** — `Cargo.toml` (1 workspace dep) + `README.md` (this file). Code does not change (except `use` lines). 15/15 E2E green.
-- **A7'.2 (next)** — `bootstrap_*` + `register_resource` + form.
-- **A8** — `saas-external-02.md`, `ADR-0008`, `ADR-0009`.
+- **A7'.1 (done)** — `Cargo.toml` (1 workspace dep) + `README.md`. Code does not change (except `use` lines). 15/15 E2E green.
+- **A7'.2 (done, this sub-stage)** — `bootstrap_*` in `main.rs` + `#[server] register_resource` / `list_resource_types` + form + 3 E2E. **18/18 E2E green.** All DoD criteria met.
+- **A8 (next)** — `saas-external-02.md`, `ADR-0008`, `ADR-0009`.
 - **A9** — DoD Phase A, tag `v0.3.0`.
 
 ## Reference

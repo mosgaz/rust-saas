@@ -119,13 +119,15 @@ per `COMPATIBILITY.md` policy.
 `0.2.1` version was declared in `COMPATIBILITY.md` but not published
 as a tag; `0.2.2` is the first tagged release after `0.2.0`.
 
-### 0.3.0 — Stage 5.0 (Phase A: A1–A6)
+### 0.3.0 — Stage 5.0 (Phase A: A1–A7'.2)
 
 Breaking changes and new API introduced across `crates/*` in Phase A
 (`crates/db/migrations/20261130*`, A1.4, A2.2a, A2.2c, A4.0–A4.6, A5,
-A6). Phase A's DoD (`# Stage 5 — план реализации.txt` §4.A9) is **not**
-yet closed; this entry documents what has already landed on `main` under
-`0.3.0`.
+A6, A7'.1, A7'.2). A7'.1 and A7'.2 are consumer-only (0 lines changed
+in `crates/*`); they close the Leptos starter-template story — no
+library API added or changed. Phase A's DoD (`# Stage 5 — план
+реализации.txt` §4.A9) is **not** yet closed; this entry documents what
+has already landed on `main` under `0.3.0`.
 
 **New public API (additive):**
 
@@ -169,6 +171,10 @@ yet closed; this entry documents what has already landed on `main` under
   - Behavioral contract preserved: status codes, JSON shape (`{"items","total","limit","offset"}` for `/tenants`/`/workspaces`), cookie flow, error bodies (`{"error": "..."}`) — identical to pre-A6.
   - `saas-axum::pagination::PaginationQuery` deliberately **not** re-exported through `rust-saas`; `axum-minimal` keeps a local 15-line `PaginationQuery` in `handlers.rs`. If consumers need it later, promote to `rust_saas::saas_axum::pagination` (additive).
 
+- **A7'.1 (consumer-only — no library API).** `examples/saas-leptos` becomes a single-workspace-dependency reference: one workspace dep `rust-saas = { path = "../../crates/rust-saas", features = ["ssr", "rate-limiter-redis"], optional = true }` + a direct `domain = { path = "../../crates/domain", default-features = false }` (hydrate-only; `rust-saas` is `optional = true`, so `rust_saas::*` is unavailable in hydrate-compiled code — `domain` stays direct). All `use`-lines in `src/*.rs` / `src/pages/*.rs` reference `rust_saas::*` instead of the individual crates. `README.md` is a starter template ("copy, rename, extend"). Code does not change (only `Cargo.toml` + `use`-lines + `README.md`); 15/15 E2E green; `cargo check --features ssr` and `cargo check --features hydrate` green. No library API change — the `rate-limiter-redis` feature and the direct `domain` dep were already available; consumer-only.
+
+- **A7'.2 (consumer-only — no library API).** `examples/saas-leptos` starter template now demonstrates the full `resource_types` lifecycle: `bootstrap_all_core(&pool, &authz)` + `bootstrap_resource_types(&pool, &authz, &[ResourceType::workspace("course", &["read","write","publish"]), ResourceType::workspace("assignment", &["read","grade"]), ResourceType::tenant("batch", &["read","manage"])])` in `src/main.rs` (idempotent on every start); `#[server] list_resource_types` + `#[server] register_resource(name, scope, actions_str)` in `src/pages/platform.rs` (both permission-checked via `(resource, manage)` in `PLATFORM_DOMAIN`); Resource Types UI section on `/platform` (form + list). 3 new E2E in `tests/e2e.rs` (15 → 18); `setup_app` mirrors `main.rs` bootstrap. No library API change — `bootstrap_*` / `register_resource_type` / `list_resource_types` already existed in `rust_saas::access::registry` since A1. Consumer-only.
+
 **Breaking:**
 
 1. **`authz::AuthorizationEngine::reload_in_memory()`** — every impl must implement it (`Ok(())` for engines without in-memory state). `AllowAllAuthz` / `DenyAllAuthz` from `authz::test_support` already ship it; a consumer's custom impl needs one more method.
@@ -207,4 +213,6 @@ yet closed; this entry documents what has already landed on `main` under
 
 - **A7'.1 (consumer-only — no library API).** `examples/saas-leptos` becomes a single-workspace-dependency reference: one workspace dep `rust-saas = { path = "../../crates/rust-saas", features = ["ssr", "rate-limiter-redis"], optional = true }` + a direct `domain = { path = "../../crates/domain", default-features = false }` (hydrate-only; `rust-saas` is `optional = true`, so `rust_saas::*` is unavailable in hydrate-compiled code — `domain` stays direct). All `use`-lines in `src/*.rs` / `src/pages/*.rs` reference `rust_saas::*` instead of the individual crates. `README.md` is a starter template ("copy, rename, extend"). Code does not change (only `Cargo.toml` + `use`-lines + `README.md`); 15/15 E2E green; `cargo check --features ssr` and `cargo check --features hydrate` green. No library API change — the `rate-limiter-redis` feature and the direct `domain` dep were already available; consumer-only.
 
-**Why.** Phase A closes all 10 pluggability blockers (B1–B10) and adds a fork-free Axum consumer path. Breaking changes are mechanical (5 signature changes + 1 new required method) and documented individually above. `examples/minimal-lms` is the reference consumer for "custom resource types + custom bindings"; `examples/axum-minimal` (post-A6) is the reference for "pure Axum, minimal path".
+- **A7'.2 (consumer-only — no library API).** `examples/saas-leptos` starter template now demonstrates the full `resource_types` lifecycle. Migration is "copy the new `main.rs` bootstrap block (`bootstrap_all_core` + `bootstrap_resource_types`) + the `Resource Types` admin-UI section in `pages/platform.rs`". No library API change — `bootstrap_*` / `register_resource_type` / `list_resource_types` already existed in `rust_saas::access::registry` since A1. A consumer who was already using `bootstrap_*` in their own `main.rs` needs no migration; a consumer who was not — this is the reference pattern. 0 lines changed in `crates/*`; `saas-leptos` E2E grew 15 → 18 (+3 bootstrap/register tests). Consumer-only.
+
+**Why.** Phase A closes all 10 pluggability blockers (B1–B10) and adds a fork-free Axum consumer path. Breaking changes are mechanical (5 signature changes + 1 new required method) and documented individually above. `examples/minimal-lms` is the reference consumer for "custom resource types + custom bindings"; `examples/axum-minimal` (post-A6) is the reference for "pure Axum, minimal path"; `examples/saas-leptos` (post-A7'.2) is the complete Leptos starter template — single-dep, full `resource_types` lifecycle (startup bootstrap + admin UI for runtime registration). A7'.1 and A7'.2 close the Leptos-path "starter template incomplete" story; the Axum path (A5 + A6) and the Leptos path (A7'.1 + A7'.2) are now equally complete reference artifacts for Phase A.
