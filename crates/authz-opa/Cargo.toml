@@ -1,0 +1,22 @@
+[package]
+name = "authz-opa"
+version = "0.3.0"
+edition = "2021"
+description = "OPA-based PolicyAdmin implementation for rust-saas"
+license = "MIT"
+publish = false
+
+[dependencies]
+authz = { path = "../authz" }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["macros"] }
+thiserror = "1.0"
+url = "2.0"
+uuid = { version = "1.0", features = ["serde"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }
+wiremock = "0.6"

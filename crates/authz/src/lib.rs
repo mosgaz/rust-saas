@@ -16,6 +16,8 @@
 //! handoff §16).
 
 use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthzError {
@@ -25,6 +27,8 @@ pub enum AuthzError {
     Internal(String),
     #[error("reload error: {0}")]
     ReloadError(String),
+    #[error("policy admin error: {0}")]
+    PolicyAdminError(String),
 }
 
 #[async_trait::async_trait]
@@ -119,6 +123,58 @@ pub trait AuthorizationEngine: Send + Sync {
     /// policy — PAP-состояние). `AuthorizationEngine` (PDP) может иметь
     /// свой `reload` отдельно, если кэширует.
     async fn reload_in_memory(&self) -> Result<(), AuthzError>;
+}
+
+/// Request for authorization decision
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AuthzRequest {
+    /// Subject (user, role, service)
+    pub subject: String,
+    /// Resource being accessed
+    pub resource: String,
+    /// Action being performed
+    pub action: String,
+    /// Optional context (attributes, relationships)
+    pub context: Option<Value>,
+}
+
+/// Policy Administration Point (PAP) trait
+///
+/// Manages authorization policies (ABAC/ReBAC). Separated from `AuthorizationEngine`
+/// (PDP) to allow external policy management (e.g., OPA).
+#[async_trait::async_trait]
+pub trait PolicyAdmin: Send + Sync {
+    /// Grant a policy (subject can perform action on resource)
+    async fn grant(
+        &self,
+        subject: &str,
+        resource: &str,
+        action: &str,
+        context: Option<&Value>,
+    ) -> Result<(), AuthzError>;
+
+    /// Revoke a policy
+    async fn revoke(
+        &self,
+        subject: &str,
+        resource: &str,
+        action: &str,
+    ) -> Result<(), AuthzError>;
+
+    /// Check if a policy exists
+    async fn has(
+        &self,
+        subject: &str,
+        resource: &str,
+        action: &str,
+        context: Option<&Value>,
+    ) -> Result<bool, AuthzError>;
+
+    /// Count policies for a subject
+    async fn count(&self, subject: &str, action: &str) -> Result<usize, AuthzError>;
+
+    /// Purge all policies for a subject
+    async fn purge(&self, subject: &str) -> Result<(), AuthzError>;
 }
 
 // ─── Stage 4.3a: test-only doubles ──────────────────────────────────────────

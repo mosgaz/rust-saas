@@ -106,6 +106,7 @@ impl From<AuthzError> for CoreError {
             AuthzError::Forbidden => CoreError::Forbidden,
             AuthzError::Internal(s) => CoreError::Internal(s),
             AuthzError::ReloadError(s) => CoreError::Internal(s),
+            AuthzError::PolicyAdminError(s) => CoreError::Internal(s),
         }
     }
 }

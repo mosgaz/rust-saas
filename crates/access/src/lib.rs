@@ -111,6 +111,7 @@ impl From<authz::AuthzError> for AccessError {
             authz::AuthzError::Forbidden => AccessError::Forbidden,
             authz::AuthzError::Internal(s) => AccessError::Internal(s),
             authz::AuthzError::ReloadError(s) => AccessError::Internal(s),
+            authz::AuthzError::PolicyAdminError(s) => AccessError::Internal(s),
         }
     }
 }
