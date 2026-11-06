@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   SQLX_MIGRATIONS_DIR: crates/db/migrations
+  # Pin for cache stability. Bump intentionally when a new sqlx-cli 0.8.x
+  # is desired; `--version 0.8` picks the latest patch.
+  SQLX_CLI_VERSION: "0.8"
 
 jobs:
   test:
@@ -38,33 +41,15 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: Cache sqlx-cli
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/sqlx
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-sqlx-cli-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sqlx-cli-
-
-      - name: Install sqlx-cli
-        run: |
-          if ! command -v sqlx &> /dev/null; then
-            cargo install sqlx-cli --no-default-features --features postgres
-          fi
-
-      - name: Run migrations
-        run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
-
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `#[sqlx::test]` creates an isolated DB per test and applies
+      # `crates/db/migrations` itself; a shared-DB `sqlx migrate run` here
+      # is redundant. The integration tests catch broken migrations.
       - name: Run tests
         run: cargo test --workspace
 
@@ -89,6 +74,7 @@ jobs:
       - name: Test rate-limiter with Redis
         run: cargo test -p rate-limiter --features redis
 
+
   check-examples:
     name: Check Examples
     runs-on: ubuntu-latest
@@ -96,6 +82,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          # Used by the hydrate-wasm32 check below.
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
 
@@ -108,8 +95,18 @@ jobs:
       - name: Check saas-leptos (SSR)
         run: cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr
 
-      - name: Check saas-leptos (Hydrate)
-        run: cargo check --manifest-path examples/saas-leptos/Cargo.toml
+      # Catches `--features hydrate` type errors on host — e.g. accidental
+      # `rust_saas::*` in hydrate-compiled code → E0433 (the A7'.1 regression).
+      # `--no-default-features` is a no-op today (default is empty) and
+      # guards against a future `default = ["ssr"]` bleeding into hydrate.
+      - name: Check saas-leptos (Hydrate, host)
+        run: cargo check --manifest-path examples/saas-leptos/Cargo.toml --no-default-features --features hydrate
+
+      # Catches wasm32-only errors: `#[cfg(target_arch = "wasm32")]` blocks,
+      # `getrandom/js`, `web-time`. Uses the wasm32 target installed above.
+      - name: Check saas-leptos (Hydrate, wasm32)
+        run: cargo check --manifest-path examples/saas-leptos/Cargo.toml --no-default-features --features hydrate --target wasm32-unknown-unknown
+
 
   e2e-examples:
     name: E2E Examples
@@ -151,41 +148,25 @@ jobs:
             examples/minimal-lms -> target
             examples/saas-leptos -> target
 
-      - name: Cache sqlx-cli
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/sqlx
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-sqlx-cli-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sqlx-cli-
-
-      - name: Install sqlx-cli
-        run: |
-          if ! command -v sqlx &> /dev/null; then
-            cargo install sqlx-cli --no-default-features --features postgres
-          fi
-
-      - name: Run migrations
-        run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
-
+      # Each example's `tests/e2e.rs` applies migrations itself:
+      #   - axum-minimal: `#[sqlx::test(migrations = "...")]`
+      #   - minimal-lms:  `#[sqlx::test(migrations = false)]` + `db::migrate_composed`
+      #   - saas-leptos:  `#[sqlx::test(migrations = "...")]`
+      # so a shared-DB `sqlx migrate run` is not needed here.
+      # `axum-minimal` and `minimal-lms` use `InMemoryRateLimiter` — no `REDIS_URL`.
       - name: E2E axum-minimal
-        env:
-          REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
 
       - name: E2E minimal-lms
-        env:
-          REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/minimal-lms/Cargo.toml --test e2e
 
+      # `saas-leptos` `main.rs` builds `RedisRateLimiter::from_url`; the
+      # `setup_app` in e2e may also pick it up — keep `REDIS_URL` available.
       - name: E2E saas-leptos
         env:
           REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr --test e2e
+
 
   deny:
     name: Cargo Deny
@@ -193,6 +174,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
 
   docker-and-smoke:
     name: Docker Build & Smoke Test
@@ -208,31 +190,31 @@ jobs:
       - name: Build saas-leptos image
         run: docker build -f examples/saas-leptos/Dockerfile -t rust-saas/saas-leptos:ci .
 
+      # `--wait` blocks until every service in `docker-compose.yml` is
+      # `healthy` (Compose v2). Replaces the old `until pg_isready` loop.
+      # Note: `mailpit` and `pgadmin` have no `healthcheck` in compose —
+      # `--wait` does not block on them, which is fine for these smokes.
       - name: Start Postgres & Mailpit
-        run: docker compose up -d
+        run: docker compose up -d --wait
 
-      - name: Wait for Postgres
-        run: |
-          until docker exec rust-saas-postgres-core pg_isready -U postgres -d rust_saas; do
-            sleep 1
-          done
-
+      # Cache only the binary, not `~/.cargo/registry/*` — `rust-cache`
+      # already covers those, and hashing `**/Cargo.lock` invalidated the
+      # cache on every dependency change (sqlx-cli is not in that lock).
       - name: Cache sqlx-cli
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/bin/sqlx
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-sqlx-cli-${{ hashFiles('**/Cargo.lock') }}
+          path: ~/.cargo/bin/sqlx
+          key: ${{ runner.os }}-sqlx-cli-${{ env.SQLX_CLI_VERSION }}
           restore-keys: |
             ${{ runner.os }}-sqlx-cli-
 
       - name: Install sqlx-cli
         run: |
           if ! command -v sqlx &> /dev/null; then
-            cargo install sqlx-cli --no-default-features --features postgres
+            cargo install sqlx-cli \
+              --no-default-features \
+              --features postgres \
+              --version ${{ env.SQLX_CLI_VERSION }}
           fi
 
       - name: Run migrations
@@ -244,6 +226,33 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
         run: cargo run -p seed
+
+      # Smoke axum-minimal: build-time success is not run-time success.
+      # `HEALTHCHECK` in the image is only used by Docker (not by CI).
+      # `/readyz` does `SELECT 1` — catches both "process did not start"
+      # and "process cannot reach Postgres". Host port 3397 so the
+      # following saas-leptos smoke can use 3395.
+      - name: Smoke axum-minimal
+        run: |
+          set -euo pipefail
+          docker run -d --name axum-minimal-smoke \
+            --network rust-saas_rust_saas_net \
+            -e DATABASE_URL='postgres://postgres:postgres@postgres:5432/rust_saas' \
+            -e JWT_SECRET='ci-smoke-secret' \
+            -p 3397:3395 \
+            rust-saas/axum-minimal:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3397/readyz >/dev/null 2>&1; then
+              echo "axum-minimal /readyz OK"
+              docker rm -f axum-minimal-smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "axum-minimal /readyz did not become ready in 30s"
+          docker logs axum-minimal-smoke || true
+          docker rm -f axum-minimal-smoke || true
+          exit 1
 
       - name: Run smoke test
         env:
