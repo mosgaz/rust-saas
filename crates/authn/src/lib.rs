@@ -66,16 +66,20 @@
 //! - `user.password_reset_completed` — after `reset_password`.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
     Argon2, PasswordHash, PasswordVerifier,
 };
 use audit::{events, AuditEvent, AuditLogger, NoopAuditLogger};
+use base32;
 use chrono::{DateTime, Duration, Utc};
 use domain::AuthUser;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use rand;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::instrument;
@@ -123,6 +127,15 @@ pub const EMAIL_VERIFICATION_TTL_HOURS: i64 = 24;
 /// Password-reset token lifetime (Stage 3d): 1 hour.
 pub const PASSWORD_RESET_TTL_HOURS: i64 = 1;
 
+/// TOTP code validity window: 30 seconds
+pub const TOTP_VALIDITY_WINDOW_SECONDS: i64 = 30;
+
+/// Number of recovery codes to generate: 10
+pub const RECOVERY_CODES_COUNT: usize = 10;
+
+/// Length of each recovery code: 10 characters
+pub const RECOVERY_CODE_LENGTH: usize = 10;
+
 /// Public projection of `identity::IdentityError`: carries only the
 /// variants that are meaningful to a caller of `authn`. The opaque `Db`
 /// and the free-form `Internal` are folded into `Internal(String)` so that
@@ -138,6 +151,8 @@ pub enum IdentityErrorKind {
     Validation(String),
     #[error("internal identity error: {0}")]
     Internal(String),
+    #[error("conflict error: {0}")]
+    Conflict(String),
 }
 
 impl From<IdentityError> for IdentityErrorKind {
@@ -147,6 +162,8 @@ impl From<IdentityError> for IdentityErrorKind {
             IdentityError::DuplicateEmail => IdentityErrorKind::DuplicateEmail,
             IdentityError::Validation(s) => IdentityErrorKind::Validation(s),
             IdentityError::Db(s) => IdentityErrorKind::Internal(s),
+            IdentityError::DuplicateExternalIdentity => IdentityErrorKind::Conflict("Duplicate external identity".to_string()),
+            IdentityError::ExternalIdentityNotFound => IdentityErrorKind::NotFound,
         }
     }
 }
@@ -170,6 +187,15 @@ pub enum AuthnError {
     /// verified (Stage 3b).
     #[error("email already verified")]
     AlreadyVerified,
+    /// TOTP 2FA is required for this user
+    #[error("two-factor authentication required")]
+    TwoFactorRequired,
+    /// Invalid TOTP code
+    #[error("invalid totp code")]
+    InvalidTotpCode,
+    /// Invalid recovery code
+    #[error("invalid recovery code")]
+    InvalidRecoveryCode,
     #[error("internal authentication error: {0}")]
     Internal(String),
     #[error("identity error: {0}")]
@@ -241,6 +267,22 @@ struct ResetTokenRecord {
     user_id: Uuid,
     expires_at: DateTime<Utc>,
     used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct TotpSecretRecord {
+    user_id: Uuid,
+    secret: String,
+    confirmed_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RecoveryCodeRecord {
+    user_id: Uuid,
+    code_hash: String,
+    used_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
 }
 
 pub struct Authn {
@@ -353,7 +395,7 @@ impl Authn {
             }
         };
 
-        let parsed = match PasswordHash::new(&record.password_hash) {
+        let parsed = match PasswordHash::new(record.password_hash.as_deref().unwrap_or_default()) {
             Ok(p) => p,
             Err(_) => {
                 self.audit_login_failed(email).await;
@@ -370,6 +412,14 @@ impl Authn {
         }
 
         let user: AuthUser = record.into();
+
+        // Check if user has TOTP enabled
+        let totp_enabled = self.is_totp_enabled(user.id).await?;
+        
+        if totp_enabled {
+            // User has 2FA enabled, require TOTP code
+            return Err(AuthnError::TwoFactorRequired);
+        }
 
         self.audit_or_warn(AuditEvent {
             event_type: events::USER_LOGIN_SUCCEEDED.into(),
@@ -1023,12 +1073,441 @@ impl Authn {
         // granularity. A token issued in the same second as a reset is
         // accepted — the 1-second window is far narrower than the
         // 15-minute `access_ttl` this closes.
-        if iat < record.password_changed_at.timestamp() {
+        if iat < record.password_changed_at.unwrap().timestamp() {
             return Err(AuthnError::TokenInvalid);
         }
 
         Ok(Some(record.into()))
     }
+
+    /// Begins the process of enabling TOTP 2FA for a user.
+    ///
+    /// This function generates a TOTP secret and stores it in the database,
+    /// but does not confirm it. The user must verify the secret by providing
+    /// a valid TOTP code before 2FA is fully enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user enabling TOTP 2FA
+    ///
+    /// # Returns
+    ///
+    /// The generated TOTP secret key on success, or an error if the user
+    /// already has confirmed TOTP enabled or another database error occurs.
+    pub async fn begin_totp_setup(&self, user_id: Uuid) -> Result<String, AuthnError> {
+        // Check if user already has confirmed TOTP
+        let totp_record: Option<TotpSecretRecord> = sqlx::query_as(
+            r#"
+            select user_id, secret, confirmed_at, created_at
+            from user_totp_secrets
+            where user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(record) = totp_record {
+            if record.confirmed_at.is_some() {
+                // User already has confirmed TOTP enabled
+                return Err(AuthnError::InvalidCredentials);
+            }
+            // User has unconfirmed TOTP setup in progress - return existing secret
+            return Ok(record.secret);
+        }
+
+        // Generate a new TOTP secret
+        let secret = Self::generate_totp_secret();
+
+        // Store the secret in the database
+        sqlx::query(
+            r#"
+            insert into user_totp_secrets (user_id, secret, confirmed_at)
+            values ($1, $2, null)
+            on conflict (user_id) do update
+            set secret = excluded.secret, confirmed_at = null
+            "#,
+        )
+        .bind(user_id)
+        .bind(&secret)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(secret)
+    }
+
+    /// Verifies a TOTP code and confirms TOTP 2FA setup for a user.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user
+    /// * `code` - The TOTP code to verify
+    ///
+    /// # Returns
+    ///
+    /// Ok(Vec<String>) with recovery codes if the code is valid and TOTP is confirmed,
+    /// or an error if the code is invalid, expired, or another error occurs.
+    pub async fn confirm_totp(&self, user_id: Uuid, code: &str) -> Result<Vec<String>, AuthnError> {
+        // Get the user's TOTP secret
+        let record: Option<TotpSecretRecord> = sqlx::query_as(
+            r#"
+            select user_id, secret, confirmed_at, created_at
+            from user_totp_secrets
+            where user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(record) = record else {
+            return Err(AuthnError::InvalidCredentials);
+        };
+
+        // Verify the TOTP code
+        if !Self::verify_totp_code_internal(&record.secret, code) {
+            return Err(AuthnError::InvalidTotpCode);
+        }
+
+        // Confirm the TOTP setup by setting confirmed_at
+        sqlx::query(
+            r#"
+            update user_totp_secrets
+            set confirmed_at = now()
+            where user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
+        // Generate recovery codes
+        let recovery_codes = Self::generate_recovery_codes();
+        
+        // Hash and store recovery codes
+        for code in &recovery_codes {
+            let code_hash = Self::hash_recovery_code(code.as_str());
+            sqlx::query(
+                r#"
+                insert into user_recovery_codes (user_id, code_hash, used_at)
+                values ($1, $2, null)
+                "#,
+            )
+            .bind(user_id)
+            .bind(&code_hash)
+            .execute(&self.pool)
+            .await?;
+        }
+        
+        // Return recovery codes to user (these should be displayed once)
+        Ok(recovery_codes)
+    }
+
+    /// Verifies a TOTP code for login.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user
+    /// * `code` - The TOTP code to verify
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if the code is valid, or an error if the code is invalid,
+    /// expired, or another error occurs.
+    pub async fn verify_totp_code(&self, user_id: Uuid, code: &str) -> Result<(), AuthnError> {
+        // Get the user's TOTP secret
+        let record: Option<TotpSecretRecord> = sqlx::query_as(
+            r#"
+            select user_id, secret, confirmed_at, created_at
+            from user_totp_secrets
+            where user_id = $1 and confirmed_at is not null
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(record) = record else {
+            return Err(AuthnError::InvalidCredentials);
+        };
+
+        // Verify the TOTP code
+        if !Self::verify_totp_code_internal(&record.secret, code) {
+            return Err(AuthnError::InvalidTotpCode);
+        }
+
+        Ok(())
+    }
+
+    /// Disables TOTP 2FA for a user.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) on success, or an error if the user doesn't have TOTP enabled
+    /// or another database error occurs.
+    pub async fn disable_totp(&self, user_id: Uuid) -> Result<(), AuthnError> {
+        // Check if user has TOTP enabled
+        let record: Option<TotpSecretRecord> = sqlx::query_as(
+            r#"
+            select user_id, secret, confirmed_at, created_at
+            from user_totp_secrets
+            where user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(record) = record else {
+            return Err(AuthnError::InvalidCredentials);
+        };
+
+        if record.confirmed_at.is_none() {
+            // TOTP setup was started but not confirmed
+            // Just remove the record
+            sqlx::query(
+                r#"
+                delete from user_totp_secrets where user_id = $1
+                "#,
+            )
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+
+        // User has confirmed TOTP enabled - remove TOTP secret and recovery codes
+        let mut tx = self.pool.begin().await?;
+        
+        sqlx::query(
+            r#"
+            delete from user_totp_secrets where user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        
+        sqlx::query(
+            r#"
+            delete from user_recovery_codes where user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        
+        tx.commit().await?;
+        
+        Ok(())
+    }
+
+    /// Checks if TOTP 2FA is enabled for a user.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user
+    ///
+    /// # Returns
+    ///
+    /// true if TOTP 2FA is enabled and confirmed, false otherwise.
+    pub async fn is_totp_enabled(&self, user_id: Uuid) -> Result<bool, AuthnError> {
+        let record: Option<TotpSecretRecord> = sqlx::query_as(
+            r#"
+            select user_id, secret, confirmed_at, created_at
+            from user_totp_secrets
+            where user_id = $1 and confirmed_at is not null
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        Ok(record.is_some())
+    }
+
+    /// Generates a random TOTP secret key.
+    ///
+    /// This uses a cryptographically secure random number generator to create
+    /// a base32-encoded secret key suitable for TOTP authentication.
+    fn generate_totp_secret() -> String {
+        use rand::RngCore;
+        let mut rng = rand::thread_rng();
+        let mut secret = [0u8; 20]; // 20 bytes = 160 bits (standard for TOTP)
+        rng.fill_bytes(&mut secret);
+        base32::encode(base32::Alphabet::RFC4648 { padding: false }, &secret)
+    }
+
+    /// Verifies a TOTP code against the user's secret.
+    ///
+    /// # Arguments
+    ///
+    /// * `secret` - The user's TOTP secret
+    /// * `code` - The TOTP code to verify
+    ///
+    /// # Returns
+    ///
+    /// true if the code is valid, false otherwise.
+    fn verify_totp_code_internal(secret: &str, code: &str) -> bool {
+        use base32::decode;
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        
+        // Clean the code (remove spaces, convert to uppercase)
+        let code = code.replace(" ", "").to_uppercase();
+
+        // Validate code format (6 digits)
+        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+
+        // Parse the code as a number
+        let code: u32 = match code.parse() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        // Decode the base32 secret
+        let decoded_secret = match decode(base32::Alphabet::RFC4648 { padding: false }, secret) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Create HMAC-SHA1 instance with the decoded secret
+        type HmacSha1 = Hmac<Sha1>;
+        let mut mac = HmacSha1::new_from_slice(&decoded_secret).expect("HMAC can take key of any size");
+        
+        // Calculate the counter value (time steps)
+        let counter = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs() / 30; // 30 second period
+        
+        // Convert counter to bytes (big-endian)
+        let counter_bytes = counter.to_be_bytes();
+        
+        // Update HMAC with the counter
+        mac.update(&counter_bytes);
+        
+        // Finalize the HMAC and get the result
+        let result = mac.finalize();
+        let hmac_bytes = result.into_bytes();
+        
+        // Dynamic truncation to get the 4-byte offset
+        let offset = (hmac_bytes[19] & 0x0f) as usize;
+        let truncated_hash = ((hmac_bytes[offset] & 0x7f) as u32) << 24
+            | ((hmac_bytes[offset + 1] as u32) << 16)
+            | ((hmac_bytes[offset + 2] as u32) << 8)
+            | (hmac_bytes[offset + 3] as u32);
+        
+        // Calculate the TOTP code (6 digits)
+        let totp_code = (truncated_hash % 1_000_000) as u32;
+        
+        // Compare with the provided code
+        totp_code == code
+    }
+
+    /// Generates a random recovery code.
+    ///
+    /// Recovery codes are 10-character alphanumeric strings (uppercase letters and digits).
+    fn generate_recovery_code() -> String {
+        use rand::Rng;
+        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // Exclude similar characters (0,O,1,I)
+        const CODE_LENGTH: usize = RECOVERY_CODE_LENGTH;
+        let mut rng = rand::thread_rng();
+        
+        (0..CODE_LENGTH)
+            .map(|_| {
+                let idx = rng.gen_range(0..CHARSET.len());
+                CHARSET[idx] as char
+            })
+            .collect()
+    }
+
+    /// Generates multiple recovery codes.
+    ///
+    /// # Returns
+    ///
+    /// A vector of RECOVERY_CODES_COUNT recovery codes.
+    fn generate_recovery_codes() -> Vec<String> {
+        (0..RECOVERY_CODES_COUNT).map(|_| Self::generate_recovery_code()).collect()
+    }
+
+    /// Hashes a recovery code for secure storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The recovery code to hash
+    ///
+    /// # Returns
+    ///
+    /// The SHA-256 hash of the code as a hex string.
+    fn hash_recovery_code(code: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(code.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Verifies a recovery code for login.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user
+    /// * `code` - The recovery code to verify
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if the code is valid and unused, or an error if the code is
+    /// invalid, already used, or another error occurs.
+    pub async fn verify_recovery_code(&self, user_id: Uuid, code: &str) -> Result<(), AuthnError> {
+        let code_hash = Self::hash_recovery_code(code);
+        
+        let mut tx = self.pool.begin().await?;
+        
+        // Find and lock the recovery code record
+        let record: Option<RecoveryCodeRecord> = sqlx::query_as(
+            r#"
+            select user_id, code_hash, used_at, created_at
+            from user_recovery_codes
+            where user_id = $1 and code_hash = $2
+            for update
+            "#,
+        )
+        .bind(user_id)
+        .bind(&code_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        
+        let Some(record) = record else {
+            return Err(AuthnError::InvalidRecoveryCode);
+        };
+        
+        if record.used_at.is_some() {
+            return Err(AuthnError::InvalidRecoveryCode);
+        }
+        
+        // Mark the recovery code as used
+        sqlx::query(
+            r#"
+            update user_recovery_codes
+            set used_at = now()
+            where user_id = $1 and code_hash = $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(&code_hash)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
 }
 
 pub fn hash_password(password: &str) -> Result<String, AuthnError> {

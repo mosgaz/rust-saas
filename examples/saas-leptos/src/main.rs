@@ -23,6 +23,10 @@ use rust_saas::audit_pg::PgAuditLogger;
 #[cfg(feature = "ssr")]
 use rust_saas::authz::AuthorizationEngine;
 #[cfg(feature = "ssr")]
+use rust_saas::authz::PolicyAdmin;
+#[cfg(feature = "ssr")]
+use rust_saas::authz_opa::OpaPolicyAdmin;
+#[cfg(feature = "ssr")]
 use rust_saas::rate_limiter::RateLimiter;
 
 #[cfg(feature = "ssr")]
@@ -160,6 +164,10 @@ async fn main() -> anyhow::Result<()> {
     // `install_recorder` is a global singleton — a second call panics.
     let prometheus = PrometheusBuilder::new().install_recorder()?;
 
+    // Create OPA PolicyAdmin instance
+    let opa_url = std::env::var("OPA_URL").unwrap_or_else(|_| "http://localhost:8181".to_string());
+    let policy_admin: Arc<dyn PolicyAdmin> = Arc::new(OpaPolicyAdmin::new(&opa_url));
+
     let app_state = saas_leptos::state::AppState {
         authn: authn.clone(),
         saas,
@@ -168,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limit,
         cookie: cookie_cfg.clone(),
         prometheus,
+        policy_admin,
     };
 
     let router = saas_leptos::build_app(app_state);

@@ -52,6 +52,12 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **`examples/minimal-lms`** (Stage 5.0-A5): fork-free Axum consumer — 8 files, ~290 LOC without comments, 3 E2E. Uses only `rust-saas = { features = ["axum"] }` from workspace. **All 10 pluggability blockers (B1–B10) closed.**
 - **`examples/axum-minimal`** (Stage 5.0-A6): refactored onto `saas-axum` — **3 files, 278 LOC src** (was ~2000), **1 library dependency** `rust-saas = { features = ["axum"] }`, **14/14 E2E green**, `fmt --check` + `clippy -D warnings` clean. Structural refactor; behavioral contract (status codes, JSON shape, cookie flow, error bodies) preserved.
 - **`examples/saas-leptos` starter template** (Stage 5.0-A7'.1 + A7'.2): **1 workspace dep** (`rust-saas` + `domain` hydrate-only). A7'.2 adds **startup `bootstrap_*`** in `main.rs` (`bootstrap_all_core` + `bootstrap_resource_types` with 3 LMS types: `course`/`assignment`/`batch`) and **admin UI** on `/platform` (`#[server] list_resource_types` + `#[server] register_resource` + form + list). **18/18 E2E green** (was 15 — A7'.2 added 3). Full `resource_types` lifecycle: startup registration + runtime registration.
+- **ABAC/ReBAC support with OPA integration (Phase B)**: Implementation of Attribute-Based Access Control (ABAC) and Relationship-Based Access Control (ReBAC) through the `PolicyAdmin` trait and OPA integration in the `authz-opa` crate. This includes:
+  - `PolicyAdmin` trait in `authz` crate for policy management operations (grant, revoke, has, count, purge)
+  - `OpaPolicyAdmin` implementation that communicates with an OPA server via REST API
+  - Context-aware policy grants that support dynamic attributes
+  - Comprehensive testing using `httpmock` to simulate OPA server interactions
+  - UI components for policy management in the `saas-leptos` example application including policy editor, permission assignment, relationship management, and policy testing/debugging tools
 
 ## Architecture
 

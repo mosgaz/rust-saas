@@ -42,8 +42,8 @@
 //! `Option<String>` is expected.
 
 use crate::auth::{
-    login, register, request_email_verification, request_password_reset, reset_password,
-    take_return_url, verify_email,
+    begin_totp_setup, confirm_totp, disable_totp, is_totp_enabled, login, register, request_email_verification, request_password_reset, reset_password,
+    take_return_url, verify_email, verify_recovery_code, verify_totp_code,
 };
 use crate::email::EmailResult;
 use domain::AuthUser;
@@ -51,6 +51,8 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params};
 use leptos_router::params::Params;
+use rust_saas::authn::AuthnError;
+use server_fn::error::ServerFnError;
 
 // ─── Login ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +75,10 @@ pub fn LoginPage() -> impl IntoView {
                         let back = take_return_url().await.ok().flatten();
                         let target = back.unwrap_or_else(|| "/".to_string());
                         navigate(&target, Default::default());
+                    }
+                    Err(ServerFnError::ServerError(val)) if val == AuthnError::TwoFactorRequired.to_string() => {
+                        // Redirect to 2FA verification page with email and password
+                        navigate(&format!("/2fa/verify?email={}&password={}", email.get(), password.get()), Default::default());
                     }
                     Err(e) => error.set(Some(e.to_string())),
                 }
@@ -98,6 +104,395 @@ pub fn LoginPage() -> impl IntoView {
                 {move || error.get().map(|e| view! { <p class="text-red-400">{e}</p> })}
                 {move || user.get().map(|u| view! { <p class="text-green-400">{u.email}</p> })}
             </div>
+        </main>
+    }
+}
+
+// ─── 2FA Setup ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq)]
+enum TotpSetupStep {
+    QrCode,
+    RecoveryCodes,
+}
+
+#[component]
+pub fn TotpSetupPage() -> impl IntoView {
+    let step = RwSignal::new(TotpSetupStep::QrCode);
+    let secret = RwSignal::new(String::new());
+    let recovery_codes = RwSignal::new(Vec::new());
+    let code = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+    let loading = RwSignal::new(false);
+
+    // Start the setup process
+    Effect::new(move |_| {
+        spawn_local(async move {
+            match begin_totp_setup().await {
+                Ok(s) => secret.set(s),
+                Err(e) => error.set(Some(e.to_string())),
+            }
+        });
+    });
+
+    let setup_totp = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        let code_val = code.get();
+        if code_val.is_empty() {
+            error.set(Some("Please enter the code from your authenticator app".into()));
+            return;
+        }
+        loading.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match confirm_totp(code_val).await {
+                Ok(codes) => {
+                    recovery_codes.set(codes);
+                    step.set(TotpSetupStep::RecoveryCodes);
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            loading.set(false);
+        });
+    };
+
+    let totp_url = move || {
+        let s = secret.get();
+        if s.is_empty() {
+            "".to_string()
+        } else {
+            // Generate a URL for the authenticator app
+            format!("otpauth://totp/Rust-SaaS?secret={}&issuer=Rust-SaaS", s)
+        }
+    };
+
+    view! {
+        <main class="mx-auto max-w-sm p-8">
+            <h1 class="text-2xl font-bold">"Set up Two-Factor Authentication"</h1>
+
+            {move || match step.get() {
+                TotpSetupStep::QrCode => view! {
+                    <div class="mt-6 space-y-4">
+                        <p class="text-sm text-neutral-400">
+                            "To enable two-factor authentication, scan the QR code below with your authenticator app (like Google Authenticator or Authy)."
+                        </p>
+                        <div class="card p-4">
+                            <img
+                                src=totp_url
+                                alt="QR code for 2FA setup"
+                                class="mx-auto my-4"
+                            />
+                            <p class="text-sm text-center">
+                                "Secret: " {secret.get()}
+                            </p>
+                        </div>
+                        <p class="text-sm text-neutral-400">
+                            "Enter the 6-digit code from your authenticator app to complete setup."
+                        </p>
+                        <input
+                            class="input"
+                            placeholder="123456"
+                            bind:value=code
+                            on:input=move |_| error.set(None)
+                        />
+                        {move || error.get().map(|e| view! { <p class="text-red-400">{e}</p> })}
+                        <button class="btn" on:click=setup_totp>
+                            {move || if loading.get() { "Verifying..." } else { "Verify Code" }}
+                        </button>
+                    </div>
+                }.into_any(),
+                TotpSetupStep::RecoveryCodes => view! {
+                    <div class="mt-6 space-y-4">
+                        <p class="text-sm text-neutral-400">
+                            "Save these recovery codes in a safe place. You can use them to access your account if you lose your authenticator device."
+                        </p>
+                        <div class="card p-4">
+                            <div class="grid grid-cols-2 gap-2">
+                                {move || {
+                                    let codes = recovery_codes.get();
+                                    codes.iter().map(|code| {
+                                        view! { <p class="text-sm font-mono">{code.clone()}</p> }
+                                    }).collect_view()
+                                }}
+                            </div>
+                        </div>
+                        <p class="text-sm text-neutral-400">
+                            "These codes will only be shown once. If you don't save them now, you'll need to generate new ones."
+                        </p>
+                        <a class="btn" href="/account">"I've saved my codes"</a>
+                    </div>
+                }.into_any(),
+            }}
+        </main>
+    }
+}
+
+// ─── 2FA Verification ──────────────────────────────────────────────────────
+
+
+#[derive(Params, PartialEq, Clone)]
+struct TotpVerificationParams {
+    email: Option<String>,
+    password: Option<String>,
+}
+
+#[component]
+pub fn TotpVerificationPage() -> impl IntoView {
+    let params = use_params::<TotpVerificationParams>();
+    let email = RwSignal::new(String::new());
+    let password = RwSignal::new(String::new());
+    let code = RwSignal::new(String::new());
+    let recovery_code = RwSignal::new(String::new());
+    let verification_method = RwSignal::new("totp".to_string());
+    let error = RwSignal::new(None::<String>);
+    let verifying = RwSignal::new(false);
+    let navigate = use_navigate();
+    let navigate_clone = navigate.clone();
+
+    // Extract email and password from query parameters
+    Effect::new(move |_| {
+        match params.get() {
+            Ok(p) => {
+                if let Some(e) = p.email {
+                    email.set(e);
+                }
+                if let Some(p) = p.password {
+                    password.set(p);
+                }
+            }
+            Err(_) => {
+                // Handle error if params parsing fails
+                tracing::warn!("Failed to parse URL parameters");
+            }
+        }
+    });
+
+    let verify_totp = move |_| {
+        if verifying.get_untracked() {
+            return;
+        }
+        let code_val = code.get();
+        let email_val = email.get();
+        let password_val = password.get();
+        let navigate = navigate_clone.clone();
+
+        if code_val.is_empty() {
+            error.set(Some("Please enter the code from your authenticator app".into()));
+            return;
+        }
+        if email_val.is_empty() || password_val.is_empty() {
+            error.set(Some("Missing credentials".into()));
+            return;
+        }
+
+        verifying.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match verify_totp_code(email_val, password_val, code_val).await {
+                Ok(user) => {
+                    let back = take_return_url().await.ok().flatten();
+                    let target = back.unwrap_or_else(|| "/".to_string());
+                    navigate(&target, Default::default());
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            verifying.set(false);
+        });
+    };
+
+    let verify_recovery = move |_| {
+        if verifying.get_untracked() {
+            return;
+        }
+        let recovery_val = recovery_code.get();
+        let email_val = email.get();
+        let password_val = password.get();
+        let navigate = navigate_clone.clone();
+
+        if recovery_val.is_empty() {
+            error.set(Some("Please enter a recovery code".into()));
+            return;
+        }
+        if email_val.is_empty() || password_val.is_empty() {
+            error.set(Some("Missing credentials".into()));
+            return;
+        }
+
+        verifying.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match verify_recovery_code(email_val, password_val, recovery_val).await {
+                Ok(user) => {
+                    let back = take_return_url().await.ok().flatten();
+                    let target = back.unwrap_or_else(|| "/".to_string());
+                    navigate(&target, Default::default());
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            verifying.set(false);
+        });
+    };
+
+    view! {
+        <main class="mx-auto max-w-sm p-8">
+            <h1 class="text-2xl font-bold">"Two-Factor Authentication"</h1>
+            <p class="mt-2 text-sm text-neutral-400">
+                "Enter the code from your authenticator app to sign in."
+            </p>
+
+            <div class="mt-6 space-y-4">
+                <div class="flex space-x-4 mb-4">
+                    <button
+                        class="px-4 py-2 text-sm font-medium rounded-lg"
+                        class:selected-totp=move || verification_method.get() == "totp"
+                        on:click=move |_| verification_method.set("totp".to_string())
+                    >
+                        "Authenticator App"
+                    </button>
+                    <button
+                        class="px-4 py-2 text-sm font-medium rounded-lg"
+                        class:selected-recovery=move || verification_method.get() == "recovery"
+                        on:click=move |_| verification_method.set("recovery".to_string())
+                    >
+                        "Recovery Code"
+                    </button>
+                </div>
+
+                {move || match verification_method.get().as_str() {
+                    "totp" => view! {
+                        <div>
+                            <input
+                                class="input"
+                                placeholder="123456"
+                                bind:value=code
+                                on:input=move |_| error.set(None)
+                            />
+                            <button class="btn mt-4" on:click=verify_totp>
+                                {move || if verifying.get() { "Verifying..." } else { "Verify Code" }}
+                            </button>
+                        </div>
+                    }.into_any(),
+                    "recovery" => view! {
+                        <div>
+                            <input
+                                class="input"
+                                placeholder="ABCD123456"
+                                bind:value=recovery_code
+                                on:input=move |_| error.set(None)
+                            />
+                            <button class="btn mt-4" on:click=verify_recovery>
+                                {move || if verifying.get() { "Verifying..." } else { "Verify Code" }}
+                            </button>
+                        </div>
+                    }.into_any(),
+                    _ => view! { <p>"Invalid method"</p> }.into_any(),
+                }}
+
+                {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
+            </div>
+        </main>
+    }
+}
+
+// ─── 2FA Management ────────────────────────────────────────────────────────
+
+#[component]
+pub fn TotpManagementPage() -> impl IntoView {
+    let totp_enabled = RwSignal::new(false);
+    let loading = RwSignal::new(true);
+    let error = RwSignal::new(None::<String>);
+    let navigate = use_navigate();
+
+    // Load current 2FA status
+    Effect::new(move |_| {
+        spawn_local(async move {
+            match is_totp_enabled().await {
+                Ok(enabled) => totp_enabled.set(enabled),
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            loading.set(false);
+        });
+    });
+
+    let disable_totp = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        loading.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match disable_totp().await {
+                Ok(()) => {
+                    totp_enabled.set(false);
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            loading.set(false);
+        });
+    };
+
+    view! {
+        <main class="mx-auto max-w-sm p-8">
+            <h1 class="text-2xl font-bold">"Two-Factor Authentication"</h1>
+
+            {move || if loading.get() {
+                view! { <p class="mt-6 text-neutral-400">"Loading..."</p> }.into_any()
+            } else {
+                view! {
+                    <div class="mt-6 space-y-6">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <h3 class="font-medium">"Authenticator App"</h3>
+                                <p class="text-sm text-neutral-400">
+                                    "Use an app like Google Authenticator or Authy to generate codes."
+                                </p>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                {move || if totp_enabled.get() {
+                                    view! {
+                                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                            "Enabled"
+                                        </span>
+                                        <button
+                                            class="text-sm text-red-400 hover:text-red-300"
+                                            on:click=disable_totp
+                                        >
+                                            "Disable"
+                                        </button>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
+                                            "Disabled"
+                                        </span>
+                                        <a
+                                            class="text-sm text-blue-400 hover:text-blue-300"
+                                            href="/2fa/setup"
+                                        >
+                                            "Set up"
+                                        </a>
+                                    }.into_any()
+                                }}
+                            </div>
+                        </div>
+
+                        <div class="border-t border-neutral-800 pt-6">
+                            <h3 class="font-medium mb-2">"Recovery Codes"</h3>
+                            <p class="text-sm text-neutral-400 mb-4">
+                                "Recovery codes can be used to access your account if you lose your authenticator device."
+                            </p>
+                            <button class="btn text-sm">
+                                "Generate New Codes"
+                            </button>
+                        </div>
+                    </div>
+                }.into_any()
+            }}
+
+            {move || error.get().map(|e| view! { <p class="mt-4 text-red-400">{e}</p> })}
         </main>
     }
 }

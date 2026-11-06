@@ -73,6 +73,26 @@ Idempotent — safe on every start. **Replace these 3 custom types with your dom
 
 The whole registry story (SQL / `bootstrap_*` / `register_resource_type`) is documented in `saas-external-02.md §6` (A8) — decision matrix "3 ways to register resources".
 
+## What Phase B added (ABAC/ReBAC with OPA integration)
+
+**Policy administration setup** (`src/main.rs`, in `AppState` initialization):
+
+```rust
+let policy_admin = Arc::new(OpaPolicyAdmin::new(
+    OPA_URL.parse().unwrap_or_else(|_| "http://localhost:8181".parse().unwrap())
+).unwrap());
+```
+
+The `OpaPolicyAdmin` instance is created with the OPA server URL (defaulting to http://localhost:8181) and added to the application state for use by server functions.
+
+**Policy management UI** (`src/pages/policy.rs`): A comprehensive policy management interface with multiple components:
+- `PolicyEditor`: Component for creating and modifying OPA policies with subject, permission, resource, and optional JSON context
+- `PermissionAssignment`: Component for searching and managing permissions with filtering capabilities and permission checking
+- `RelationshipManagement`: Component for handling ReBAC scenarios, allowing users to manage relationships between subjects and resources
+- `PolicyTesting`: Component for testing and debugging policies with test case creation, execution, result visualization, and persistence
+
+The UI is accessible at `/policy` and provides a tabbed interface for navigating between different policy management functions. Server functions in `src/auth.rs` handle the backend operations using the `policy_admin` from `AppState`.
+
 ## What-is-NOT-included (you write these)
 
 - Your domain model (`courses`, `lessons`, `assignments` — 1:1 to `workspaces`/`documents` via consumer migrations `90000000000000+`)

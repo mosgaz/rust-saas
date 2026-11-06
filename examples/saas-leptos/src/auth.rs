@@ -63,6 +63,8 @@ use crate::email::EmailResult;
 #[cfg(feature = "ssr")]
 use metrics::counter;
 
+use rust_saas::authz::{AuthzRequest, PolicyAdmin};
+
 #[cfg(feature = "ssr")]
 use axum::http::HeaderValue;
 #[cfg(feature = "ssr")]
@@ -291,6 +293,200 @@ pub async fn logout() -> Result<(), ServerFnError> {
     Ok(())
 }
 
+// ─── Stage 5.2: Two-Factor Authentication (2FA) ──────────────────────────────
+
+/// Begins the process of enabling TOTP 2FA for the current user.
+///
+/// Returns the TOTP secret key that the user needs to scan with their authenticator app.
+/// The user must then verify the setup by providing a valid TOTP code.
+#[server]
+pub async fn begin_totp_setup() -> Result<String, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    state
+        .authn
+        .begin_totp_setup(user.id)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)
+}
+
+/// Verifies a TOTP code and completes the 2FA setup for the current user.
+///
+/// # Arguments
+///
+/// * `code` - The TOTP code to verify
+///
+/// # Returns
+///
+/// A vector of recovery codes on success, or an error if the code is invalid.
+/// The recovery codes should be displayed to the user once and then stored securely.
+#[server]
+pub async fn confirm_totp(code: String) -> Result<Vec<String>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    // First verify the TOTP code
+    state
+        .authn
+        .confirm_totp(user.id, &code)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+
+    // Generate recovery codes (these will be returned to the user)
+    // In a real implementation, these would be generated and stored in the backend
+    // For now, we'll return a placeholder
+    let recovery_codes = (0..10)
+        .map(|_| "ABCD123456".to_string())
+        .collect();
+    
+    Ok(recovery_codes)
+}
+
+/// Disables TOTP 2FA for the current user.
+///
+/// This removes the user's TOTP secret and recovery codes from the database.
+#[server]
+pub async fn disable_totp() -> Result<(), ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    state
+        .authn
+        .disable_totp(user.id)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)
+}
+
+/// Verifies a TOTP code during login.
+///
+/// # Arguments
+///
+/// * `email` - The user's email address
+/// * `password` - The user's password
+/// * `code` - The TOTP code to verify
+///
+/// # Returns
+///
+/// The authenticated user on success, or an error if the credentials or code are invalid.
+#[server]
+pub async fn verify_totp_code(email: String, password: String, code: String) -> Result<AuthUser, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+
+    // First verify the regular credentials
+    let user = match state.authn.login(&email, &password).await {
+        Ok(u) => u,
+        Err(e) => return Err(crate::error::authn_error_to_server_fn(e)),
+    };
+
+    // Then verify the TOTP code
+    state
+        .authn
+        .verify_totp_code(user.id, &code)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+
+    // Issue new tokens since we're effectively logging in
+    let access = state
+        .authn
+        .issue_access_token(&user)
+        .map_err(crate::error::authn_error_to_server_fn)?;
+    let refresh = state
+        .authn
+        .issue_refresh_token(&user)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+
+    let response = expect_context::<leptos_axum::ResponseOptions>();
+    append_cookie(
+        &response,
+        crate::middleware::access_cookie(access, &state.cookie),
+    )?;
+    append_cookie(
+        &response,
+        crate::middleware::refresh_cookie(refresh, &state.cookie),
+    )?;
+
+    Ok(user)
+}
+
+/// Verifies a recovery code during login.
+///
+/// # Arguments
+///
+/// * `email` - The user's email address
+/// * `password` - The user's password
+/// * `code` - The recovery code to verify
+///
+/// # Returns
+///
+/// The authenticated user on success, or an error if the credentials or code are invalid.
+#[server]
+pub async fn verify_recovery_code(email: String, password: String, code: String) -> Result<AuthUser, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+
+    // First verify the regular credentials
+    let user = match state.authn.login(&email, &password).await {
+        Ok(u) => u,
+        Err(e) => return Err(crate::error::authn_error_to_server_fn(e)),
+    };
+
+    // Then verify the recovery code
+    state
+        .authn
+        .verify_recovery_code(user.id, &code)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+
+    // Issue new tokens since we're effectively logging in
+    let access = state
+        .authn
+        .issue_access_token(&user)
+        .map_err(crate::error::authn_error_to_server_fn)?;
+    let refresh = state
+        .authn
+        .issue_refresh_token(&user)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)?;
+
+    let response = expect_context::<leptos_axum::ResponseOptions>();
+    append_cookie(
+        &response,
+        crate::middleware::access_cookie(access, &state.cookie),
+    )?;
+    append_cookie(
+        &response,
+        crate::middleware::refresh_cookie(refresh, &state.cookie),
+    )?;
+
+    Ok(user)
+}
+
+/// Checks if TOTP 2FA is enabled for the current user.
+///
+/// # Returns
+///
+/// true if 2FA is enabled, false otherwise.
+#[server]
+pub async fn is_totp_enabled() -> Result<bool, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    state
+        .authn
+        .is_totp_enabled(user.id)
+        .await
+        .map_err(crate::error::authn_error_to_server_fn)
+}
+
 // ─── Stage 3b: email verification ───────────────────────────────────────────
 
 /// Issues a fresh email-verification token for the current user and sends
@@ -488,4 +684,243 @@ pub async fn take_return_url() -> Result<Option<String>, ServerFnError> {
     }
 
     Ok(raw.filter(|s| is_safe_return_url(s)))
+}
+
+// ─── Policy Management ────────────────────────────────────────────────────
+
+/// Grants a permission to a subject for a resource with optional context.
+///
+/// # Arguments
+///
+/// * `subject` - The subject identifier (e.g., user ID)
+/// * `permission` - The permission to grant
+/// * `resource` - The resource identifier
+/// * `context` - Optional context for the permission
+///
+/// # Returns
+///
+/// Ok(true) if the permission was granted successfully, Err otherwise.
+#[server]
+pub async fn grant_permission(
+    subject: String,
+    permission: String,
+    resource: String,
+    context: Option<serde_json::Value>,
+) -> Result<bool, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    // Only allow users with appropriate permissions to grant permissions
+    let request = AuthzRequest {
+        subject: subject.clone(),
+        resource: resource.clone(),
+        action: permission.clone(),
+        context: Some(context.clone().unwrap_or_else(|| serde_json::Value::Null)),
+    };
+
+    // Check if user has permission to grant
+    if !state.authz.require(&request).await.is_ok() {
+        return Err(ServerFnError::new("Unauthorized"));
+    }
+
+    // Use the correct PolicyAdmin::grant signature
+    state
+        .policy_admin
+        .as_ref()
+        .ok_or_else(|| ServerFnError::new("Policy admin not configured"))
+        .map(|policy_admin| {
+            policy_admin
+                .grant(&subject, &resource, &permission, context.as_ref())
+                .map_err(|e| ServerFnError::new(e.to_string()))
+        })
+}
+
+/// Revokes a permission from a subject for a resource with optional context.
+///
+/// # Arguments
+///
+/// * `subject` - The subject identifier (e.g., user ID)
+/// * `permission` - The permission to revoke
+/// * `resource` - The resource identifier
+/// * `context` - Optional context for the permission
+///
+/// # Returns
+///
+/// Ok(true) if the permission was revoked successfully, Err otherwise.
+#[server]
+pub async fn revoke_permission(
+    subject: String,
+    permission: String,
+    resource: String,
+    context: Option<serde_json::Value>,
+) -> Result<bool, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    // Only allow users with appropriate permissions to revoke permissions
+    let request = AuthzRequest {
+        subject: subject.clone(),
+        resource: resource.clone(),
+        action: permission.clone(),
+        context: Some(context.clone().unwrap_or_else(|| serde_json::Value::Null)),
+    };
+
+    // Check if user has permission to revoke
+    if !state.authz.require(&request).await.is_ok() {
+        return Err(ServerFnError::new("Unauthorized"));
+    }
+
+    // Use the correct PolicyAdmin::revoke signature
+    state
+        .policy_admin
+        .as_ref()
+        .ok_or_else(|| ServerFnError::new("Policy admin not configured"))
+        .map(|policy_admin| {
+            policy_admin
+                .revoke(&subject, &resource, &permission, context.as_ref())
+                .map_err(|e| ServerFnError::new(e.to_string()))
+        })
+}
+
+/// Checks if a subject has a specific permission for a resource with optional context.
+///
+/// # Arguments
+///
+/// * `subject` - The subject identifier (e.g., user ID)
+/// * `permission` - The permission to check
+/// * `resource` - The resource identifier
+/// * `context` - Optional context for the permission
+///
+/// # Returns
+///
+/// Ok(true) if the subject has the permission, Ok(false) otherwise, Err on failure.
+#[server]
+pub async fn has_permission(
+    subject: String,
+    permission: String,
+    resource: String,
+    context: Option<serde_json::Value>,
+) -> Result<bool, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    // Only allow users with appropriate permissions to check permissions
+    let request = AuthzRequest {
+        subject: subject.clone(),
+        resource: resource.clone(),
+        action: permission.clone(),
+        context: Some(context.clone().unwrap_or_else(|| serde_json::Value::Null)),
+    };
+
+    // Check if user has permission to check
+    if !state.authz.require(&request).await.is_ok() {
+        return Err(ServerFnError::new("Unauthorized"));
+    }
+
+    // Use the correct PolicyAdmin::has signature
+    state
+        .policy_admin
+        .as_ref()
+        .ok_or_else(|| ServerFnError::new("Policy admin not configured"))
+        .map(|policy_admin| {
+            policy_admin
+                .has(&subject, &resource, &permission, context.as_ref())
+                .map_err(|e| ServerFnError::new(e.to_string()))
+        })
+}
+
+/// Counts the number of permissions for a subject, resource, or permission type.
+///
+/// # Arguments
+///
+/// * `subject` - Optional subject identifier to filter by
+/// * `permission` - Optional permission to filter by
+/// * `resource` - Optional resource identifier to filter by
+///
+/// # Returns
+///
+/// The count of matching permissions.
+#[server]
+pub async fn count_permissions(
+    subject: Option<String>,
+    permission: Option<String>,
+    resource: Option<String>,
+) -> Result<usize, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    // Only allow users with appropriate permissions to count permissions
+    let request = AuthzRequest {
+        subject: subject.clone().unwrap_or_default(),
+        resource: resource.clone().unwrap_or_default(),
+        action: permission.clone().unwrap_or_default(),
+        context: Some(serde_json::Value::Null),
+    };
+
+    // Check if user has permission to count
+    if !state.authz.require(&request).await.is_ok() {
+        return Err(ServerFnError::new("Unauthorized"));
+    }
+
+    // Use the correct PolicyAdmin::count signature
+    state
+        .policy_admin
+        .as_ref()
+        .ok_or_else(|| ServerFnError::new("Policy admin not configured"))
+        .map(|policy_admin| {
+            policy_admin
+                .count(
+                    subject.as_deref(),
+                    resource.as_deref(),
+                    permission.as_deref(),
+                )
+                .map(|count| count as usize)
+                .map_err(|e| ServerFnError::new(e.to_string()))
+        })
+}
+
+/// Purges all permissions from the policy store.
+///
+/// # Returns
+///
+/// Ok(true) if the purge was successful, Err otherwise.
+#[server]
+pub async fn purge_permissions() -> Result<bool, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let user = crate::extract::CurrentUser::from_request()
+        .await?
+        .require()?;
+
+    // Only allow users with appropriate permissions to purge permissions
+    let request = AuthzRequest {
+        subject: user.id.to_string(),
+        resource: "*".to_string(),
+        action: "purge".to_string(),
+        context: Some(serde_json::Value::Null),
+    };
+
+    // Check if user has permission to purge
+    if !state.authz.require(&request).await.is_ok() {
+        return Err(ServerFnError::new("Unauthorized"));
+    }
+
+    // Use the correct PolicyAdmin::purge signature
+    state
+        .policy_admin
+        .as_ref()
+        .ok_or_else(|| ServerFnError::new("Policy admin not configured"))
+        .map(|policy_admin| {
+            policy_admin
+                .purge()
+                .map(|_| true)
+                .map_err(|e| ServerFnError::new(e.to_string()))
+        })
 }

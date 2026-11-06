@@ -198,12 +198,16 @@ version = "0.3.0"
 dependencies = [
  "argon2",
  "audit",
+ "base32",
  "chrono",
  "domain",
+ "hmac",
  "identity",
  "jsonwebtoken",
+ "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha-1",
  "sha2",
  "sqlx",
  "thiserror 2.0.21",
@@ -335,6 +339,12 @@ name = "base16"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d27c3610c36aee21ce8ac510e6224498de4228ad772a171ed65643a24693a5a8"
+
+[[package]]
+name = "base32"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23ce669cd6c8588f79e15cf450314f9638f967fc5770ff1c7c1deb0925ea7cfa"
 
 [[package]]
 name = "base64"
@@ -3203,6 +3213,17 @@ checksum = "d9a4f81a0d855f279c3448243138a55cbfdd9851da9341b9c1e5971b90089e61"
 dependencies = [
  "server_fn_macro",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "sha-1"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5058ada175748e33390e40e872bd0fe59a19f265d0158daa551c5a88a76009c"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

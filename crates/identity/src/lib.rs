@@ -34,6 +34,10 @@ pub enum IdentityError {
     Validation(String),
     #[error("db error: {0}")]
     Db(String),
+    #[error("external identity already linked")]
+    DuplicateExternalIdentity,
+    #[error("external identity not found")]
+    ExternalIdentityNotFound,
 }
 
 /// Full `users` row, including `password_hash`, `email_verified_at`, and
@@ -46,12 +50,12 @@ pub enum IdentityError {
 pub struct UserRecord {
     pub id: Uuid,
     pub email: String,
-    pub password_hash: String,
+    pub password_hash: Option<String>,
     pub email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
     /// When the password was last changed (Stage 3d). Source of truth for
     /// the iat-vs-`password_changed_at` check in Stage 4; this stage only
     /// maintains it.
-    pub password_changed_at: chrono::DateTime<chrono::Utc>,
+    pub password_changed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -271,5 +275,224 @@ pub async fn update_password_tx(
     if updated.rows_affected() == 0 {
         return Err(IdentityError::NotFound);
     }
+    Ok(())
+}
+
+/// Creates a user with an external identity (e.g., OIDC).
+///
+/// This function creates a new user with the provided email and links the
+/// external identity (provider + external_id) to the user. Since the user
+/// authenticates via an external provider, no password_hash is stored.
+///
+/// # Arguments
+///
+/// * `pool` - Database connection pool
+/// * `email` - User's email address
+/// * `provider` - External identity provider (e.g., "google", "github")
+/// * `external_id` - User ID from the external provider
+/// * `email_verified` - Whether the email has been verified by the provider
+///
+/// # Returns
+///
+/// The created AuthUser on success, or an error if the email is already
+/// registered or another database error occurs.
+///
+/// # Note
+///
+/// The user's `password_hash` is NULL since they authenticate via external
+/// provider. `password_changed_at` is also NULL as there is no password.
+/// `email_verified_at` is set based on the `email_verified` parameter.
+pub async fn create_external_user(
+    pool: &PgPool,
+    email: &str,
+    provider: &str,
+    external_id: &str,
+    email_verified: bool,
+) -> Result<AuthUser, IdentityError> {
+    validate_email(email)?;
+
+    let email_verified_at = if email_verified {
+        Some(chrono::Utc::now())
+    } else {
+        None
+    };
+
+    let mut tx = pool.begin().await?;
+
+    // First, create the user
+    let user = sqlx::query_as::<_, AuthUser>(
+        r#"
+        insert into users (email, email_verified_at)
+        values ($1, $2)
+        returning id, email, (email_verified_at is not null) as email_verified, created_at
+        "#,
+    )
+    .bind(email)
+    .bind(email_verified_at)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(db) if db.constraint() == Some("users_email_key") => {
+            IdentityError::DuplicateEmail
+        }
+        other => IdentityError::Db(other.to_string()),
+    })?;
+
+    // Then, link the external identity
+    sqlx::query(
+        r#"
+        insert into external_identities (user_id, provider, external_id, email)
+        values ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(user.id)
+    .bind(provider)
+    .bind(external_id)
+    .bind(email)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(db) if db.constraint() == Some("external_identities_pkey") => {
+            IdentityError::DuplicateExternalIdentity
+        }
+        other => IdentityError::Db(other.to_string()),
+    })?;
+
+    tx.commit().await?;
+
+    Ok(user)
+}
+
+/// Finds a user by their external identity (provider + external_id).
+///
+/// # Arguments
+///
+/// * `pool` - Database connection pool
+/// * `provider` - External identity provider (e.g., "google", "github")
+/// * `external_id` - User ID from the external provider
+///
+/// # Returns
+///
+/// The AuthUser if found, None if no user with that external identity exists,
+/// or an error if a database error occurs.
+pub async fn find_by_external_id(
+    pool: &PgPool,
+    provider: &str,
+    external_id: &str,
+) -> Result<Option<AuthUser>, IdentityError> {
+    let user = sqlx::query_as::<_, AuthUser>(
+        r#"
+        select u.id, u.email, (u.email_verified_at is not null) as email_verified, u.created_at
+        from users u
+        join external_identities ei on u.id = ei.user_id
+        where ei.provider = $1 and ei.external_id = $2
+        "#,
+    )
+    .bind(provider)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(user)
+}
+
+/// Links an external identity to an existing user.
+///
+/// This function connects an external identity (e.g., from Google, GitHub)
+/// to an existing user account. This allows users to sign in with multiple
+/// providers or link social accounts to their existing account.
+///
+/// # Arguments
+///
+/// * `pool` - Database connection pool
+/// * `user_id` - ID of the existing user
+/// * `provider` - External identity provider (e.g., "google", "github")
+/// * `external_id` - User ID from the external provider
+/// * `email` - Email address from the external provider
+///
+/// # Returns
+///
+/// Ok(()) on success, or an error if the external identity is already
+/// linked to another user or another database error occurs.
+///
+/// # Note
+///
+/// This function does not verify that the email from the external provider
+/// matches the user's email. That validation should be done by the caller
+/// if desired.
+pub async fn link_external_identity(
+    pool: &PgPool,
+    user_id: Uuid,
+    provider: &str,
+    external_id: &str,
+    email: &str,
+) -> Result<(), IdentityError> {
+    sqlx::query(
+        r#"
+        insert into external_identities (user_id, provider, external_id, email)
+        values ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(user_id)
+    .bind(provider)
+    .bind(external_id)
+    .bind(email)
+    .execute(pool)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(db) if db.constraint() == Some("external_identities_pkey") => {
+            IdentityError::DuplicateExternalIdentity
+        }
+        sqlx::Error::Database(db) if db.constraint() == Some("external_identities_user_id_fkey") => {
+            IdentityError::NotFound
+        }
+        other => IdentityError::Db(other.to_string()),
+    })?;
+
+    Ok(())
+}
+
+/// Unlinks an external identity from a user.
+///
+/// This function removes the connection between an external identity and a
+/// user account. If this was the user's only authentication method, they
+/// will no longer be able to sign in unless they have a password or another
+/// linked identity.
+///
+/// # Arguments
+///
+/// * `pool` - Database connection pool
+/// * `user_id` - ID of the user
+/// * `provider` - External identity provider to unlink
+///
+/// # Returns
+///
+/// Ok(()) on success, or an error if the external identity was not found
+/// or another database error occurs.
+///
+/// # Note
+///
+/// This function does not delete the user account, only the link to the
+/// external provider. The user account remains intact.
+pub async fn unlink_external_identity(
+    pool: &PgPool,
+    user_id: Uuid,
+    provider: &str,
+) -> Result<(), IdentityError> {
+    let result = sqlx::query(
+        r#"
+        delete from external_identities
+        where user_id = $1 and provider = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(provider)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(IdentityError::ExternalIdentityNotFound);
+    }
+
     Ok(())
 }

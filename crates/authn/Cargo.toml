@@ -23,6 +23,14 @@ tracing.workspace = true
 # SHA-256 for `refresh_tokens.token_hash` (Stage 2b). Not used for passwords
 # (passwords are Argon2, see `hash_password`).
 sha2.workspace = true
+# Random number generation for TOTP and recovery codes
+rand = "0.8"
+# SHA-1 for TOTP implementation
+sha-1 = "0.10"
+# HMAC for TOTP implementation
+hmac = "0.12"
+# Base32 encoding for TOTP secret
+base32 = "0.4"
 
 [dev-dependencies]
 tokio.workspace = true

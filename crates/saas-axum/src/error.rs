@@ -141,6 +141,8 @@ fn status_for_identity(e: &IdentityError) -> StatusCode {
         IdentityError::NotFound => StatusCode::NOT_FOUND,
         IdentityError::DuplicateEmail => StatusCode::CONFLICT,
         IdentityError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        IdentityError::DuplicateExternalIdentity => StatusCode::CONFLICT,
+        IdentityError::ExternalIdentityNotFound => StatusCode::NOT_FOUND,
     }
 }
 
@@ -151,6 +153,7 @@ fn status_for_identity_kind(e: &authn::IdentityErrorKind) -> StatusCode {
         IdentityErrorKind::NotFound => StatusCode::NOT_FOUND,
         IdentityErrorKind::DuplicateEmail => StatusCode::CONFLICT,
         IdentityErrorKind::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        IdentityErrorKind::Conflict(_) => StatusCode::CONFLICT,
     }
 }
 
@@ -163,6 +166,9 @@ fn status_for_authn(e: &AuthnError) -> StatusCode {
         AuthnError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         AuthnError::Identity(inner) => status_for_identity_kind(inner),
         AuthnError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        AuthnError::TwoFactorRequired => StatusCode::UNAUTHORIZED,
+        AuthnError::InvalidTotpCode => StatusCode::UNAUTHORIZED,
+        AuthnError::InvalidRecoveryCode => StatusCode::UNAUTHORIZED,
     }
 }
 

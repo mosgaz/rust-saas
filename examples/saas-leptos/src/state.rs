@@ -9,6 +9,8 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use rust_saas::authn::Authn;
 #[cfg(feature = "ssr")]
 use rust_saas::saas::SaasState;
+#[cfg(feature = "ssr")]
+use rust_saas::authz::PolicyAdmin;
 
 #[cfg(feature = "ssr")]
 use crate::cookie::CookieConfig;
@@ -40,6 +42,8 @@ pub struct AppState {
     /// `tests/e2e.rs` via `PrometheusBuilder::build_recorder()`;
     /// `/metrics` renders it.
     pub prometheus: PrometheusHandle,
+    /// Policy administration implementation for managing OPA policies
+    pub policy_admin: Arc<dyn PolicyAdmin>,
 }
 
 #[cfg(feature = "ssr")]

@@ -13,7 +13,7 @@
 
 use authz::{AuthzError, PolicyAdmin, AuthzRequest};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 use url::Url;
 
@@ -113,25 +113,44 @@ impl PolicyAdmin for OpaPolicyAdmin {
         context: Option<&Value>,
     ) -> Result<(), AuthzError> {
         let policy_id = format!("{}_{}_{}", subject, resource, action);
-        let mut rule_body = serde_json::json!({
+        // Create the rule body with just the allow field
+        let rule_body = serde_json::json!({
             "allow": true
         });
 
-        if let Some(ctx) = context {
-            if let Some(obj) = ctx.as_object() {
-                for (key, value) in obj {
-                    rule_body[key] = value.clone();
-                }
-            }
-        }
-
-        let policy = serde_json::json!({
+        // Create the policy with proper structure
+        let mut policy = serde_json::json!({
             "package": "authz",
             "import": [
                 "data.graph"
             ],
             "result": rule_body
         });
+
+        // If context is provided, create a rule that checks the context
+        if let Some(ctx) = context {
+            if let Some(obj) = ctx.as_object() {
+                // Add conditions to the rule body to check context attributes
+                let condition = obj.iter().map(|(key, value)| {
+                    format!("input.context.{} == {}", key, serde_json::to_string(value).unwrap())
+                }).collect::<Vec<String>>().join(" && ");
+                
+                if !condition.is_empty() {
+                    // Create a proper Rego rule with context
+                    // The rule should be: allow {
+                    //   input.context.department == "engineering"
+                    //   input.context.level == "senior"
+                    // }
+                    let mut rule_parts = vec!["allow".to_string()];
+                    
+                    for (key, value) in obj {
+                        rule_parts.push(format!("input.context.{} == {}", key, serde_json::to_string(value).unwrap()));
+                    }
+                    
+                    policy["result"] = serde_json::Value::String(rule_parts.join("\n  "));
+                }
+            }
+        }
 
         let response = self
             .client
@@ -144,7 +163,8 @@ impl PolicyAdmin for OpaPolicyAdmin {
         let status = response.status();
         let text = response.text().await.map_err(OpaError::from)?;
 
-        if !status.is_success() {
+        // For DELETE operations, treat 404 as success (idempotent)
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
             return Err(OpaError::Opa {
                 code: status.as_u16(),
                 message: text,
@@ -173,7 +193,8 @@ impl PolicyAdmin for OpaPolicyAdmin {
         let status = response.status();
         let text = response.text().await.map_err(OpaError::from)?;
 
-        if !status.is_success() {
+        // For DELETE operations, treat 404 as success (idempotent)
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
             return Err(OpaError::Opa {
                 code: status.as_u16(),
                 message: text,
@@ -191,12 +212,24 @@ impl PolicyAdmin for OpaPolicyAdmin {
         action: &str,
         context: Option<&Value>,
     ) -> Result<bool, AuthzError> {
-        let request = AuthzRequest {
+        let mut request = AuthzRequest {
             subject: subject.to_string(),
             resource: resource.to_string(),
             action: action.to_string(),
             context: context.cloned(),
         };
+
+        // If context is provided, merge it with the request context
+        if let Some(ctx) = context {
+            if let Some(request_context) = request.context.as_mut() {
+                // Merge the provided context with the request context
+                for (k, v) in ctx.as_object().unwrap().iter() {
+                    request_context[k] = v.clone();
+                }
+            } else {
+                request.context = Some(ctx.clone());
+            }
+        }
 
         let opa_request = OpaRequest { input: request };
 
@@ -364,10 +397,10 @@ mod tests {
         let policy_id = "user1_document_read";
         let mock = server.mock(|when, then| {
             when.method(PUT)
-               .path(format!("/v1/policies/{}", policy_id).as_str());
-            then.status(200)
-               .expect_body_contains(r#"department": "engineering""#)
-               .expect_body_contains(r#"allow": true"#);
+               .path(format!("/v1/policies/{}", policy_id).as_str())
+               .body_contains("\"department\": \"engineering\"")
+               .body_contains("\"allow\": true");
+            then.status(200);
         });
         
         // Create context with attributes
@@ -475,9 +508,9 @@ mod tests {
         // Extract the context from the request body
         let mock = server.mock(|when, then| {
             when.method(POST)
-               .path("/v1/data/authz/allow");
+               .path("/v1/data/authz/allow")
+               .body_contains("\"department\": \"engineering\"");
             then.status(200)
-               .expect_body_contains(r#"department": "engineering""#)
                .json_body(json!({"result": true}));
         });
         
