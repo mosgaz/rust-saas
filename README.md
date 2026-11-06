@@ -876,7 +876,7 @@ Explicitly **out of scope** for this reference:
 
 ## Compatibility
 
-All `crates/*` share **one version** (`[workspace.package] version = "0.3.0"` (unreleased)). Consumers must pin every path / git dependency to the same revision. See `COMPATIBILITY.md` for the SemVer policy and breaking-change log (`0.3.0` — 5 breaking items from A2.2 + `reload_in_memory` from A1.4 + `migrate_with` deprecated; `axum` feature and `build_app_full_with` are additive; A6, A7'.1, A7'.2 are consumer-only refactors with no library API change).
+All `crates/*` share **one version** (`[workspace.package] version = "0.3.0"`). Consumers must pin every path / git dependency to the same revision.
 
 ## License
 

@@ -6,12 +6,7 @@ and one revision**. Do not mix, for example, `access 0.1.0` with `saas
 version at the source; consumers must pin every path / git dependency to
 the same tag.
 
-**Current version:** `0.3.0` (unreleased — Phase A / Stage 5.0 is
-in progress; `Cargo.toml` → `[workspace.package]` reflects `0.3.0` so a
-consumer who pulls `main` sees cargo's incompatibility warning
-immediately, but the `v0.3.0` tag is applied only after Phase A's DoD
-(`# Stage 5 — план реализации.txt` §4.A9) is closed). See the `0.3.0`
-section below.
+**Current version:** `0.3.0` (released 2026-11-06 — Phase A / Stage 5.0 is closed). See the `0.3.0` section below.
 
 ## Versioning policy
 
