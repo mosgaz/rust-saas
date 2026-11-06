@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "access"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -116,7 +116,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "audit-pg"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "audit",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "authn"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "audit",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "authz"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "authz-casbin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "authz",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "db"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "sqlx",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "domain",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "rate-limiter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "redis",
@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "rust-saas"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "access",
  "anyhow",
@@ -2038,7 +2038,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saas"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "access",
  "async-trait",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "saas-axum"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "access",
  "async-trait",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "seed"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "access",
  "anyhow",
