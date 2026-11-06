@@ -158,13 +158,21 @@ pub async fn create_role(
 
     resolve_domain_tenant(&state, &user, &domain).await?;
 
-    let key = rust_saas::access::RoleKey::parse(key).map_err(crate::error::access_error_to_server_fn)?;
+    let key =
+        rust_saas::access::RoleKey::parse(key).map_err(crate::error::access_error_to_server_fn)?;
     let pairs = parse_permission_pairs(&permissions)?;
 
-    let role =
-        rust_saas::saas::access::create_role(&state.saas, &user, &domain, &key, name, description, &pairs)
-            .await
-            .map_err(crate::error::core_error_to_server_fn)?;
+    let role = rust_saas::saas::access::create_role(
+        &state.saas,
+        &user,
+        &domain,
+        &key,
+        name,
+        description,
+        &pairs,
+    )
+    .await
+    .map_err(crate::error::core_error_to_server_fn)?;
     Ok(RoleView::from(role))
 }
 
@@ -200,9 +208,16 @@ pub async fn update_role(
 
     let pairs = parse_permission_pairs(&permissions)?;
 
-    let role = rust_saas::saas::access::update_role(&state.saas, &user, role_id, name, description, &pairs)
-        .await
-        .map_err(crate::error::core_error_to_server_fn)?;
+    let role = rust_saas::saas::access::update_role(
+        &state.saas,
+        &user,
+        role_id,
+        name,
+        description,
+        &pairs,
+    )
+    .await
+    .map_err(crate::error::core_error_to_server_fn)?;
     Ok(RoleView::from(role))
 }
 

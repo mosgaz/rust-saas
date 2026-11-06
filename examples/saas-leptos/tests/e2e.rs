@@ -724,12 +724,11 @@ async fn bootstrap_registers_core_and_custom_types(pool: PgPool) {
 
         // And their actions landed in `permissions` (A1.2 trigger
         // propagates them to owners).
-        let perms: i64 =
-            sqlx::query_scalar("select count(*) from permissions where resource = $1")
-                .bind(name)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let perms: i64 = sqlx::query_scalar("select count(*) from permissions where resource = $1")
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert!(perms > 0, "`{name}` must have at least one permission row");
     }
 }

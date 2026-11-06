@@ -60,8 +60,8 @@ pub async fn create_workspace(tenant_id: Uuid, name: String) -> Result<Workspace
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    let owner_key =
-        rust_saas::access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
+    let owner_key = rust_saas::access::RoleKey::parse("owner")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     let active = rust_saas::saas::platform::resolve_active_tenant(&state.saas, &user, tenant_id)
         .await

@@ -118,12 +118,13 @@ pub async fn create_tenant(name: String) -> Result<Tenant, ServerFnError> {
     let user = crate::extract::CurrentUser::from_request()
         .await?
         .require()?;
-    let owner_key =
-        rust_saas::access::RoleKey::parse("owner").map_err(|e| ServerFnError::new(e.to_string()))?;
+    let owner_key = rust_saas::access::RoleKey::parse("owner")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let tenant = rust_saas::saas::platform::provision_tenant(&state.saas, &user, name, &user, &owner_key)
-        .await
-        .map_err(crate::error::core_error_to_server_fn)?;
+    let tenant =
+        rust_saas::saas::platform::provision_tenant(&state.saas, &user, name, &user, &owner_key)
+            .await
+            .map_err(crate::error::core_error_to_server_fn)?;
 
     Ok(tenant)
 }
@@ -188,9 +189,10 @@ pub async fn list_audit(
         .await?
         .require()?;
 
-    let perms = rust_saas::saas::access::my_permissions(&state.saas, &user, domain::PLATFORM_DOMAIN)
-        .await
-        .map_err(crate::error::core_error_to_server_fn)?;
+    let perms =
+        rust_saas::saas::access::my_permissions(&state.saas, &user, domain::PLATFORM_DOMAIN)
+            .await
+            .map_err(crate::error::core_error_to_server_fn)?;
     if !perms.iter().any(|(r, a)| r == "audit" && a == "read") {
         return Err(crate::error::core_error_to_server_fn(
             rust_saas::saas::CoreError::Forbidden,

@@ -169,7 +169,9 @@ pub(crate) async fn resolve_domain_tenant(
                 .fetch_optional(state.saas.pool())
                 .await
                 .map_err(|e| ServerFnError::new(e.to_string()))?;
-        tid.ok_or_else(|| crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound))?
+        tid.ok_or_else(|| {
+            crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound)
+        })?
     } else {
         return Err(ServerFnError::new(format!("invalid domain: {domain}")));
     };

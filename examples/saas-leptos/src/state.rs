@@ -2,11 +2,11 @@
 use std::sync::Arc;
 
 #[cfg(feature = "ssr")]
-use rust_saas::authn::Authn;
-#[cfg(feature = "ssr")]
 use leptos::prelude::LeptosOptions;
 #[cfg(feature = "ssr")]
 use metrics_exporter_prometheus::PrometheusHandle;
+#[cfg(feature = "ssr")]
+use rust_saas::authn::Authn;
 #[cfg(feature = "ssr")]
 use rust_saas::saas::SaasState;
 

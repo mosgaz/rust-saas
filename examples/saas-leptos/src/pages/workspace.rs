@@ -119,8 +119,9 @@ async fn resolve_ws_tenant(
             .fetch_optional(state.saas.pool())
             .await
             .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let tenant_id = tenant_id
-        .ok_or_else(|| crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound))?;
+    let tenant_id = tenant_id.ok_or_else(|| {
+        crate::error::core_error_to_server_fn(rust_saas::saas::CoreError::NotFound)
+    })?;
 
     let active = rust_saas::saas::platform::resolve_active_tenant(&state.saas, user, tenant_id)
         .await

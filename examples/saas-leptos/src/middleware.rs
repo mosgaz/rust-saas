@@ -25,7 +25,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rust_saas::authn::{Authn, AuthnError};
 use axum::extract::{Request, State};
 use axum::http::header::{CACHE_CONTROL, SET_COOKIE};
 use axum::http::HeaderValue;
@@ -34,6 +33,7 @@ use axum::response::Response;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use cookie::time::Duration as CookieDuration;
 use domain::AuthUser;
+use rust_saas::authn::{Authn, AuthnError};
 
 use crate::cookie::CookieConfig;
 
