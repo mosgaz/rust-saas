@@ -110,3 +110,6 @@ examples/*/pkg/
 # Files: ADR-000*.md, sass-*.md, saas-appendix-*.md
 # ─────────────────────────────────────────────────────────────────────────────
 /internal-docs/
+
+# AI assistant configs
+.qwen/
