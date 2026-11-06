@@ -102,6 +102,9 @@ jobs:
       - name: Check axum-minimal
         run: cargo check --manifest-path examples/axum-minimal/Cargo.toml
 
+      - name: Check minimal-lms
+        run: cargo check --manifest-path examples/minimal-lms/Cargo.toml
+
       - name: Check saas-leptos (SSR)
         run: cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr
 
@@ -145,6 +148,7 @@ jobs:
           workspaces: |
             . -> target
             examples/axum-minimal -> target
+            examples/minimal-lms -> target
             examples/saas-leptos -> target
 
       - name: Cache sqlx-cli
@@ -172,6 +176,11 @@ jobs:
         env:
           REDIS_URL: redis://localhost:6379
         run: cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
+
+      - name: E2E minimal-lms
+        env:
+          REDIS_URL: redis://localhost:6379
+        run: cargo test --manifest-path examples/minimal-lms/Cargo.toml --test e2e
 
       - name: E2E saas-leptos
         env:
