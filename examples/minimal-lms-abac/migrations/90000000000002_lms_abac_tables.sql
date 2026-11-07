@@ -13,6 +13,8 @@ create table courses (
     title        text not null,
     status       text not null default 'draft'
                  check (status in ('draft', 'published', 'archived')),
+    department   text not null default 'general',
+    is_locked    boolean not null default false,
     owner_id     uuid not null,
     created_at   timestamptz not null default now()
 );
