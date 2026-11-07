@@ -6,7 +6,7 @@ and one revision**. Do not mix, for example, `access 0.1.0` with `saas
 version at the source; consumers must pin every path / git dependency to
 the same tag.
 
-**Current version:** `0.4.0` (released 2026-11-06 — Phase A / Stage 5.0 is closed). See the `0.3.0` section below.
+**Current version:** `0.4.0` (released 2026-11-07 — Phase A / Stage 5.0 and Phase B' / Stage 5.1 are closed). See the `0.4.0` section below.
 
 ## Versioning policy
 
@@ -120,12 +120,15 @@ as a tag; `0.2.2` is the first tagged release after `0.2.0`.
 
 - `authz::AuthzRequest`, `authz::Subject`, `authz::Resource` — ABAC/ReBAC-aware request types.
 - `authz::AuthorizationEngine::can_request` / `require_request` — default impls fall back to RBAC via `can()`.
-- `authz-casbin::CasbinAuthz::can_request` — evaluates `context.constraints` (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`).
-- New example: `examples/minimal-lms-abac`.
+- `authz::ConstraintEvaluator` — new trait for custom ABAC rules not built into the library.
+- `authz-casbin::CasbinAuthz::can_request` — evaluates `context.constraints` (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`). Unknown types are passed to the registered `ConstraintEvaluator` (if any).
+- `authz-casbin::CasbinAuthz::with_custom_constraints()` — registers the custom evaluator.
+- `saas-axum::AxumAppStateBuilder::with_custom_constraints()` — passes the evaluator down to `CasbinAuthz`.
+- New example: `examples/minimal-lms-abac` demonstrates all built-in constraints and a custom `attr_gt` evaluator.
 
-**Migration.** No action required. Existing `AuthorizationEngine` impls (including custom ones) compile unchanged thanks to the default impl. To use ABAC, call `can_request` instead of `can`.
+**Migration.** No action required. Existing `AuthorizationEngine` impls (including custom ones) compile unchanged thanks to the default impl. To use ABAC, call `can_request` instead of `can`. To add custom rules, implement `ConstraintEvaluator` and register it.
 
-**Why.** Phase B' closes the ABAC requirement without introducing `PolicyAdmin` (PAP) or `authz-opa`. ABAC rules are code (handlers / bindings), RBAC rules are data (Casbin). See `internal-docs/ADR-0010`.
+**Why.** Phase B' closes the ABAC requirement without introducing `PolicyAdmin` (PAP) or `authz-opa`. ABAC rules are code (handlers / bindings / custom evaluators), RBAC rules are data (Casbin). See `internal-docs/ADR-0010`.
 
 ### 0.3.0 — Stage 5.0 (Phase A: A1–A7'.2)
 
