@@ -319,7 +319,7 @@ jobs:
           docker rm -f minimal-lms-smoke || true
           exit 1
 
-      - name: Clean consumer tables for minimal-lms-abac
+      - name: Clean consumer tables for minimal-lms-abac (before ABAC test)
         run: |
           docker run --rm --network rust-saas_rust_saas_net \
             -e PGPASSWORD=postgres postgres:16-alpine \
@@ -352,6 +352,18 @@ jobs:
           docker logs minimal-lms-abac-smoke || true
           docker rm -f minimal-lms-abac-smoke || true
           exit 1
+      - name: Clean consumer tables for saas-leptos (before Leptos test)
+        run: |
+          docker run --rm --network rust-saas_rust_saas_net \
+            -e PGPASSWORD=postgres postgres:16-alpine \
+            psql -h postgres -U postgres -d rust_saas -c "
+              DROP TABLE IF EXISTS courses CASCADE;
+              DROP TABLE IF EXISTS assignments CASCADE;
+              DROP TABLE IF EXISTS batches CASCADE;
+              DROP TABLE IF EXISTS files CASCADE;
+              DELETE FROM _sqlx_migrations WHERE version >= 90000000000000;
+            "
+
       - name: Run smoke test
         env:
           IMAGE: rust-saas/saas-leptos:ci
