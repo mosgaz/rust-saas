@@ -158,6 +158,30 @@ jobs:
       #   - saas-leptos:  `#[sqlx::test(migrations = "...")]`
       # so a shared-DB `sqlx migrate run` is not needed here.
       # `axum-minimal` and `minimal-lms` use `InMemoryRateLimiter` — no `REDIS_URL`.
+      # sqlx-adapter uses compile-time query! macros against the base DB.
+      # Ensure the schema exists before compilation.
+      - name: Cache sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/sqlx
+          key: ${{ runner.os }}-sqlx-cli-${{ env.SQLX_CLI_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-sqlx-cli-
+
+      - name: Install sqlx-cli
+        run: |
+          if ! command -v sqlx &> /dev/null; then
+            cargo install sqlx-cli \
+              --no-default-features \
+              --features postgres \
+              --version ${{ env.SQLX_CLI_VERSION }}
+          fi
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5430/rust_saas
+        run: sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
+
       - name: E2E axum-minimal
         run: cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
 
