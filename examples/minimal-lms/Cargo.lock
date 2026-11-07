@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "access"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "audit",
  "authz",
@@ -110,7 +110,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "audit-pg"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "audit",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "authn"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "audit",
@@ -155,23 +155,25 @@ dependencies = [
 
 [[package]]
 name = "authz"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "uuid",
 ]
 
 [[package]]
 name = "authz-casbin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "authz",
  "casbin",
+ "serde_json",
  "sqlx",
  "sqlx-adapter",
- "thiserror 2.0.21",
  "tokio",
  "uuid",
 ]
@@ -537,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "db"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "sqlx",
@@ -585,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1122,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "domain",
@@ -1801,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "rate-limiter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "tracing",
@@ -1957,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "rust-saas"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "access",
  "anyhow",
@@ -2036,7 +2038,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saas"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "access",
  "audit",
@@ -2053,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "saas-axum"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "access",
  "async-trait",
