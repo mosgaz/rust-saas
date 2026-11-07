@@ -1,9 +1,9 @@
-//! Three handlers demonstrating ABAC on Casbin.
+//! Handlers demonstrating all 4 built-in ABAC constraints on Casbin.
 //!
-//! - `create_course`: RBAC — the caller must have `course_type_a:create` or
-//!   `course_type_b:create`. The default `can_request` path (RBAC) is used.
-//! - `read_course`: ABAC — `owner_only` constraint on `resource.attrs.owner_id`.
-//! - `update_course`: ABAC — `status_in` constraint on `resource.attrs.status`.
+//! - `create_course`: RBAC — the caller must have `course_type_a:create`.
+//! - `read_course`: `owner_only` — only the owner can read.
+//! - `update_course`: `owner_only` + `status_in` + `attr_eq` (not locked).
+//! - `read_shared_course`: `attr_in_subject` (same department).
 
 use std::sync::Arc;
 
@@ -38,6 +38,7 @@ pub struct CourseResponse {
     pub id: Uuid,
     pub title: String,
     pub status: String,
+    pub department: String,
     pub owner_id: Uuid,
 }
 
@@ -47,12 +48,14 @@ struct CourseRow {
     workspace_id: Uuid,
     title: String,
     status: String,
+    department: String,
+    is_locked: bool,
     owner_id: Uuid,
 }
 
 async fn fetch_course(state: &AxumAppState, id: Uuid) -> Result<CourseRow, AppError> {
     let row = sqlx::query_as::<_, CourseRow>(
-        "SELECT id, workspace_id, title, status, owner_id FROM courses WHERE id = $1",
+        "SELECT id, workspace_id, title, status, department, is_locked, owner_id FROM courses WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(state.saas.pool())
@@ -73,39 +76,22 @@ pub async fn create_course(
     Json(req): Json<CreateCourseReq>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let user = current.require()?;
-
-    // 1. Resolve active workspace (membership + status check).
     platform::resolve_active_workspace(&state.saas, &user, workspace_id).await?;
 
-    // 2. RBAC: check that the caller may create this course kind.
     let domain = workspace_domain(workspace_id);
     let resource_kind = format!("course_{}", req.kind);
     let authz_req = AuthzRequest {
         domain,
-        subject: Subject {
-            id: user.id,
-            roles: vec![],
-            attrs: json!({}),
-        },
-        resource: Resource {
-            kind: resource_kind,
-            id: None,
-            attrs: json!({}),
-        },
+        subject: Subject { id: user.id, roles: vec![], attrs: json!({}) },
+        resource: Resource { kind: resource_kind, id: None, attrs: json!({}) },
         action: "create".into(),
         context: json!({}),
     };
 
-    if !state
-        .authz
-        .can_request(&authz_req)
-        .await
-        .map_err(authz_err)?
-    {
+    if !state.authz.can_request(&authz_req).await.map_err(authz_err)? {
         return Err(AppError::Core(CoreError::Forbidden));
     }
 
-    // 3. Persist.
     let row = sqlx::query_as::<_, (Uuid, String)>(
         "INSERT INTO courses (workspace_id, title, owner_id) VALUES ($1, $2, $3) RETURNING id, status",
     )
@@ -122,6 +108,7 @@ pub async fn create_course(
             id: row.0,
             title: req.title,
             status: row.1,
+            department: "general".into(),
             owner_id: user.id,
         }),
     ))
@@ -136,31 +123,19 @@ pub async fn read_course(
     let course = fetch_course(&state, course_id).await?;
     platform::resolve_active_workspace(&state.saas, &user, course.workspace_id).await?;
 
-    let domain = workspace_domain(course.workspace_id);
-
-    // ABAC: only the owner may read.
     let authz_req = AuthzRequest {
-        domain,
-        subject: Subject {
-            id: user.id,
-            roles: vec![],
-            attrs: json!({}),
-        },
+        domain: workspace_domain(course.workspace_id),
+        subject: Subject { id: user.id, roles: vec![], attrs: json!({}) },
         resource: Resource {
             kind: "course".into(),
             id: Some(course.id),
-            attrs: json!({ "owner_id": course.owner_id, "status": course.status }),
+            attrs: json!({ "owner_id": course.owner_id }),
         },
         action: "read".into(),
         context: json!({ "constraints": [{"type": "owner_only"}] }),
     };
 
-    if !state
-        .authz
-        .can_request(&authz_req)
-        .await
-        .map_err(authz_err)?
-    {
+    if !state.authz.can_request(&authz_req).await.map_err(authz_err)? {
         return Err(AppError::Core(CoreError::Forbidden));
     }
 
@@ -168,6 +143,7 @@ pub async fn read_course(
         id: course.id,
         title: course.title,
         status: course.status,
+        department: course.department,
         owner_id: course.owner_id,
     }))
 }
@@ -182,35 +158,29 @@ pub async fn update_course(
     let course = fetch_course(&state, course_id).await?;
     platform::resolve_active_workspace(&state.saas, &user, course.workspace_id).await?;
 
-    let domain = workspace_domain(course.workspace_id);
-
-    // ABAC: may update only if the course is draft or published.
     let authz_req = AuthzRequest {
-        domain,
-        subject: Subject {
-            id: user.id,
-            roles: vec![],
-            attrs: json!({}),
-        },
+        domain: workspace_domain(course.workspace_id),
+        subject: Subject { id: user.id, roles: vec![], attrs: json!({}) },
         resource: Resource {
             kind: "course".into(),
             id: Some(course.id),
-            attrs: json!({ "owner_id": course.owner_id, "status": course.status }),
+            attrs: json!({
+                "owner_id": course.owner_id,
+                "status": course.status,
+                "is_locked": course.is_locked
+            }),
         },
         action: "write".into(),
         context: json!({
             "constraints": [
-                {"type": "status_in", "values": ["draft", "published"]}
+                {"type": "owner_only"},
+                {"type": "status_in", "values": ["draft", "published"]},
+                {"type": "attr_eq", "path": "is_locked", "value": false}
             ]
         }),
     };
 
-    if !state
-        .authz
-        .can_request(&authz_req)
-        .await
-        .map_err(authz_err)?
-    {
+    if !state.authz.can_request(&authz_req).await.map_err(authz_err)? {
         return Err(AppError::Core(CoreError::Forbidden));
     }
 
@@ -225,6 +195,49 @@ pub async fn update_course(
         id: course.id,
         title: req.title,
         status: course.status,
+        department: course.department,
+        owner_id: course.owner_id,
+    }))
+}
+
+pub async fn read_shared_course(
+    State(state): State<Arc<AxumAppState>>,
+    current: CurrentUser,
+    Path(course_id): Path<Uuid>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let user = current.require()?;
+    let course = fetch_course(&state, course_id).await?;
+    platform::resolve_active_workspace(&state.saas, &user, course.workspace_id).await?;
+
+    // In a real app, `user_department` comes from the DB or JWT claims.
+    // Here we mock it based on the user's email for demonstration.
+    let user_department = if user.email.contains("math") { "math" } else { "general" };
+
+    let authz_req = AuthzRequest {
+        domain: workspace_domain(course.workspace_id),
+        subject: Subject {
+            id: user.id,
+            roles: vec![],
+            attrs: json!({ "department": user_department }),
+        },
+        resource: Resource {
+            kind: "course".into(),
+            id: Some(course.id),
+            attrs: json!({ "department": course.department }),
+        },
+        action: "read".into(),
+        context: json!({ "constraints": [{"type": "attr_in_subject", "attr": "department"}] }),
+    };
+
+    if !state.authz.can_request(&authz_req).await.map_err(authz_err)? {
+        return Err(AppError::Core(CoreError::Forbidden));
+    }
+
+    Ok(Json(CourseResponse {
+        id: course.id,
+        title: course.title,
+        status: course.status,
+        department: course.department,
         owner_id: course.owner_id,
     }))
 }

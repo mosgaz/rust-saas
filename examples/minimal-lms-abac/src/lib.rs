@@ -17,6 +17,7 @@ pub fn build_app(state: Arc<AxumAppState>) -> axum::Router {
             post(handlers::create_course),
         )
         .route("/courses/{course_id}", get(handlers::read_course))
+        .route("/courses/{course_id}/shared", get(handlers::read_shared_course))
         .route("/courses/{course_id}", patch(handlers::update_course));
     build_app_full_with(state, extra)
 }
