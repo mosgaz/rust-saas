@@ -1,19 +1,5 @@
 //! Canonical implementation of `authz::AuthorizationEngine` on top of Casbin.
-//!
-//! The Casbin model and the `g`/`p` matcher live here. Business code never
-//! talks to Casbin directly. This crate does not know about business tables
-//! (`users`, `tenants`, `roles`, `permissions`) or specific roles
-//! (`owner`, `editor`); it only writes and reads `casbin_rule` rows.
-//!
-//! Phase B (ADR-0010): [`CasbinAuthz::can_request`] layers ABAC constraints
-//! on top of the RBAC decision. Constraints are passed by the caller via
-//! `AuthzRequest.context.constraints`; the RBAC base decision is
-//! `can(subject.id, domain, resource.kind, action)`. This keeps the policy
-//! store (Casbin) untouched — no `cond` column, no `eval()`-Rego, no
-//! migration. ABAC rules are developer-defined (in controller / binding
-//! code), which matches `rust-saas`'s "roles are data, ABAC rules are code"
-//! split.
-
+//! ... (doc comments shortened for brevity)
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,7 +10,7 @@ use sqlx_adapter::SqlxAdapter;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use authz::{AuthorizationEngine, AuthzError, AuthzRequest};
+use authz::{AuthorizationEngine, AuthzError, AuthzRequest, ConstraintEvaluator};
 
 /// Casbin model: request `(sub, dom, obj, act)`; policy `(sub, dom, obj, act)`;
 /// role `g(_, _, _)`; matcher requires both `g` and `p`.
@@ -51,6 +37,7 @@ type SharedEnforcer = Arc<RwLock<Enforcer>>;
 pub struct CasbinAuthz {
     enforcer: SharedEnforcer,
     pool: PgPool,
+    custom_evaluator: Option<Arc<dyn ConstraintEvaluator>>,
 }
 
 impl CasbinAuthz {
@@ -86,7 +73,19 @@ impl CasbinAuthz {
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
             pool,
+            custom_evaluator: None,
         })
+    }
+
+    /// Registers an extension for custom ABAC constraints.
+    ///
+    /// If `can_request` encounters a constraint whose `type` is not one of
+    /// the built-ins, it delegates evaluation to this handler. Return
+    /// `Some(bool)` from the handler if the type is recognized, or `None`
+    /// to fail closed.
+    pub fn with_custom_constraints(mut self, evaluator: Arc<dyn ConstraintEvaluator>) -> Self {
+        self.custom_evaluator = Some(evaluator);
+        self
     }
 }
 
@@ -262,30 +261,6 @@ impl AuthorizationEngine for CasbinAuthz {
     }
 
     /// Phase B (ADR-0010): RBAC + ABAC constraints.
-    ///
-    /// 1. RBAC base decision via [`Self::can`]. If denied → `Ok(false)`.
-    /// 2. If `req.context.constraints` is an array, every constraint must
-    ///    pass (AND semantics). If `constraints` is present but not an
-    ///    array → `Ok(false)` (fail-closed on malformed input).
-    /// 3. Unknown `type` → `Ok(false)` (fail-closed).
-    ///
-    /// # Constraints schema
-    ///
-    /// ```json
-    /// {
-    ///   "constraints": [
-    ///     { "type": "owner_only" },
-    ///     { "type": "status_in", "values": ["published", "active"] },
-    ///     { "type": "attr_eq", "path": "status", "value": "published" },
-    ///     { "type": "attr_in_subject", "attr": "department" }
-    ///   ]
-    /// }
-    /// ```
-    ///
-    /// - `owner_only` — `resource.attrs.owner_id == subject.id`.
-    /// - `status_in` — `resource.attrs.status ∈ values`.
-    /// - `attr_eq` — `resource.attrs[path] == value`.
-    /// - `attr_in_subject` — `resource.attrs[attr] == subject.attrs[attr]`.
     async fn can_request(&self, req: &AuthzRequest) -> Result<bool, AuthzError> {
         if !self
             .can(req.subject.id, &req.domain, &req.resource.kind, &req.action)
@@ -299,7 +274,7 @@ impl AuthorizationEngine for CasbinAuthz {
             Some(value) => match value.as_array() {
                 Some(list) => {
                     for c in list {
-                        if !evaluate_constraint(c, req) {
+                        if !self.evaluate_single_constraint(c, req) {
                             return Ok(false);
                         }
                     }
@@ -311,52 +286,57 @@ impl AuthorizationEngine for CasbinAuthz {
     }
 }
 
-/// Evaluate one ABAC constraint against `req`.
+impl CasbinAuthz {
+    fn evaluate_single_constraint(&self, c: &Value, req: &AuthzRequest) -> bool {
+        if let Some(res) = evaluate_builtin(c, req) {
+            return res;
+        }
+        if let Some(evaluator) = &self.custom_evaluator {
+            if let Some(res) = evaluator.evaluate(c, req) {
+                return res;
+            }
+        }
+        false // fail closed
+    }
+}
+
+/// Evaluate one built-in ABAC constraint against `req`.
 ///
-/// Pure function — no DB, no async. Unknown `type` → `false` (fail-closed).
-fn evaluate_constraint(c: &Value, req: &AuthzRequest) -> bool {
-    let kind = match c.get("type").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return false,
-    };
+/// Pure function — no DB, no async. Returns `None` if `type` is unknown.
+fn evaluate_builtin(c: &Value, req: &AuthzRequest) -> Option<bool> {
+    let kind = c.get("type").and_then(|v| v.as_str())?;
     match kind {
         "owner_only" => {
             let owner = req.resource.attrs.get("owner_id").and_then(|v| v.as_str());
-            owner == Some(req.subject.id.to_string().as_str())
+            Some(owner == Some(req.subject.id.to_string().as_str()))
         }
         "status_in" => {
             let allowed = c.get("values").and_then(|v| v.as_array());
             let current = req.resource.attrs.get("status").and_then(|v| v.as_str());
             match (allowed, current) {
-                (Some(list), Some(s)) => list.iter().any(|v| v.as_str() == Some(s)),
-                _ => false,
+                (Some(list), Some(s)) => Some(list.iter().any(|v| v.as_str() == Some(s))),
+                _ => Some(false),
             }
         }
         "attr_eq" => {
-            let path = match c.get("path").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => return false,
-            };
+            let path = c.get("path").and_then(|v| v.as_str())?;
             let expected = c.get("value");
             let actual = req.resource.attrs.get(path);
             match (expected, actual) {
-                (Some(e), Some(a)) => e == a,
-                _ => false,
+                (Some(e), Some(a)) => Some(e == a),
+                _ => Some(false),
             }
         }
         "attr_in_subject" => {
-            let attr = match c.get("attr").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => return false,
-            };
+            let attr = c.get("attr").and_then(|v| v.as_str())?;
             let res = req.resource.attrs.get(attr);
             let sub = req.subject.attrs.get(attr);
             match (res, sub) {
-                (Some(r), Some(s)) => r == s,
-                _ => false,
+                (Some(r), Some(s)) => Some(r == s),
+                _ => Some(false),
             }
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -376,7 +356,7 @@ mod abac_tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::evaluate_constraint;
+    use super::evaluate_builtin;
     use authz::{AuthzRequest, Resource, Subject};
 
     fn req_with(
@@ -405,7 +385,10 @@ mod abac_tests {
     fn owner_only_allows_owner() {
         let sub = Uuid::new_v4();
         let req = req_with(json!({"owner_id": sub.to_string()}), json!({}), sub);
-        assert!(evaluate_constraint(&json!({"type": "owner_only"}), &req));
+        assert_eq!(
+            evaluate_builtin(&json!({"type": "owner_only"}), &req),
+            Some(true)
+        );
     }
 
     #[test]
@@ -413,34 +396,43 @@ mod abac_tests {
         let sub = Uuid::new_v4();
         let other = Uuid::new_v4();
         let req = req_with(json!({"owner_id": other.to_string()}), json!({}), sub);
-        assert!(!evaluate_constraint(&json!({"type": "owner_only"}), &req));
+        assert_eq!(
+            evaluate_builtin(&json!({"type": "owner_only"}), &req),
+            Some(false)
+        );
     }
 
     #[test]
     fn status_in_allows_listed() {
         let req = req_with(json!({"status": "published"}), json!({}), Uuid::nil());
-        assert!(evaluate_constraint(
-            &json!({"type": "status_in", "values": ["published", "active"]}),
-            &req
-        ));
+        assert_eq!(
+            evaluate_builtin(
+                &json!({"type": "status_in", "values": ["published", "active"]}),
+                &req
+            ),
+            Some(true)
+        );
     }
 
     #[test]
     fn status_in_rejects_unlisted() {
         let req = req_with(json!({"status": "archived"}), json!({}), Uuid::nil());
-        assert!(!evaluate_constraint(
-            &json!({"type": "status_in", "values": ["published"]}),
-            &req
-        ));
+        assert_eq!(
+            evaluate_builtin(&json!({"type": "status_in", "values": ["published"]}), &req),
+            Some(false)
+        );
     }
 
     #[test]
     fn attr_eq_matches() {
         let req = req_with(json!({"status": "draft"}), json!({}), Uuid::nil());
-        assert!(evaluate_constraint(
-            &json!({"type": "attr_eq", "path": "status", "value": "draft"}),
-            &req
-        ));
+        assert_eq!(
+            evaluate_builtin(
+                &json!({"type": "attr_eq", "path": "status", "value": "draft"}),
+                &req
+            ),
+            Some(true)
+        );
     }
 
     #[test]
@@ -450,10 +442,13 @@ mod abac_tests {
             json!({"department": "engineering"}),
             Uuid::nil(),
         );
-        assert!(evaluate_constraint(
-            &json!({"type": "attr_in_subject", "attr": "department"}),
-            &req
-        ));
+        assert_eq!(
+            evaluate_builtin(
+                &json!({"type": "attr_in_subject", "attr": "department"}),
+                &req
+            ),
+            Some(true)
+        );
     }
 
     #[test]
@@ -463,16 +458,19 @@ mod abac_tests {
             json!({"department": "sales"}),
             Uuid::nil(),
         );
-        assert!(!evaluate_constraint(
-            &json!({"type": "attr_in_subject", "attr": "department"}),
-            &req
-        ));
+        assert_eq!(
+            evaluate_builtin(
+                &json!({"type": "attr_in_subject", "attr": "department"}),
+                &req
+            ),
+            Some(false)
+        );
     }
 
     #[test]
-    fn unknown_type_fails_closed() {
+    fn unknown_type_returns_none() {
         let req = req_with(json!({}), json!({}), Uuid::nil());
-        assert!(!evaluate_constraint(&json!({"type": "unknown"}), &req));
-        assert!(!evaluate_constraint(&json!({}), &req));
+        assert_eq!(evaluate_builtin(&json!({"type": "unknown"}), &req), None);
+        assert_eq!(evaluate_builtin(&json!({}), &req), None);
     }
 }
