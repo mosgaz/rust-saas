@@ -44,7 +44,7 @@ use access::{AccessState, ResourceType};
 use audit::AuditLogger;
 use audit_pg::PgAuditLogger;
 use authn::Authn;
-use authz::AuthorizationEngine;
+use authz::{AuthorizationEngine, ConstraintEvaluator};
 use authz_casbin::CasbinAuthz;
 use axum::http::Extensions;
 use chrono::TimeDelta;
@@ -128,6 +128,7 @@ pub struct AxumAppStateBuilder {
     bindings: Vec<RouteBinding>,
     path_permissions: Option<Arc<dyn PathPermissions>>,
     resource_types: Vec<ResourceType>,
+    custom_constraints: Option<Arc<dyn ConstraintEvaluator>>,
     access_skipped: bool,
     extensions: Extensions,
 }
@@ -148,6 +149,7 @@ impl AxumAppStateBuilder {
             bindings: Vec::new(),
             path_permissions: None,
             resource_types: Vec::new(),
+            custom_constraints: None,
             access_skipped: false,
             extensions: Extensions::new(),
         }
@@ -221,6 +223,13 @@ impl AxumAppStateBuilder {
         self
     }
 
+    /// Registers a custom evaluator for ABAC constraints not built into `rust-saas`.
+    /// This allows extending the `can_request` logic without forking the library.
+    pub fn with_custom_constraints(mut self, evaluator: Arc<dyn ConstraintEvaluator>) -> Self {
+        self.custom_constraints = Some(evaluator);
+        self
+    }
+
     /// Opts out of RBAC: skips `AccessState` creation and the
     /// `bootstrap_all_core` / `bootstrap_resource_types` steps. Low-level
     /// methods (`create_tenant`, `create_workspace`, …) still work — they
@@ -245,11 +254,13 @@ impl AxumAppStateBuilder {
     /// / Internal)` per `CoreError::from(AccessError)`.
     pub async fn build(self) -> Result<AxumAppState, AppError> {
         // 1. Authorization engine (Casbin).
-        let authz: Arc<dyn AuthorizationEngine> = Arc::new(
-            CasbinAuthz::from_pool(self.pool.clone())
-                .await
-                .map_err(CoreError::from)?,
-        );
+        let mut casbin = CasbinAuthz::from_pool(self.pool.clone())
+            .await
+            .map_err(CoreError::from)?;
+        if let Some(eval) = self.custom_constraints {
+            casbin = casbin.with_custom_constraints(eval);
+        }
+        let authz: Arc<dyn AuthorizationEngine> = Arc::new(casbin);
 
         // 2. Audit logger (default = real PgAuditLogger).
         let audit: Arc<dyn AuditLogger> = self

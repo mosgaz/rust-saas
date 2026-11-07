@@ -73,6 +73,20 @@ pub struct AuthzRequest {
     pub context: Value,
 }
 
+/// Extension point for custom ABAC constraints.
+///
+/// `rust-saas` provides built-in constraints (`owner_only`, `status_in`,
+/// `attr_eq`, `attr_in_subject`). If you need domain-specific logic
+/// (e.g., numerical comparison `budget < 1000`), implement this trait
+/// and register it via `CasbinAuthz::with_custom_constraints`.
+///
+/// When `can_request` encounters an unrecognized constraint `type`, it
+/// delegates to this evaluator. Return `Some(bool)` if handled, or `None`
+/// if the type is unknown (which will fail closed).
+pub trait ConstraintEvaluator: Send + Sync {
+    fn evaluate(&self, constraint: &serde_json::Value, req: &AuthzRequest) -> Option<bool>;
+}
+
 /// The actor in an [`AuthzRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subject {
