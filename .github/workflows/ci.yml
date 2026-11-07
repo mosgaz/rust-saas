@@ -337,6 +337,16 @@ jobs:
           docker rm -f minimal-lms-smoke || true
           exit 1
 
+      - name: Clean consumer tables for minimal-lms-abac
+        run: |
+          docker run --rm --network rust-saas_rust_saas_net \
+            -e PGPASSWORD=postgres postgres:16-alpine \
+            psql -h postgres -U postgres -d rust_saas -c "
+              DROP TABLE IF EXISTS courses CASCADE;
+              DROP TABLE IF EXISTS assignments CASCADE;
+              DELETE FROM _sqlx_migrations WHERE version >= 90000000000000;
+            "
+
       - name: Smoke minimal-lms-abac
         run: |
           set -euo pipefail
