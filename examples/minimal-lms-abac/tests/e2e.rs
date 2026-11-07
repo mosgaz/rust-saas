@@ -269,16 +269,17 @@ async fn create_course_type_enforced(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn update_course_status_gated(pool: PgPool) {
+async fn update_course_abac_combined(pool: PgPool) {
     let (app, state) = setup_app(pool.clone()).await;
     let (cookie1, user1) = register_user(&app, "owner@test.com").await;
     let ws_id = create_workspace(&pool, &state, &user1, "tenant1").await;
+    let domain = workspace_domain(ws_id);
 
     let course_id: Uuid = sqlx::query_scalar(
         "INSERT INTO courses (workspace_id, title, owner_id, status) VALUES ($1, 'test', $2, 'draft') RETURNING id"
     ).bind(ws_id).bind(user1.id).fetch_one(&pool).await.unwrap();
 
-    // 1. Draft status -> update allowed (200 OK)
+    // 1. Owner can update draft (passes owner_only AND status_in) -> 200 OK
     let body = json!({"title": "new title"});
     let req = Request::builder()
         .method("PATCH")
@@ -291,14 +292,48 @@ async fn update_course_status_gated(pool: PgPool) {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    // 2. Archived status -> update denied (403 Forbidden)
+    // 2. Give user2 the RBAC permission to write courses
+    let (cookie2, user2) = register_user(&app, "user2@test.com").await;
+    let tenant_id = get_tenant_id(&pool, ws_id).await;
+    add_member(&pool, tenant_id, ws_id, user2.id, "member").await;
+
+    state
+        .authz
+        .grant_role(
+            user2.id,
+            &domain,
+            "editor",
+            &[("course".into(), "write".into())],
+        )
+        .await
+        .unwrap();
+
+    // 3. User2 tries to update owner's course -> 403 Forbidden (fails owner_only)
+    let body = json!({"title": "hacked"});
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/courses/{}", course_id))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-CSRF-Token", csrf_from_cookie(&cookie2))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let req = add_cookie(req, &cookie2);
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "ABAC owner_only must block non-owner"
+    );
+
+    // 4. Update status to archived.
     sqlx::query("UPDATE courses SET status = 'archived' WHERE id = $1")
         .bind(course_id)
         .execute(&pool)
         .await
         .unwrap();
 
-    let body = json!({"title": "try again"});
+    // 5. Owner tries to update archived course -> 403 Forbidden (fails status_in)
+    let body = json!({"title": "too late"});
     let req = Request::builder()
         .method("PATCH")
         .uri(format!("/courses/{}", course_id))
@@ -308,5 +343,9 @@ async fn update_course_status_gated(pool: PgPool) {
         .unwrap();
     let req = add_cookie(req, &cookie1);
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "ABAC status_in must block archived course"
+    );
 }
