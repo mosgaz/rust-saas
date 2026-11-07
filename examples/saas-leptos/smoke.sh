@@ -83,6 +83,7 @@ hdr "starting $IMAGE"
 docker run --rm -d --name "$CTR" \
   --network "$NET" \
   -e DATABASE_URL="postgres://${PG_USER}:postgres@postgres:5432/${PG_DB}" \
+  -e REDIS_URL="redis://redis:6379" \
   -e JWT_SECRET='smoke-secret-not-for-prod' \
   -p "${HOST_PORT}:3395" \
   "$IMAGE" >/dev/null
