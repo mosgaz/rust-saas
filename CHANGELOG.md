@@ -14,9 +14,10 @@ revision.
 
 **Additive:** `AuthzRequest` DTO + `AuthorizationEngine::can_request` / `require_request` (default impls fall back to RBAC). No breaking changes.
 
-- `authz`: `AuthzRequest`, `Subject`, `Resource` DTOs (with `serde`). `can_request` and `require_request` added to `AuthorizationEngine` with default RBAC fallback.
-- `authz-casbin`: `can_request` override — evaluates ABAC constraints from `context.constraints` (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`). Unknown types fail closed.
-- **`examples/minimal-lms-abac`**: fork-free Axum consumer demonstrating `read-own`, `create-type` (RBAC), and `status-gated` (ABAC) scenarios. 3 E2E tests.
+- `authz`: `AuthzRequest`, `Subject`, `Resource` DTOs (with `serde`). `can_request` and `require_request` added to `AuthorizationEngine` with default RBAC fallback. Added `ConstraintEvaluator` trait for custom ABAC rules.
+- `authz-casbin`: `can_request` override — evaluates ABAC constraints from `context.constraints` (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`). Added `with_custom_constraints()` to register a `ConstraintEvaluator` for custom rules. Unknown types fail closed if no custom evaluator handles them.
+- `saas-axum`: Added `with_custom_constraints()` to `AxumAppStateBuilder` to allow seamless registration of custom ABAC rules without forking the library.
+- **`examples/minimal-lms-abac`**: fork-free Axum consumer demonstrating all 4 built-in ABAC constraints (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`) in combinations, plus a custom `attr_gt` (Greater Than) constraint via `ConstraintEvaluator`.
 
 ### Why no OPA / PolicyAdmin?
 

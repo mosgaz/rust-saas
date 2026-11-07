@@ -2,12 +2,12 @@
 
 **rust-saas** is a Rust library and reference application for building multi-tenant SaaS.
 
-The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, and authorization from each other, so they can be reused in other applications through git dependencies. Three reference consumers live under `examples/`:
+The library crates live in `crates/` (a Cargo workspace) and separate business logic, identity, authentication, and authorization from each other, so they can be reused in other applications through git dependencies. Four reference consumers live under `examples/`:
 
 - `examples/saas-leptos` — Leptos SSR + Axum + `#[server]` (starter template; A7'.2 — single-dep + startup `bootstrap_*` + admin UI for `resource_types`).
 - `examples/axum-minimal` — pure Axum, no Leptos (Stage 3g portability proof; **Stage 5.0-A6 — fork-free consumer on `saas-axum`**, one library dependency, 278 LOC src, 14 E2E).
 - `examples/minimal-lms` — **fork-free Axum consumer on `saas-axum`** (Stage 5.0-A5; DoD-артефакт Phase A, Axum path).
-- `examples/minimal-lms-abac` — **fork-free Axum consumer demonstrating ABAC on Casbin** (Stage 5.1 Phase B', ADR-0010). `owner_only`, `status_in`, RBAC create-types.
+- `examples/minimal-lms-abac` — **fork-free Axum consumer demonstrating ABAC on Casbin** (Stage 5.1 Phase B', ADR-0010). Shows all built-in constraints (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`) and how to implement a custom `ConstraintEvaluator` (e.g., `attr_gt`).
 
 ## Features
 
@@ -49,11 +49,12 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **`create_workspace` split** (Stage 5.0-A2.2c, B10 closed): 4-arg (no owner) + `create_workspace_with_owner` (6-arg).
 - **`saas::platform::{resolve_tenant, resolve_workspace, resolve_active_workspace, is_tenant_member, is_workspace_member}`** + `ActiveWorkspace` (Stage 5.0-A2.1, B8 closed).
 - **`db::migrate_composed`** (Stage 5.0-A3, B1 closed): merge workspace set + consumer migrator, one run, validated before SQL. `db::MIGRATOR` public. `db::migrate_with` deprecated.
-- **ABAC on Casbin** (Stage 5.1 Phase B', ADR-0010): `AuthzRequest` DTO + `AuthorizationEngine::can_request`. Constraints (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`) evaluated on `context.constraints`. No OPA, no `PolicyAdmin`.
+- **ABAC on Casbin** (Stage 5.1 Phase B', ADR-0010): `AuthzRequest` DTO + `AuthorizationEngine::can_request`. Constraints (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`) evaluated on `context.constraints`. No OPA, no `PolicyAdmin`. Custom rules via `ConstraintEvaluator` trait.
 - **`saas-axum` HTTP adapter** (Stage 5.0-A4, B5/B6/B7 closed): internal crate, consumer-facing via `rust-saas = { features = ["axum"] }`. **Four entry-points**: `build_app` (public-only), `build_app_with_protected(state, protected)`, `build_app_full(state)` (public + standard endpoints `/auth/*`, `/my_permissions*`, `/resource_types`), **`build_app_full_with(state, extra_protected)`** (Stage 5.0-A4.6 — public + standard + custom, all under `csrf_guard → auto_refresh → auth_layer`). `RouteBinding`/`BindingScope`/`RouteBindings`/`PathPermissions` for declarative path-level gating; fail-fast validation in `build()`.
 - **`examples/minimal-lms`** (Stage 5.0-A5): fork-free Axum consumer — 8 files, ~290 LOC without comments, 3 E2E. Uses only `rust-saas = { features = ["axum"] }` from workspace. **All 10 pluggability blockers (B1–B10) closed.**
 - **`examples/axum-minimal`** (Stage 5.0-A6): refactored onto `saas-axum` — **3 files, 278 LOC src** (was ~2000), **1 library dependency** `rust-saas = { features = ["axum"] }`, **14/14 E2E green**, `fmt --check` + `clippy -D warnings` clean. Structural refactor; behavioral contract (status codes, JSON shape, cookie flow, error bodies) preserved.
 - **`examples/saas-leptos` starter template** (Stage 5.0-A7'.1 + A7'.2): **1 workspace dep** (`rust-saas` + `domain` hydrate-only). A7'.2 adds **startup `bootstrap_*`** in `main.rs` (`bootstrap_all_core` + `bootstrap_resource_types` with 3 LMS types: `course`/`assignment`/`batch`) and **admin UI** on `/platform` (`#[server] list_resource_types` + `#[server] register_resource` + form + list). **18/18 E2E green** (was 15 — A7'.2 added 3). Full `resource_types` lifecycle: startup registration + runtime registration.
+- **`examples/minimal-lms-abac`** (Stage 5.1 Phase B'): fork-free Axum consumer showing all 4 built-in constraints and a custom `attr_gt` evaluator. 3 E2E.
 
 ## Architecture
 
@@ -67,9 +68,13 @@ crates/                  (library — the Cargo workspace)
 │                       TenantStatus (Active / Suspended)
 ├── authz/              AuthorizationEngine trait
 │                       (can / require / grant_role / revoke_role / has_role /
-│                        count_users_with_role / purge_role / reload_in_memory) + AuthzError;
+│                        count_users_with_role / purge_role / reload_in_memory /
+│                        can_request / require_request) + AuthzError;
+│                       AuthzRequest, Subject, Resource DTOs;
+│                       ConstraintEvaluator trait (Phase B');
 │                       test_support (AllowAllAuthz / DenyAllAuthz) — под feature `test-support`
-├── authz-casbin/       CasbinAuthz: canonical trait implementation
+├── authz-casbin/       CasbinAuthz: canonical trait implementation;
+│                       evaluate_builtin ABAC constraints; with_custom_constraints
 ├── audit/              AuditLogger trait, AuditEvent DTO, NoopAuditLogger, 21 event constants
 ├── audit-pg/           PgAuditLogger: PostgreSQL implementation (audit_log table) + MIGRATOR
 ├── access/             Sole owner of `permissions`, `roles`, `role_permissions`:
@@ -97,6 +102,7 @@ crates/                  (library — the Cargo workspace)
 │                       RouteBindings + PathPermissions + auth_layer + csrf + auto_refresh,
 │                       endpoints /auth/* + /my_permissions* + /resource_types,
 │                       build_app / build_app_with_protected / build_app_full / build_app_full_with
+│                       with_custom_constraints (Phase B')
 ├── rust-saas/          Meta-crate (Stage 4.0): features ["ssr" | "hydrate" | "axum"];
 │                       migrate_all / migrate_extended (Stage 5.0-A3)
 └── seed/               Bootstrap data and demo accounts (all email-verified)
@@ -114,8 +120,11 @@ examples/                (reference consumers — outside the workspace)
 ├── axum-minimal/       Stage 3g + Stage 5.0-A6: pure Axum, no Leptos — fork-free
 │                       consumer on saas-axum (3 files, 278 LOC src, 14 E2E,
 │                       1 library dep)
-└── minimal-lms/        Stage 5.0-A5: fork-free Axum consumer on saas-axum
-                        (DoD-артефакт Phase A, Axum path; ~290 LOC без комментариев; 3 E2E)
+├── minimal-lms/        Stage 5.0-A5: fork-free Axum consumer on saas-axum
+│                       (DoD-артефакт Phase A, Axum path; ~290 LOC без комментариев; 3 E2E)
+└── minimal-lms-abac/   Stage 5.1 Phase B': fork-free Axum consumer demonstrating
+                        ABAC on Casbin (owner_only, status_in, attr_eq, attr_in_subject)
+                        + custom attr_gt constraint via ConstraintEvaluator. 3 E2E.
 ```
 
 `examples/*` is listed in `workspace.exclude`; each example has its own `Cargo.toml` and `Cargo.lock`, and depends on the library crates via path dependencies pointing at `../../crates/*`.
@@ -126,7 +135,7 @@ The application separates five concerns:
 |---|---|---|
 | Identity | Who you are as an entity (`users` table, `AuthUser`) | `identity` |
 | Authentication | How you proved you are who you are (Argon2, JWT, refresh tokens, email verification, password reset) | `authn` |
-| Authorization | What you are allowed to do (`AuthorizationEngine`) | `authz` / `authz-casbin` |
+| Authorization | What you are allowed to do (`AuthorizationEngine`, ABAC constraints) | `authz` / `authz-casbin` |
 | Roles & permissions | Who has which rights (`roles`, `permissions`, `role_permissions`, `resource_types`) | `access` |
 | Data isolation | Which rows you can see (SQL filters by tenant/workspace) | `saas` |
 
@@ -136,35 +145,36 @@ Plus a cross-cutting concern:
 |---|---|---|
 | Audit | Who did what, when (`audit_log`) | `audit` / `audit-pg` |
 
-`Casbin does not replace SQL isolation. JWT does not replace Casbin. UI does not replace backend authorization. Roles are data, not code. Audit is best-effort, not a security boundary.`
+`Casbin does not replace SQL isolation. JWT does not replace Casbin. UI does not replace backend authorization. Roles are data, not code. ABAC rules are code. Audit is best-effort, not a security boundary.`
 
 ### Crate dependency graph
 
 ```text
-saas-leptos  -> rust-saas (features = ["ssr", "rate-limiter-redis"]),
-                domain (hydrate-only)                                          (example)
-axum-minimal -> rust-saas (features = ["axum"])                               (example)
-minimal-lms  -> rust-saas (features = ["axum"])                               (example)
-seed         -> authz, authz-casbin, access, authn, identity, db, domain, saas,
-                audit, audit-pg
-saas-axum    -> domain, authz, authz-casbin, access, identity, authn, saas, db,
-                audit, audit-pg, rate-limiter, axum, axum-extra, tower-http, matchit
-saas         -> authz (trait), access, identity, domain, audit, sqlx, sha2
-access       -> authz (trait), domain, audit, sqlx, uuid, serde, thiserror
-authn        -> identity, domain, audit, sqlx, argon2, jsonwebtoken, sha2
-identity     -> domain, sqlx
-authz-casbin -> authz (trait), casbin, sqlx, sqlx-adapter
-authz        -> uuid, thiserror, async-trait
-audit        -> serde, uuid, thiserror, async-trait, chrono, serde_json
-audit-pg     -> audit, sqlx, uuid, thiserror, async-trait, serde_json
-db           -> sqlx, anyhow
-rate-limiter -> async-trait, uuid, tracing, redis (optional)
-domain       -> serde, uuid, chrono; sqlx (optional, ssr only);
-                `test-support` feature (test-only AuthUser constructors)
-rust-saas    -> domain, authz, audit, rate-limiter (default);
-                + access, authz-casbin, identity, authn, saas, db, audit-pg
-                  + domain/ssr (feature `ssr`);
-                + saas-axum (feature `axum`)                                  (meta-crate)
+saas-leptos      -> rust-saas (features = ["ssr", "rate-limiter-redis"]),
+                    domain (hydrate-only)                                      (example)
+axum-minimal     -> rust-saas (features = ["axum"])                            (example)
+minimal-lms      -> rust-saas (features = ["axum"])                            (example)
+minimal-lms-abac -> rust-saas (features = ["axum"])                            (example)
+seed             -> authz, authz-casbin, access, authn, identity, db, domain, saas,
+                    audit, audit-pg
+saas-axum        -> domain, authz, authz-casbin, access, identity, authn, saas, db,
+                    audit, audit-pg, rate-limiter, axum, axum-extra, tower-http, matchit
+saas             -> authz (trait), access, identity, domain, audit, sqlx, sha2
+access           -> authz (trait), domain, audit, sqlx, uuid, serde, thiserror
+authn            -> identity, domain, audit, sqlx, argon2, jsonwebtoken, sha2
+identity         -> domain, sqlx
+authz-casbin     -> authz (trait), casbin, sqlx, sqlx-adapter
+authz            -> uuid, thiserror, async-trait, serde, serde_json
+audit            -> serde, uuid, thiserror, async-trait, chrono, serde_json
+audit-pg         -> audit, sqlx, uuid, thiserror, async-trait, serde_json
+db               -> sqlx, anyhow
+rate-limiter     -> async-trait, uuid, tracing, redis (optional)
+domain           -> serde, uuid, chrono; sqlx (optional, ssr only);
+                    `test-support` feature (test-only AuthUser constructors)
+rust-saas        -> domain, authz, audit, rate-limiter (default);
+                    + access, authz-casbin, identity, authn, saas, db, audit-pg
+                      + domain/ssr (feature `ssr`);
+                    + saas-axum (feature `axum`)                              (meta-crate)
 ```
 
 Forbidden edges:
@@ -206,7 +216,7 @@ Casbin policies are scoped by domain:
 | `tenant:{tenant_id}` | Tenant-level operations |
 | `workspace:{workspace_id}` | Workspace-level operations |
 
-### Domain-ownership RBAC
+### Domain-ownership RBAC & ABAC
 
 - A **role** is a named set of permissions in a **domain** (not in a tenant).
 - A **permission** is a `(resource, action)` pair from the `permissions` reference table. Every `permissions.resource` must be declared in `resource_types` (Stage 5.0-A1.3 FK).
@@ -216,6 +226,7 @@ Casbin policies are scoped by domain:
 - The **owner guard** prevents removing the last holder of a `protected` role (`saas::member::{change_role, remove_role}` returns `Forbidden`).
 - **Platform admin** (Stage 3f) is a user holding `platform` `owner` (or any role that grants platform-scoped permissions). It is **not** a superuser inside tenants/workspaces.
 - **`resource_types`** (Stage 5.0-A1): declared, not enforced. `scope` (`platform` / `tenant` / `workspace` / `custom:*`) is a hint for consumer UI; enforcement remains in `casbin_rule.p.v1`. Runtime registration via `access::registry::{bootstrap_*, register_resource_type, add_action}`; `AuthorizationEngine::reload_in_memory()` makes the current process see the new permissions without a restart.
+- **ABAC (Phase B')**: evaluated after RBAC. A caller passes `AuthzRequest` (with `Subject`, `Resource`, `action`, and `context.constraints`) to `can_request`. Built-in constraints are `owner_only`, `status_in`, `attr_eq`, `attr_in_subject`. Custom rules can be added by implementing `ConstraintEvaluator`.
 
 Example permissions and demo roles:
 
@@ -254,7 +265,7 @@ Example permissions and demo roles:
 |---|---|
 | Language | Rust |
 | UI | Leptos (in the reference example) |
-| Backend | Axum (in the reference example, `axum-minimal`, `minimal-lms`) |
+| Backend | Axum (in the reference example, `axum-minimal`, `minimal-lms`, `minimal-lms-abac`) |
 | Database | PostgreSQL 16 |
 | Database access | SQLx |
 | Authorization | Casbin (via `authz-casbin`) |
@@ -268,6 +279,7 @@ Example permissions and demo roles:
 | Refresh tokens | SHA-256 over random raw token; not persisted |
 | HTTP adapter | `saas-axum` (internal) — `rust-saas::features = ["axum"]` |
 | Resource registry | `resource_types` table (Stage 5.0-A1) |
+| ABAC constraints | Built-in (Casbin) + `ConstraintEvaluator` trait (Phase B') |
 | Styling | Tailwind CSS v4 (in `saas-leptos`) |
 | Local infrastructure | Docker Compose v2 — PostgreSQL + Mailpit + Redis |
 | Logging | `tracing` + `tracing-subscriber` (`RUST_LOG` env-filter) |
@@ -278,7 +290,7 @@ Example permissions and demo roles:
 ### Prerequisites
 
 - Rust
-- `wasm32-unknown-unknown` target (for `saas-leptos`; not needed for `axum-minimal` / `minimal-lms`)
+- `wasm32-unknown-unknown` target (for `saas-leptos`; not needed for `axum-minimal` / `minimal-lms` / `minimal-lms-abac`)
 - `cargo-leptos` (for `saas-leptos`)
 - Docker with the Compose **v2** plugin (`docker compose version` should print `v2.x.y`)
 
@@ -475,6 +487,25 @@ cargo test --manifest-path examples/minimal-lms/Cargo.toml
 
 DoD deviations from `saas-23.md §3` (documented in A8 §5.7(i)): 8 deps (not 5); 4 handlers (not 5); `build_app_full_with` (not `build_app_full(state).route(...)`); LOC 486 raw / ~290 without comments (DoD "≤300 without comments" satisfied).
 
+### Run the `minimal-lms-abac` example (Stage 5.1 Phase B')
+
+```bash
+docker compose up -d         # Postgres (default port 5430)
+cargo run --manifest-path examples/minimal-lms-abac/Cargo.toml
+```
+
+`minimal-lms-abac` demonstrates ABAC on Casbin:
+
+- 4 handlers covering all built-in constraints (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`).
+- Custom `ConstraintEvaluator` implementation (`attr_gt` - Greater Than).
+- 3 E2E tests validating ABAC rules in combinations.
+
+Run tests:
+
+```bash
+cargo test --manifest-path examples/minimal-lms-abac/Cargo.toml
+```
+
 ### CSRF (Stage 4.1c)
 
 Two complementary mechanisms:
@@ -524,15 +555,17 @@ clear && cargo test && cargo check && cargo check -p seed \
   && cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr \
   && cargo check --manifest-path examples/saas-leptos/Cargo.toml \
   && cargo check --manifest-path examples/axum-minimal/Cargo.toml \
-  && cargo check --manifest-path examples/minimal-lms/Cargo.toml
+  && cargo check --manifest-path examples/minimal-lms/Cargo.toml \
+  && cargo check --manifest-path examples/minimal-lms-abac/Cargo.toml
 ```
 
-E2E for the three consumers:
+E2E for the four consumers:
 
 ```bash
 cargo test --manifest-path examples/axum-minimal/Cargo.toml --test e2e
 cargo test --manifest-path examples/saas-leptos/Cargo.toml --features ssr --test e2e
 cargo test --manifest-path examples/minimal-lms/Cargo.toml --test e2e
+cargo test --manifest-path examples/minimal-lms-abac/Cargo.toml --test e2e
 ```
 
 ### Running tests
@@ -541,9 +574,9 @@ cargo test --manifest-path examples/minimal-lms/Cargo.toml --test e2e
 cargo test
 ```
 
-**254 workspace tests + 35 E2E, all green.** (14 `axum-minimal` + 18 `saas-leptos` (A7'.2 added 3) + 3 `minimal-lms`.)
+**262 workspace tests + 38 E2E, all green.** (14 `axum-minimal` + 18 `saas-leptos` + 3 `minimal-lms` + 3 `minimal-lms-abac`.)
 
-Unit tests live inline (`#[cfg(test)] mod tests`) in `authn`, `access`, `saas`, `audit`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
+Unit tests live inline (`#[cfg(test)] mod tests`) in `authn`, `access`, `saas`, `audit`, `authz-casbin`. Integration tests live in `crates/*/tests/` and use `#[sqlx::test]`:
 
 - Each test gets its own isolated database on `DATABASE_URL`; `crates/db/migrations` applied automatically; dropped after.
 - No manual `createdb` required. User in `DATABASE_URL` needs `CREATE DATABASE`.
@@ -561,7 +594,11 @@ The reference examples have small unit-test modules too (`rate_limit.rs` in both
 ├── crates/
 │   ├── domain/
 │   ├── authz/
+│   │   └── src/
+│   │       └── lib.rs             # AuthorizationEngine, AuthzRequest, ConstraintEvaluator
 │   ├── authz-casbin/
+│   │   └── src/
+│   │       └── lib.rs             # CasbinAuthz, evaluate_builtin, with_custom_constraints
 │   ├── audit/
 │   ├── audit-pg/
 │   │   └── migrations/            # 000_users_bootstrap.sql + 001_audit_log.sql
@@ -645,16 +682,27 @@ The reference examples have small unit-test modules too (`rate_limit.rs` in both
     │   │   ├── main.rs            # connect + migrate + AxumAppState::builder + serve — ~41 LOC
     │   │   └── handlers.rs        # 7 handlers + local PaginationQuery — ~206 LOC
     │   └── tests/e2e.rs           # 14 tests — ~377 LOC
-    └── minimal-lms/               # Stage 5.0-A5: fork-free Axum consumer
+    ├── minimal-lms/               # Stage 5.0-A5: fork-free Axum consumer
+    │   ├── Cargo.toml
+    │   ├── Cargo.lock
+    │   ├── build.rs
+    │   ├── migrations/
+    │   │   └── 90000000000001_lms_tables.sql
+    │   ├── src/
+    │   │   ├── lib.rs             # build_app(state) = build_app_full_with(state, extra_routes())
+    │   │   ├── main.rs            # migrate_composed + AxumAppState::builder + serve
+    │   │   └── handlers.rs        # 4 handlers: list/create courses, list files, create batch
+    │   └── tests/e2e.rs           # 3 E2E
+    └── minimal-lms-abac/          # Stage 5.1 Phase B': fork-free Axum consumer demonstrating ABAC
         ├── Cargo.toml
         ├── Cargo.lock
         ├── build.rs
         ├── migrations/
-        │   └── 90000000000001_lms_tables.sql
+        │   └── 90000000000001_lms_abac_tables.sql
         ├── src/
         │   ├── lib.rs             # build_app(state) = build_app_full_with(state, extra_routes())
-        │   ├── main.rs            # migrate_composed + AxumAppState::builder + serve
-        │   └── handlers.rs        # 4 handlers: list/create courses, list files, create batch
+        │   ├── main.rs            # migrate_composed + CustomEvaluator + AxumAppState::builder + serve
+        │   └── handlers.rs        # 4 handlers: read_own, read_shared, create_type, status_gated
         └── tests/e2e.rs           # 3 E2E
 ```
 
@@ -668,11 +716,11 @@ Shared DTOs (`Tenant`, `Workspace`, `Document`, `AuthUser`, `Invitation`, `Membe
 
 ### authz
 
-`AuthorizationEngine` trait — **8 methods**: `can`, `require`, `grant_role`, `revoke_role`, `has_role`, `count_users_with_role`, `purge_role`, `reload_in_memory` (Stage 5.0-A1.4). `AuthzError::ReloadError`. `test_support::{AllowAllAuthz, DenyAllAuthz}` under feature `test-support`. Trait-only.
+`AuthorizationEngine` trait — **10 methods**: `can`, `require`, `grant_role`, `revoke_role`, `has_role`, `count_users_with_role`, `purge_role`, `reload_in_memory`, `can_request`, `require_request`. `AuthzError::ReloadError`. `AuthzRequest`, `Subject`, `Resource` DTOs. `ConstraintEvaluator` trait. `test_support::{AllowAllAuthz, DenyAllAuthz}` under feature `test-support`. Trait-only.
 
 ### authz-casbin
 
-`CasbinAuthz` — the canonical `AuthorizationEngine` impl. Two constructors: `CasbinAuthz::new(url)` and `CasbinAuthz::from_pool(PgPool)` (recommended). Raw SQL only against `casbin_rule`.
+`CasbinAuthz` — the canonical `AuthorizationEngine` impl. Two constructors: `CasbinAuthz::new(url)` and `CasbinAuthz::from_pool(PgPool)` (recommended). Raw SQL only against `casbin_rule`. Evaluates built-in ABAC constraints (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`). Supports custom constraints via `with_custom_constraints()`.
 
 ### audit (Stage 3e)
 
@@ -717,7 +765,7 @@ PostgreSQL helper + migration runner. `MIGRATOR` (15 files) + `migrate_composed(
 
 ### saas-axum (Stage 5.0-A4)
 
-Internal HTTP adapter. Consumer-facing via `rust-saas = { features = ["axum"] }`. Four entry-points: `build_app` (public-only), `build_app_with_protected(state, protected)`, `build_app_full(state)` (public + standard endpoints), `build_app_full_with(state, extra_protected)` (public + standard + custom, all under `csrf_guard → auto_refresh → auth_layer`). `RouteBinding` / `BindingScope` / `RouteBindings` / `PathPermissions` + `bindings::validate()` fail-fast in `build()`. Endpoints `/auth/{register,login,logout,refresh}`, `/my_permissions` (+ `/grouped`), `/resource_types`.
+Internal HTTP adapter. Consumer-facing via `rust-saas = { features = ["axum"] }`. Four entry-points: `build_app` (public-only), `build_app_with_protected(state, protected)`, `build_app_full(state)` (public + standard endpoints), `build_app_full_with(state, extra_protected)` (public + standard + custom, all under `csrf_guard → auto_refresh → auth_layer`). `RouteBinding` / `BindingScope` / `RouteBindings` / `PathPermissions` + `bindings::validate()` fail-fast in `build()`. Endpoints `/auth/{register,login,logout,refresh}`, `/my_permissions` (+ `/grouped`), `/resource_types`. Supports custom constraints via `with_custom_constraints()`.
 
 ### rust-saas (meta-crate, Stage 4.0)
 
@@ -756,6 +804,22 @@ Reference consumer (single-dep since A7'.1: `rust-saas = { features = ["ssr", "r
 
 Deviations from `saas-23.md §3` documented in A8 §5.7(i): 8 deps (not 5), 4 handlers (not 5), `build_app_full_with` (not `build_app_full(state).route(...)`), LOC ~486 raw / ~290 without comments.
 
+### examples/minimal-lms-abac (Stage 5.1 Phase B')
+
+**Fork-free Axum consumer demonstrating ABAC on Casbin** (ADR-0010).
+
+- `Cargo.toml` — 1 workspace dep (`rust-saas = { features = ["axum"] }`) + 11 system + 4 dev-deps.
+- `migrations/90000000000001_lms_abac_tables.sql` — 2 tables (`courses`, `assignments`) with ABAC-relevant columns (`owner_id`, `status`, `department`, `is_locked`).
+- `src/main.rs` — defines a custom `CustomEvaluator` implementing `ConstraintEvaluator` (for `attr_gt`). Registers it via `with_custom_constraints`.
+- `src/handlers.rs` — 4 handlers demonstrating all built-in constraints and a custom constraint:
+  - `read_course` (`owner_only`).
+  - `read_shared_course` (`attr_in_subject`).
+  - `create_course` (RBAC only, no constraints).
+  - `update_course` (combines `owner_only` + `status_in` + `attr_eq`).
+- `tests/e2e.rs` — 3 E2E testing ABAC rules in combinations.
+
+Deviations documented in B4': 11 system deps (vs 8 in minimal-lms) — `tracing`, `tracing-subscriber`, `serde_json`.
+
 ## Development principles
 
 - Keep authentication separate from authorization.
@@ -765,6 +829,7 @@ Deviations from `saas-23.md §3` documented in A8 §5.7(i): 8 deps (not 5), 4 ha
 - Always scope database queries by tenant or workspace.
 - Treat UI visibility as convenience, not as a security boundary.
 - **Roles are data, not code.** No built-in role enums.
+- **ABAC rules are code, not data.** Defined in handlers or custom evaluators, evaluated on the fly.
 - **`roles.key` is immutable.** Rename = delete + create.
 - **Tenant suspension is enforced explicitly, not by middleware** (ADR-0002 rev.2). `resolve_active_tenant` in mutations; reads/cleanup stay available.
 - **`suspend_tenant` / `activate_tenant` are idempotent.** Only on transition emits events.
@@ -789,6 +854,7 @@ Deviations from `saas-23.md §3` documented in A8 §5.7(i): 8 deps (not 5), 4 ha
 - **`resource_types` declared, not enforced.** `scope` is a hint. Enforcement in `casbin_rule.p.v1`. Runtime registration via `access::registry`; `reload_in_memory()` refreshes current process.
 - **`build_app_full_with` is the fork-free entry-point.** Consumer-supplied protected routes get the same `csrf_guard → auto_refresh → auth_layer` chain as the standard endpoints. `.route(...)` on `build_app_full(state)`'s return value does **not** accept handlers with `State<Arc<AxumAppState>>` (structure: `Router<()>` after `.with_state(state)`).
 - **`bootstrap_*` in `main.rs` is the recommended startup pattern.** `examples/saas-leptos` (A7'.2) and `examples/minimal-lms` (A5) both call it after `CasbinAuthz::from_pool`, before `SaasBuilder`. Idempotent; safe on every start. `register_resource_type` (runtime, permission-checked) is the admin-UI variant.
+- **Custom ABAC via `ConstraintEvaluator`.** If built-in constraints are not enough, implement `ConstraintEvaluator` and register it via `with_custom_constraints`. Do not fork the library.
 
 ## Roadmap
 
@@ -826,19 +892,21 @@ Deviations from `saas-23.md §3` documented in A8 §5.7(i): 8 deps (not 5), 4 ha
 - **A7'.2 (done, this stage):** `saas-leptos` starter template — `bootstrap_all_core` + `bootstrap_resource_types` in `main.rs`; `#[server] list_resource_types` / `register_resource` + UI form on `/platform`; **18/18 E2E** (was 15 — +3 bootstrap/register tests); `fmt --check` + `clippy -D warnings` clean. Consumer-only; 0 lines changed in `crates/*`.
 - **A8 (next):** docs (`saas-external-02.md`, `ADR-0008`, `ADR-0009`, `CHANGELOG`, `README`, Appendix B) + CI jobs for both examples (`minimal-lms` + `axum-minimal`).
 - **A9:** DoD Phase A, tag `v0.3.0`.
-- **Stage 5.1+ (open):** ABAC/ReBAC (Phase B); OIDC + TOTP + WebAuthn (Phase C); RLS + cleanup TTL + escape hatch + polish (Phase D).
+- **Phase B' (Stage 5.1) (done):** ABAC on Casbin (`AuthzRequest`, `can_request`, built-in constraints, `ConstraintEvaluator`, `examples/minimal-lms-abac`).
+- **Stage 5.2+ (open):** OIDC + TOTP + WebAuthn (Phase C); RLS + cleanup TTL + escape hatch + polish (Phase D).
 
 ## Pluggability: what can be replaced, what cannot
 
-`rust-saas` is **not** a hexagonal framework with a port on every axis. It is a PostgreSQL-backed core with **three ports** (`authz`, `audit`, `rate-limiter`) and concrete implementations elsewhere.
+`rust-saas` is **not** a hexagonal framework with a port on every axis. It is a PostgreSQL-backed core with **four ports** (`authz`, `audit`, `rate-limiter`, `ConstraintEvaluator`) and concrete implementations elsewhere.
 
 ### Ports (traits + implementations)
 
 | Concern | Trait | Default impl | Replace without forking? |
 |---|---|---|---|
-| Authorization | `authz::AuthorizationEngine` | `authz-casbin::CasbinAuthz` | **yes** — e.g. OPA, Keycloak |
+| Authorization (PDP) | `authz::AuthorizationEngine` | `authz-casbin::CasbinAuthz` | **yes** — e.g. OPA, Keycloak |
 | Audit | `audit::AuditLogger` | `audit-pg::PgAuditLogger` | **yes** — Kafka, file, OTel |
 | Rate limiter | `rate-limiter::RateLimiter` | `InMemoryRateLimiter` / `RedisRateLimiter` | **yes** — Redis, custom store |
+| Custom ABAC constraints | `authz::ConstraintEvaluator` | None (built-in logic in `CasbinAuthz`) | **yes** — register via `with_custom_constraints` |
 
 ### Concrete dependencies (replacement = fork)
 
@@ -869,16 +937,17 @@ Explicitly **out of scope** for this reference:
 
 1. **Multi-DB.** PostgreSQL only.
 2. **Generic DAL / repository traits over `PgPool`.** `PgPool` in public signatures is deliberate.
-3. **`RoleStore` / `UserStore` / `Authn` trait / `saas` split (S1–S4).** Replacement is a fork; the three ports cover common cases.
-4. **Full hexagonal architecture.** Three ports, not "everything is a trait".
-5. **Runtime pluggability (dynamic dispatch for everything).** `Arc<dyn Trait>` only for `AuthorizationEngine`, `AuditLogger`, `RateLimiter`.
+3. **`RoleStore` / `UserStore` / `Authn` trait / `saas` split (S1–S4).** Replacement is a fork; the four ports cover common cases.
+4. **Full hexagonal architecture.** Four ports, not "everything is a trait".
+5. **Runtime pluggability (dynamic dispatch for everything).** `Arc<dyn Trait>` only for `AuthorizationEngine`, `AuditLogger`, `RateLimiter`, `ConstraintEvaluator`.
 6. **HTTP-framework-specific features in the library.** CSRF, cookies, rate limiting, IP/user-agent, email transport — all at the consumer.
 7. **`no_std` / zero-copy.**
 8. **Distributed transactions / 2PC.** ADR-0003 (A-lite) records the trade-off.
+9. **Universal policy engine (OPA/Rego/Cedar) inside the library.** See ADR-0010.
 
 ## Compatibility
 
-All `crates/*` share **one version** (`[workspace.package] version = "0.3.0"`). Consumers must pin every path / git dependency to the same revision.
+All `crates/*` share **one version** (`[workspace.package] version = "0.4.0"`). Consumers must pin every path / git dependency to the same revision.
 
 ## License
 

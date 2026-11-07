@@ -188,6 +188,12 @@ jobs:
       - name: E2E minimal-lms
         run: cargo test --manifest-path examples/minimal-lms/Cargo.toml --test e2e
 
+      - name: Clean DB for E2E minimal-lms-abac
+        run: |
+          sqlx database drop -y
+          sqlx database create
+          sqlx migrate run --source ${{ env.SQLX_MIGRATIONS_DIR }}
+
       - name: E2E minimal-lms-abac
         run: cargo test --manifest-path examples/minimal-lms-abac/Cargo.toml --test e2e
 
