@@ -80,7 +80,7 @@ if docker ps -aq --filter "name=^${CTR}$" | grep -q .; then
 fi
 
 hdr "starting $IMAGE"
-docker run --rm -d --name "$CTR" \
+docker run -d --name "$CTR" \
   --network "$NET" \
   -e DATABASE_URL="postgres://${PG_USER}:postgres@postgres:5432/${PG_DB}" \
   -e REDIS_URL="redis://redis:6379" \
