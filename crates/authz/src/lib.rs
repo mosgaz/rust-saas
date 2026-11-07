@@ -14,7 +14,14 @@
 //! on delete (`purge_role`). These helpers do not participate in the
 //! caller's SQL transaction; they are idempotent and safe to retry (see
 //! handoff §16).
+//!
+//! Phase B (ADR-0010): `AuthzRequest` / `can_request` / `require_request`
+//! add an ABAC/ReBAC-aware decision path. The default impls fall back to
+//! RBAC via [`AuthorizationEngine::can`]; `authz-casbin` overrides
+//! `can_request` with the Casbin ABAC matcher.
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +32,75 @@ pub enum AuthzError {
     Internal(String),
     #[error("reload error: {0}")]
     ReloadError(String),
+}
+
+/// Request for an ABAC/ReBAC-aware authorization decision.
+///
+/// Phase B (ADR-0010): ABAC is built on Casbin matchers, not on a separate
+/// policy engine. `domain` matches the RBAC domain (`platform` /
+/// `tenant:{uuid}` / `workspace:{uuid}`). `subject.roles` and
+/// `resource.attrs` are the inputs the Casbin ABAC matcher (B2') reads via
+/// `r.sub_roles` / `r.obj_attrs`; `context` is request-level (IP, time, …).
+///
+/// # Example
+///
+/// ```ignore
+/// let req = AuthzRequest {
+///     domain: workspace_domain(ws_id),
+///     subject: Subject { id: actor, roles: vec!["editor".into()], attrs: json!({}) },
+///     resource: Resource {
+///         kind: "document".into(),
+///         id: Some(doc_id),
+///         attrs: json!({ "owner_id": doc.owner_id, "status": doc.status }),
+///     },
+///     action: "write".into(),
+///     context: Value::Null,
+/// };
+/// authz.can_request(&req).await?;
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthzRequest {
+    /// RBAC domain: `platform` / `tenant:{uuid}` / `workspace:{uuid}`.
+    pub domain: String,
+    /// The actor (id, role keys, free-form ABAC attributes).
+    pub subject: Subject,
+    /// The resource being accessed (kind, optional instance id, attributes).
+    pub resource: Resource,
+    /// The action (`read`, `write`, `manage`, …).
+    pub action: String,
+    /// Request-level context (IP, time, …). `Value::Null` if unused.
+    #[serde(default)]
+    pub context: Value,
+}
+
+/// The actor in an [`AuthzRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subject {
+    /// Stable actor id (matches `casbin_rule.g.v0` / `users.id`).
+    pub id: Uuid,
+    /// Role keys held by the actor in `domain`. Ignored by the default
+    /// (RBAC) impl of [`AuthorizationEngine::can_request`]; used by the
+    /// Casbin ABAC matcher (B2').
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Free-form ABAC attributes (e.g. `{ "department": "engineering" }`).
+    #[serde(default)]
+    pub attrs: Value,
+}
+
+/// The resource in an [`AuthzRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resource {
+    /// Resource kind (`document`, `course`, …) — matches
+    /// `casbin_rule.p.v2` / `permissions.resource`.
+    pub kind: String,
+    /// Instance id. `None` for create-flow (no instance yet).
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    /// Free-form ABAC attributes (`owner_id`, `status`, …). Populated by
+    /// the caller from the fetched DB row, never trusted from the client.
+    #[serde(default)]
+    pub attrs: Value,
 }
 
 #[async_trait::async_trait]
@@ -109,16 +185,47 @@ pub trait AuthorizationEngine: Send + Sync {
 
     /// Reload in-memory policy from the backing store.
     ///
-    /// No-op for engines without in-memory state (OPA, SpiceDB, AllowAll, DenyAll).
+    /// No-op for engines without in-memory state (AllowAll, DenyAll, …).
     ///
     /// # Breaking
     /// Trait method added in 0.3.0. All impls must implement it.
     ///
-    /// # Phase B note
-    /// При PDP/PAP split (Phase B) метод переходит в `PolicyAdmin` (кэш
-    /// policy — PAP-состояние). `AuthorizationEngine` (PDP) может иметь
-    /// свой `reload` отдельно, если кэширует.
+    /// # Phase B note (ADR-0010)
+    /// Stays on `AuthorizationEngine` — Phase B is ABAC on Casbin; there
+    /// is no `PolicyAdmin` (PAP) split.
     async fn reload_in_memory(&self) -> Result<(), AuthzError>;
+
+    /// ABAC/ReBAC-aware decision (Phase B, ADR-0010).
+    ///
+    /// # Default implementation
+    /// Falls back to RBAC via [`Self::can`]: `subject.id` is the actor,
+    /// `resource.kind` is the resource type. `subject.roles`,
+    /// `resource.id`, `resource.attrs`, and `context` are ignored.
+    ///
+    /// This is correct for RBAC-only deployments (`AllowAllAuthz`,
+    /// `DenyAllAuthz`) and for pre-ABAC `CasbinAuthz`. `CasbinAuthz`
+    /// overrides it in B2' with the real Casbin ABAC matcher.
+    ///
+    /// # Additive
+    /// Trait method added in `0.4.0` with a default impl. Every existing
+    /// impl compiles unchanged.
+    async fn can_request(&self, req: &AuthzRequest) -> Result<bool, AuthzError> {
+        self.can(req.subject.id, &req.domain, &req.resource.kind, &req.action)
+            .await
+    }
+
+    /// Requires [`Self::can_request`].
+    ///
+    /// Returns [`AuthzError::Forbidden`] on `false`. Default impl delegates
+    /// to [`Self::can_request`]; overridable by ABAC-aware engines if a
+    /// richer error is needed.
+    async fn require_request(&self, req: &AuthzRequest) -> Result<(), AuthzError> {
+        if self.can_request(req).await? {
+            Ok(())
+        } else {
+            Err(AuthzError::Forbidden)
+        }
+    }
 }
 
 // ─── Stage 4.3a: test-only doubles ──────────────────────────────────────────
@@ -291,10 +398,78 @@ pub mod test_support {
 
 #[cfg(all(test, feature = "test-support"))]
 mod test_support_tests {
+    use serde_json::json;
     use uuid::Uuid;
 
     use super::test_support::{AllowAllAuthz, DenyAllAuthz};
-    use super::{AuthorizationEngine, AuthzError};
+    use super::{AuthorizationEngine, AuthzError, AuthzRequest, Resource, Subject};
+
+    fn sample_request() -> AuthzRequest {
+        AuthzRequest {
+            domain: "workspace:00000000-0000-0000-0000-000000000001".into(),
+            subject: Subject {
+                id: Uuid::nil(),
+                roles: vec!["editor".into()],
+                attrs: json!({ "department": "engineering" }),
+            },
+            resource: Resource {
+                kind: "document".into(),
+                id: Some(Uuid::nil()),
+                attrs: json!({ "owner_id": Uuid::nil(), "status": "draft" }),
+            },
+            action: "read".into(),
+            context: json!({ "ip": "127.0.0.1" }),
+        }
+    }
+
+    #[test]
+    fn authz_request_serde_roundtrip() {
+        let req = sample_request();
+        let json = serde_json::to_string(&req).unwrap();
+        let back: AuthzRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.domain, req.domain);
+        assert_eq!(back.subject.id, req.subject.id);
+        assert_eq!(back.subject.roles, req.subject.roles);
+        assert_eq!(back.subject.attrs, req.subject.attrs);
+        assert_eq!(back.resource.kind, req.resource.kind);
+        assert_eq!(back.resource.id, req.resource.id);
+        assert_eq!(back.resource.attrs, req.resource.attrs);
+        assert_eq!(back.action, req.action);
+        assert_eq!(back.context, req.context);
+    }
+
+    #[test]
+    fn authz_request_defaults_context_to_null() {
+        // context is `#[serde(default)]` — omitting it must deserialize to `Value::Null`.
+        let json = r#"{
+            "domain": "platform",
+            "subject": { "id": "00000000-0000-0000-0000-000000000000" },
+            "resource": { "kind": "document" },
+            "action": "read"
+        }"#;
+        let req: AuthzRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.context, serde_json::Value::Null);
+        assert!(req.subject.roles.is_empty());
+        assert_eq!(req.subject.attrs, serde_json::Value::Null);
+        assert!(req.resource.id.is_none());
+        assert_eq!(req.resource.attrs, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn allow_all_can_request_uses_rbac_fallback() {
+        // Default impl → `can`, which `AllowAllAuthz` returns `Ok(true)`.
+        let a = AllowAllAuthz;
+        assert!(a.can_request(&sample_request()).await.unwrap());
+        a.require_request(&sample_request()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deny_all_can_request_uses_rbac_fallback() {
+        let d = DenyAllAuthz;
+        assert!(!d.can_request(&sample_request()).await.unwrap());
+        let err = d.require_request(&sample_request()).await.unwrap_err();
+        assert!(matches!(err, AuthzError::Forbidden));
+    }
 
     #[tokio::test]
     async fn allow_all_grants_every_check() {

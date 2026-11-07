@@ -7,6 +7,7 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - `examples/saas-leptos` — Leptos SSR + Axum + `#[server]` (starter template; A7'.2 — single-dep + startup `bootstrap_*` + admin UI for `resource_types`).
 - `examples/axum-minimal` — pure Axum, no Leptos (Stage 3g portability proof; **Stage 5.0-A6 — fork-free consumer on `saas-axum`**, one library dependency, 278 LOC src, 14 E2E).
 - `examples/minimal-lms` — **fork-free Axum consumer on `saas-axum`** (Stage 5.0-A5; DoD-артефакт Phase A, Axum path).
+- `examples/minimal-lms-abac` — **fork-free Axum consumer demonstrating ABAC on Casbin** (Stage 5.1 Phase B', ADR-0010). `owner_only`, `status_in`, RBAC create-types.
 
 ## Features
 
@@ -48,6 +49,7 @@ The library crates live in `crates/` (a Cargo workspace) and separate business l
 - **`create_workspace` split** (Stage 5.0-A2.2c, B10 closed): 4-arg (no owner) + `create_workspace_with_owner` (6-arg).
 - **`saas::platform::{resolve_tenant, resolve_workspace, resolve_active_workspace, is_tenant_member, is_workspace_member}`** + `ActiveWorkspace` (Stage 5.0-A2.1, B8 closed).
 - **`db::migrate_composed`** (Stage 5.0-A3, B1 closed): merge workspace set + consumer migrator, one run, validated before SQL. `db::MIGRATOR` public. `db::migrate_with` deprecated.
+- **ABAC on Casbin** (Stage 5.1 Phase B', ADR-0010): `AuthzRequest` DTO + `AuthorizationEngine::can_request`. Constraints (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`) evaluated on `context.constraints`. No OPA, no `PolicyAdmin`.
 - **`saas-axum` HTTP adapter** (Stage 5.0-A4, B5/B6/B7 closed): internal crate, consumer-facing via `rust-saas = { features = ["axum"] }`. **Four entry-points**: `build_app` (public-only), `build_app_with_protected(state, protected)`, `build_app_full(state)` (public + standard endpoints `/auth/*`, `/my_permissions*`, `/resource_types`), **`build_app_full_with(state, extra_protected)`** (Stage 5.0-A4.6 — public + standard + custom, all under `csrf_guard → auto_refresh → auth_layer`). `RouteBinding`/`BindingScope`/`RouteBindings`/`PathPermissions` for declarative path-level gating; fail-fast validation in `build()`.
 - **`examples/minimal-lms`** (Stage 5.0-A5): fork-free Axum consumer — 8 files, ~290 LOC without comments, 3 E2E. Uses only `rust-saas = { features = ["axum"] }` from workspace. **All 10 pluggability blockers (B1–B10) closed.**
 - **`examples/axum-minimal`** (Stage 5.0-A6): refactored onto `saas-axum` — **3 files, 278 LOC src** (was ~2000), **1 library dependency** `rust-saas = { features = ["axum"] }`, **14/14 E2E green**, `fmt --check` + `clippy -D warnings` clean. Structural refactor; behavioral contract (status codes, JSON shape, cookie flow, error bodies) preserved.

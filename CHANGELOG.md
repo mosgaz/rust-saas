@@ -8,6 +8,20 @@ Every crate in `crates/` shares one version (enforced by
 `[workspace.package]`); consumers must pin all crates to the same
 revision.
 
+## [0.4.0] - 2026-11-07
+
+### Phase B' — ABAC on Casbin (ADR-0010)
+
+**Additive:** `AuthzRequest` DTO + `AuthorizationEngine::can_request` / `require_request` (default impls fall back to RBAC). No breaking changes.
+
+- `authz`: `AuthzRequest`, `Subject`, `Resource` DTOs (with `serde`). `can_request` and `require_request` added to `AuthorizationEngine` with default RBAC fallback.
+- `authz-casbin`: `can_request` override — evaluates ABAC constraints from `context.constraints` (`owner_only`, `status_in`, `attr_eq`, `attr_in_subject`). Unknown types fail closed.
+- **`examples/minimal-lms-abac`**: fork-free Axum consumer demonstrating `read-own`, `create-type` (RBAC), and `status-gated` (ABAC) scenarios. 3 E2E tests.
+
+### Why no OPA / PolicyAdmin?
+
+See `internal-docs/ADR-0010-ABAC-on-Casbin.md`. OPA is a PDP, not a PAP; dynamic rule creation in OPA is an architectural dead end. Casbin + developer-defined ABAC constraints cover all requested use cases without new tables or external services.
+
 ## [0.3.0] - 2026-11-05
 
 ### Stage 5.0 — Phase A (A1 + A2 + A3 + A4 + A4.6 + A5 + A6 + A7'.1 + A7'.2)

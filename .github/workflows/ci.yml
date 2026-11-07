@@ -92,6 +92,9 @@ jobs:
       - name: Check minimal-lms
         run: cargo check --manifest-path examples/minimal-lms/Cargo.toml
 
+      - name: Check minimal-lms-abac
+        run: cargo check --manifest-path examples/minimal-lms-abac/Cargo.toml
+
       - name: Check saas-leptos (SSR)
         run: cargo check --manifest-path examples/saas-leptos/Cargo.toml --features ssr
 
@@ -146,6 +149,7 @@ jobs:
             . -> target
             examples/axum-minimal -> target
             examples/minimal-lms -> target
+            examples/minimal-lms-abac -> target
             examples/saas-leptos -> target
 
       # Each example's `tests/e2e.rs` applies migrations itself:
@@ -159,6 +163,9 @@ jobs:
 
       - name: E2E minimal-lms
         run: cargo test --manifest-path examples/minimal-lms/Cargo.toml --test e2e
+
+      - name: E2E minimal-lms-abac
+        run: cargo test --manifest-path examples/minimal-lms-abac/Cargo.toml --test e2e
 
       # `saas-leptos` `main.rs` builds `RedisRateLimiter::from_url`; the
       # `setup_app` in e2e may also pick it up — keep `REDIS_URL` available.
@@ -190,6 +197,12 @@ jobs:
       - name: Build saas-leptos image
         run: docker build -f examples/saas-leptos/Dockerfile -t rust-saas/saas-leptos:ci .
 
+      - name: Build minimal-lms image
+        run: docker build -f examples/minimal-lms/Dockerfile -t rust-saas/minimal-lms:ci .
+
+
+      - name: Build minimal-lms-abac image
+        run: docker build -f examples/minimal-lms-abac/Dockerfile -t rust-saas/minimal-lms-abac:ci .
       # `--wait` blocks until every service in `docker-compose.yml` is
       # `healthy` (Compose v2). Replaces the old `until pg_isready` loop.
       # Note: `mailpit` and `pgadmin` have no `healthcheck` in compose —
@@ -254,6 +267,49 @@ jobs:
           docker rm -f axum-minimal-smoke || true
           exit 1
 
+      - name: Smoke minimal-lms
+        run: |
+          set -euo pipefail
+          docker run -d --name minimal-lms-smoke \
+            --network rust-saas_rust_saas_net \
+            -e DATABASE_URL='postgres://postgres:postgres@postgres:5432/rust_saas' \
+            -e JWT_SECRET='ci-smoke-secret' \
+            -p 3396:3395 \
+            rust-saas/minimal-lms:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3396/readyz >/dev/null 2>&1; then
+              echo "minimal-lms /readyz OK"
+              docker rm -f minimal-lms-smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "minimal-lms /readyz did not become ready in 30s"
+          docker logs minimal-lms-smoke || true
+          docker rm -f minimal-lms-smoke || true
+          exit 1
+
+      - name: Smoke minimal-lms-abac
+        run: |
+          set -euo pipefail
+          docker run -d --name minimal-lms-abac-smoke \
+            --network rust-saas_rust_saas_net \
+            -e DATABASE_URL='postgres://postgres:postgres@postgres:5432/rust_saas' \
+            -e JWT_SECRET='ci-smoke-secret' \
+            -p 3398:3395 \
+            rust-saas/minimal-lms-abac:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3398/readyz >/dev/null 2>&1; then
+              echo "minimal-lms-abac /readyz OK"
+              docker rm -f minimal-lms-abac-smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "minimal-lms-abac /readyz did not become ready in 30s"
+          docker logs minimal-lms-abac-smoke || true
+          docker rm -f minimal-lms-abac-smoke || true
+          exit 1
       - name: Run smoke test
         env:
           IMAGE: rust-saas/saas-leptos:ci

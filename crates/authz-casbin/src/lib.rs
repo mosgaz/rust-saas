@@ -5,46 +5,26 @@
 //! (`users`, `tenants`, `roles`, `permissions`) or specific roles
 //! (`owner`, `editor`); it only writes and reads `casbin_rule` rows.
 //!
-//! Stage 2d: the struct carries its own `PgPool` (shared with `saas`/`access`
-//! via [`CasbinAuthz::from_pool`]) so that `has_role`, `count_users_with_role`,
-//! and `purge_role` can query `casbin_rule` directly. `purge_role` is the only
-//! method that uses raw `DELETE` instead of `MgmtApi` (mass delete by
-//! `(role, domain)` is not expressible through `remove_filtered_grouping_policy`
-//! without an N+1 loop); the in-memory model is reloaded via `load_policy()`
-//! afterwards.
-//!
-//! Stage 3h (ADR-0003 §2.2): `grant_role` pre-checks `has_policy` /
-//! `has_grouping_policy` before each `add_policy` / `add_grouping_policy`
-//! call. `casbin-rs` 2.x `add_policy` does not deduplicate `p`-rows, so a
-//! repeated `grant_role` would otherwise insert duplicates; `has_policy` is
-//! an in-memory O(1) check and does not require modifying `sqlx-adapter`.
-//! The unique index `casbin_rule_unique_idx` (migration
-//! `20261110000001_casbin_rule_unique_idx.sql`) is a belt-and-suspenders
-//! safety net on the database side.
-//!
-//! **Stage 4.5b — cross-process race on `grant_role`.** `has_policy` /
-//! `has_grouping_policy` are in-memory; across processes two replicas can
-//! both pass the pre-check and both call `add_*_policy`. The second insert
-//! hits `casbin_rule_unique_idx` (PostgreSQL `23505`), which
-//! `sqlx-adapter` surfaces as `casbin::Error::AdapterError(...)` — the
-//! trait `AuthorizationEngine` would otherwise map that to
-//! `AuthzError::Internal` and the caller would see HTTP 500 on an
-//! idempotent `assign_role`. 4.5b treats the violation as an idempotent
-//! success and reloads the in-memory model from `casbin_rule` so the
-//! pre-check reflects reality for the next call. No `sqlx-adapter` fork
-//! (ADR-0003 §3.65). The unique index is now load-bearing: it is the
-//! only cross-process safety net this reference keeps.
+//! Phase B (ADR-0010): [`CasbinAuthz::can_request`] layers ABAC constraints
+//! on top of the RBAC decision. Constraints are passed by the caller via
+//! `AuthzRequest.context.constraints`; the RBAC base decision is
+//! `can(subject.id, domain, resource.kind, action)`. This keeps the policy
+//! store (Casbin) untouched — no `cond` column, no `eval()`-Rego, no
+//! migration. ABAC rules are developer-defined (in controller / binding
+//! code), which matches `rust-saas`'s "roles are data, ABAC rules are code"
+//! split.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
+use serde_json::Value;
 use sqlx::PgPool;
 use sqlx_adapter::SqlxAdapter;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use authz::{AuthorizationEngine, AuthzError};
+use authz::{AuthorizationEngine, AuthzError, AuthzRequest};
 
 /// Casbin model: request `(sub, dom, obj, act)`; policy `(sub, dom, obj, act)`;
 /// role `g(_, _, _)`; matcher requires both `g` and `p`.
@@ -76,9 +56,6 @@ pub struct CasbinAuthz {
 impl CasbinAuthz {
     /// Convenience constructor: opens its own `PgPool` and delegates to
     /// [`CasbinAuthz::from_pool`].
-    ///
-    /// Prefer [`CasbinAuthz::from_pool`] when the consumer already holds a
-    /// `PgPool` (single connection pool per process — Stage 2d).
     pub async fn new(database_url: &str) -> Result<Self, AuthzError> {
         let pool = PgPool::connect(database_url)
             .await
@@ -150,22 +127,8 @@ impl AuthorizationEngine for CasbinAuthz {
         permissions: &[(String, String)],
     ) -> Result<(), AuthzError> {
         let mut enforcer = self.enforcer.write().await;
-
-        // Stage 4.5b: if a cross-process race causes a unique violation on
-        // `casbin_rule_unique_idx`, the offending row is already in the
-        // database — treat it as an idempotent success and reload the
-        // in-memory model *once* at the end. Without the reload, this
-        // replica's in-memory enforcer would be missing the row another
-        // replica wrote, and `can` / `require` would disagree with the
-        // database. Multiple violations within one call coalesce into a
-        // single reload.
         let mut needs_reload = false;
 
-        // Idempotent `g`-row: skip `add_grouping_policy` when the user already
-        // holds `role_key` in `domain`. `add_grouping_policy` normally
-        // deduplicates, but the pre-check is cheap and makes the whole method
-        // idempotent by construction (ADR-0003 §2.2).
-        // `MgmtApi::has_grouping_policy` returns `bool` synchronously.
         let grouping = vec![
             user_id.to_string(),
             role_key.to_string(),
@@ -182,11 +145,6 @@ impl AuthorizationEngine for CasbinAuthz {
         }
 
         for (resource, action) in permissions {
-            // Idempotent `p`-row: `casbin-rs` 2.x `add_policy` does not check
-            // for an existing `(sub, dom, obj, act)` and would insert a
-            // duplicate. `has_policy` is in-memory; no migration or adapter
-            // change is needed for the pre-check itself (ADR-0003 §2.2).
-            // `MgmtApi::has_policy` returns `bool` synchronously.
             let policy = vec![
                 role_key.to_string(),
                 domain.to_string(),
@@ -206,10 +164,6 @@ impl AuthorizationEngine for CasbinAuthz {
         }
 
         if needs_reload {
-            // Reload under the same write-lock so concurrent `can` / `require`
-            // reads see a consistent model. A cross-process race that produced
-            // a violation means the row is in the database; `load_policy` pulls
-            // it (and every other row we just wrote) into memory.
             enforcer
                 .load_policy()
                 .await
@@ -226,7 +180,6 @@ impl AuthorizationEngine for CasbinAuthz {
         role_key: &str,
     ) -> Result<(), AuthzError> {
         let mut enforcer = self.enforcer.write().await;
-
         enforcer
             .remove_grouping_policy(vec![
                 user_id.to_string(),
@@ -235,7 +188,6 @@ impl AuthorizationEngine for CasbinAuthz {
             ])
             .await
             .map_err(|e| AuthzError::Internal(e.to_string()))?;
-
         Ok(())
     }
 
@@ -308,41 +260,219 @@ impl AuthorizationEngine for CasbinAuthz {
             .map_err(|e| AuthzError::ReloadError(e.to_string()))?;
         Ok(())
     }
+
+    /// Phase B (ADR-0010): RBAC + ABAC constraints.
+    ///
+    /// 1. RBAC base decision via [`Self::can`]. If denied → `Ok(false)`.
+    /// 2. If `req.context.constraints` is an array, every constraint must
+    ///    pass (AND semantics). If `constraints` is present but not an
+    ///    array → `Ok(false)` (fail-closed on malformed input).
+    /// 3. Unknown `type` → `Ok(false)` (fail-closed).
+    ///
+    /// # Constraints schema
+    ///
+    /// ```json
+    /// {
+    ///   "constraints": [
+    ///     { "type": "owner_only" },
+    ///     { "type": "status_in", "values": ["published", "active"] },
+    ///     { "type": "attr_eq", "path": "status", "value": "published" },
+    ///     { "type": "attr_in_subject", "attr": "department" }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// - `owner_only` — `resource.attrs.owner_id == subject.id`.
+    /// - `status_in` — `resource.attrs.status ∈ values`.
+    /// - `attr_eq` — `resource.attrs[path] == value`.
+    /// - `attr_in_subject` — `resource.attrs[attr] == subject.attrs[attr]`.
+    async fn can_request(&self, req: &AuthzRequest) -> Result<bool, AuthzError> {
+        if !self
+            .can(req.subject.id, &req.domain, &req.resource.kind, &req.action)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        match req.context.get("constraints") {
+            None | Some(Value::Null) => Ok(true),
+            Some(value) => match value.as_array() {
+                Some(list) => {
+                    for c in list {
+                        if !evaluate_constraint(c, req) {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+        }
+    }
+}
+
+/// Evaluate one ABAC constraint against `req`.
+///
+/// Pure function — no DB, no async. Unknown `type` → `false` (fail-closed).
+fn evaluate_constraint(c: &Value, req: &AuthzRequest) -> bool {
+    let kind = match c.get("type").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return false,
+    };
+    match kind {
+        "owner_only" => {
+            let owner = req.resource.attrs.get("owner_id").and_then(|v| v.as_str());
+            owner == Some(req.subject.id.to_string().as_str())
+        }
+        "status_in" => {
+            let allowed = c.get("values").and_then(|v| v.as_array());
+            let current = req.resource.attrs.get("status").and_then(|v| v.as_str());
+            match (allowed, current) {
+                (Some(list), Some(s)) => list.iter().any(|v| v.as_str() == Some(s)),
+                _ => false,
+            }
+        }
+        "attr_eq" => {
+            let path = match c.get("path").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return false,
+            };
+            let expected = c.get("value");
+            let actual = req.resource.attrs.get(path);
+            match (expected, actual) {
+                (Some(e), Some(a)) => e == a,
+                _ => false,
+            }
+        }
+        "attr_in_subject" => {
+            let attr = match c.get("attr").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return false,
+            };
+            let res = req.resource.attrs.get(attr);
+            let sub = req.subject.attrs.get(attr);
+            match (res, sub) {
+                (Some(r), Some(s)) => r == s,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// `true` iff `e` is (or wraps) a PostgreSQL unique violation raised by
-/// `casbin_rule_unique_idx` — the constraint from migration
-/// `20261110000001_casbin_rule_unique_idx.sql`.
-///
-/// **Why string matching.** `sqlx-adapter` does not preserve the typed
-/// `sqlx::Error`; it wraps it in `casbin::Error::AdapterError(Box<dyn
-/// Error + Send + Sync>)`. Downcasting would require matching on the
-/// concrete `sqlx::Error::Database` variant, which is not reachable from
-/// the trait surface without a `sqlx-adapter` fork (ADR-0003 §3.65). The
-/// `Display` string is stable for PostgreSQL (SQLSTATE `23505`,
-/// canonical `duplicate key …` phrasing) and, more importantly, the
-/// constraint name `casbin_rule_unique_idx` is deterministic: our own
-/// migration. If either ever changes, the test
-/// `grant_role_survives_unique_violation` (integration) catches the
-/// regression — the check then falls through to `AuthzError::Internal`
-/// and the test fails, surfacing the breakage instead of silently
-/// treating a genuine violation as success.
-///
-/// **What this is *not*.** Not a general "catch all errors" path — the
-/// caller still gets `AuthzError::Internal` for any non-unique failure
-/// (connection lost, FK violation, disk full, …). Only the specific
-/// constraint is treated as "already there, reload and continue".
+/// `casbin_rule_unique_idx` (ADR-0003 §3.65, Stage 4.5b).
 fn is_unique_violation(e: &casbin::Error) -> bool {
     let msg = e.to_string();
-    // Most specific: constraint name from our own migration.
     if msg.contains("casbin_rule_unique_idx") {
         return true;
     }
-    // Fallback: canonical PostgreSQL phrasing + the table name. Some
-    // `sqlx-adapter` / `casbin` version pairs strip the constraint name
-    // from the wrapped `Display`; the phrasing + table combination is
-    // specific enough in practice (`casbin_rule` is only used by this
-    // crate, and `duplicate key` only comes from a unique/PK violation).
     let lower = msg.to_lowercase();
     lower.contains("duplicate key") && msg.contains("casbin_rule")
+}
+
+#[cfg(test)]
+mod abac_tests {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::evaluate_constraint;
+    use authz::{AuthzRequest, Resource, Subject};
+
+    fn req_with(
+        attrs: serde_json::Value,
+        sub_attrs: serde_json::Value,
+        sub_id: Uuid,
+    ) -> AuthzRequest {
+        AuthzRequest {
+            domain: "workspace:00000000-0000-0000-0000-000000000001".into(),
+            subject: Subject {
+                id: sub_id,
+                roles: vec!["editor".into()],
+                attrs: sub_attrs,
+            },
+            resource: Resource {
+                kind: "document".into(),
+                id: Some(Uuid::nil()),
+                attrs,
+            },
+            action: "read".into(),
+            context: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn owner_only_allows_owner() {
+        let sub = Uuid::new_v4();
+        let req = req_with(json!({"owner_id": sub.to_string()}), json!({}), sub);
+        assert!(evaluate_constraint(&json!({"type": "owner_only"}), &req));
+    }
+
+    #[test]
+    fn owner_only_rejects_non_owner() {
+        let sub = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let req = req_with(json!({"owner_id": other.to_string()}), json!({}), sub);
+        assert!(!evaluate_constraint(&json!({"type": "owner_only"}), &req));
+    }
+
+    #[test]
+    fn status_in_allows_listed() {
+        let req = req_with(json!({"status": "published"}), json!({}), Uuid::nil());
+        assert!(evaluate_constraint(
+            &json!({"type": "status_in", "values": ["published", "active"]}),
+            &req
+        ));
+    }
+
+    #[test]
+    fn status_in_rejects_unlisted() {
+        let req = req_with(json!({"status": "archived"}), json!({}), Uuid::nil());
+        assert!(!evaluate_constraint(
+            &json!({"type": "status_in", "values": ["published"]}),
+            &req
+        ));
+    }
+
+    #[test]
+    fn attr_eq_matches() {
+        let req = req_with(json!({"status": "draft"}), json!({}), Uuid::nil());
+        assert!(evaluate_constraint(
+            &json!({"type": "attr_eq", "path": "status", "value": "draft"}),
+            &req
+        ));
+    }
+
+    #[test]
+    fn attr_in_subject_matches() {
+        let req = req_with(
+            json!({"department": "engineering"}),
+            json!({"department": "engineering"}),
+            Uuid::nil(),
+        );
+        assert!(evaluate_constraint(
+            &json!({"type": "attr_in_subject", "attr": "department"}),
+            &req
+        ));
+    }
+
+    #[test]
+    fn attr_in_subject_rejects_mismatch() {
+        let req = req_with(
+            json!({"department": "engineering"}),
+            json!({"department": "sales"}),
+            Uuid::nil(),
+        );
+        assert!(!evaluate_constraint(
+            &json!({"type": "attr_in_subject", "attr": "department"}),
+            &req
+        ));
+    }
+
+    #[test]
+    fn unknown_type_fails_closed() {
+        let req = req_with(json!({}), json!({}), Uuid::nil());
+        assert!(!evaluate_constraint(&json!({"type": "unknown"}), &req));
+        assert!(!evaluate_constraint(&json!({}), &req));
+    }
 }
