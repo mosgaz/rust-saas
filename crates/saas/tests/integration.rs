@@ -2742,15 +2742,26 @@ async fn advisory_lock_does_not_block_other_roles(pool: PgPool) {
 
     // r1 removed owner2's owner role. admin's owner role was untouched.
     assert!(
-        !saas.authz().has_role(owner2.id, &tenant_domain, "owner").await.unwrap(),
+        !saas
+            .authz()
+            .has_role(owner2.id, &tenant_domain, "owner")
+            .await
+            .unwrap(),
         "owner2 owner role must be removed"
     );
     assert!(
-        saas.authz().has_role(admin.id, &tenant_domain, "owner").await.unwrap(),
+        saas.authz()
+            .has_role(admin.id, &tenant_domain, "owner")
+            .await
+            .unwrap(),
         "admin owner role must be intact"
     );
     assert!(
-        !saas.authz().has_role(editor.id, &tenant_domain, "editor").await.unwrap(),
+        !saas
+            .authz()
+            .has_role(editor.id, &tenant_domain, "editor")
+            .await
+            .unwrap(),
         "editor role must be removed"
     );
 }
